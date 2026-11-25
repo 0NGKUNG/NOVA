@@ -1,0 +1,47 @@
+[package]
+name = "nova"
+description = "NOVA — Personal AI Agent Mission Control, Dynamic Island & Dev HUD for Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "nova"
+
+[lib]
+name = "nova_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+sysinfo = "0.32"
+keyring = { version = "3", features = ["windows-native"] }
+arboard = "3.4"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Foundation",
+  "Media_Control",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
