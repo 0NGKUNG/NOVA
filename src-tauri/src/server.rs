@@ -11,8 +11,8 @@ use crate::state::{AppCore, CORE_PORT};
 use crate::system_tools::{
     annotate_altgr_conflicts, capture_screen_data_url, control_windows_media, focus_session_window,
     get_windows_media_status, kill_process_by_pid, launch_workspace_session, open_in_editor,
-    open_url_or_path, paste_preserving_clipboard, sample_hardware_telemetry, scan_listening_ports,
-    write_clipboard_text,
+    open_url_or_path, paste_preserving_clipboard, read_clipboard_image_data_url,
+    sample_hardware_telemetry, scan_listening_ports, write_clipboard_text,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
@@ -108,6 +108,9 @@ fn mobile_route_allowed(path: &str) -> bool {
             | "/api/approvals/resolve"
             | "/api/chat/send"
             | "/api/chat/new"
+            | "/api/account/switch"
+            | "/api/quota"
+            | "/api/quota/refresh"
             | "/api/telemetry"
             | "/api/focus/control"
             | "/api/focus/todos"
@@ -236,6 +239,9 @@ pub async fn start_core_http_server(
         .route("/rules/delete", post(api_delete_rule))
         .route("/settings", post(api_save_settings))
         .route("/secrets/set", post(api_set_secret))
+        .route("/account/switch", post(api_switch_account))
+        .route("/quota", get(api_get_quota))
+        .route("/quota/refresh", post(api_refresh_quota))
         .route("/hooks/antigravity", post(api_apply_agy_hooks))
         .route("/telemetry", get(api_telemetry))
         .route("/ports", get(api_ports))
@@ -247,6 +253,7 @@ pub async fn start_core_http_server(
         .route("/chat/new", post(api_chat_new))
         .route("/chat/delete", post(api_chat_delete))
         .route("/context/snip", post(api_screen_snip))
+        .route("/context/clipboard-image", post(api_clipboard_image))
         .route("/context/clipboard-copy", post(api_clipboard_copy))
         .route("/context/clipboard-pin", post(api_clipboard_pin))
         .route("/workspace/focus", post(api_focus_session))
@@ -268,7 +275,7 @@ pub async fn start_core_http_server(
         .nest("/api", api)
         .route("/ws", get(ws_handler))
         .layer(middleware::from_fn_with_state(core.clone(), security_gate))
-        .layer(DefaultBodyLimit::max(12 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(cors)
         .with_state(core.clone());
 
@@ -320,9 +327,32 @@ async fn api_health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "nova-core", "port": CORE_PORT }))
 }
 
-async fn api_window_wake(State(core): State<AppCore>) -> Json<Value> {
+async fn api_window_wake(State(core): State<AppCore>) -> impl IntoResponse {
+    let ping_rx = core
+        .ui_liveness
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ping| ping());
     let _ = core.events_tx.send(json!({ "type": "window_wake" }));
-    Json(json!({ "ok": true }))
+    if let Some(rx) = ping_rx {
+        if tokio::time::timeout(std::time::Duration::from_millis(900), rx)
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ok": false, "error": "UI event loop unresponsive" })),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "interactiveDesktop": crate::has_interactive_shell_desktop()
+        })),
+    )
 }
 
 fn snapshot_for_scope(core: &AppCore, scope: AuthScope) -> crate::models::NovaSnapshot {
@@ -380,26 +410,41 @@ async fn api_resolve_approval(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ImageAttachmentReq {
+    data_url: String,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionSendReq {
     workspace_path: Option<String>,
     conversation_id: Option<String>,
     prompt: String,
     mode: Option<String>,
+    model: Option<String>,
     effort: Option<String>,
     image_data_url: Option<String>,
+    images: Option<Vec<ImageAttachmentReq>>,
 }
 
 async fn api_session_send(
     State(core): State<AppCore>,
     Json(req): Json<SessionSendReq>,
 ) -> impl IntoResponse {
+    let image_pairs: Option<Vec<(String, Option<String>)>> = req
+        .images
+        .map(|list| list.into_iter().map(|i| (i.data_url, i.name)).collect());
+
     match core.dispatch_agent_prompt(
         req.workspace_path.as_deref().unwrap_or_default(),
         req.conversation_id.as_deref(),
         &req.prompt,
         req.mode.as_deref(),
+        req.model.as_deref(),
         req.effort.as_deref(),
         req.image_data_url.as_deref(),
+        image_pairs.as_deref(),
     ) {
         Ok(val) => (StatusCode::OK, Json(val)),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
@@ -519,6 +564,81 @@ async fn api_set_secret(
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchAccountReq {
+    account: String,
+}
+
+async fn api_switch_account(
+    State(core): State<AppCore>,
+    Json(req): Json<SwitchAccountReq>,
+) -> impl IntoResponse {
+    let acc = if req.account == "second" { "second" } else { "main" };
+    {
+        let mut g = core.inner.lock().unwrap();
+        g.settings.active_account = acc.to_string();
+    }
+    core.persist();
+    core.broadcast_snapshot(Some("ready"));
+    (StatusCode::OK, Json(json!({ "ok": true, "activeAccount": acc })))
+}
+
+async fn api_get_quota(State(core): State<AppCore>) -> Json<Value> {
+    let quota = {
+        let g = core.inner.lock().unwrap();
+        g.compute_quota_state()
+    };
+    Json(serde_json::to_value(quota).unwrap_or_default())
+}
+
+async fn api_refresh_quota(State(core): State<AppCore>) -> impl IntoResponse {
+    let (main_key, second_key) = {
+        let _g = core.inner.lock().unwrap();
+        (
+            crate::ai_services::get_secret("gemini").or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+            crate::ai_services::get_secret("gemini_second").or_else(|| std::env::var("GEMINI_API_KEY_SECOND").ok()),
+        )
+    };
+
+    if let Some(k) = &main_key {
+        let (ok, err) = crate::ai_services::probe_gemini_quota(k).await;
+        let mut g = core.inner.lock().unwrap();
+        if !ok {
+            let is_429 = err.as_deref().map(|e| e.contains("429")).unwrap_or(false);
+            if is_429 {
+                g.quota_tracker.main.last_429 = Some(std::time::Instant::now());
+            }
+            g.quota_tracker.main.last_probe_status = err;
+        } else {
+            g.quota_tracker.main.last_429 = None;
+            g.quota_tracker.main.last_probe_status = None;
+        }
+    }
+
+    if let Some(k) = &second_key {
+        let (ok, err) = crate::ai_services::probe_gemini_quota(k).await;
+        let mut g = core.inner.lock().unwrap();
+        if !ok {
+            let is_429 = err.as_deref().map(|e| e.contains("429")).unwrap_or(false);
+            if is_429 {
+                g.quota_tracker.second.last_429 = Some(std::time::Instant::now());
+            }
+            g.quota_tracker.second.last_probe_status = err;
+        } else {
+            g.quota_tracker.second.last_429 = None;
+            g.quota_tracker.second.last_probe_status = None;
+        }
+    }
+
+    let quota = {
+        let g = core.inner.lock().unwrap();
+        g.compute_quota_state()
+    };
+    core.broadcast_snapshot(None);
+    (StatusCode::OK, Json(serde_json::to_value(quota).unwrap_or_default()))
 }
 
 #[derive(Deserialize)]
@@ -695,7 +815,7 @@ async fn api_chat_send(
         }
     }
 
-    let (provider, model, sys_prompt, history, ollama_url, lmstudio_url) = {
+    let (provider, model, sys_prompt, history, ollama_url, lmstudio_url, active_account) = {
         let mut g = core.inner.lock().unwrap();
         let provider = req
             .provider
@@ -707,6 +827,7 @@ async fn api_chat_send(
             .unwrap_or_else(|| g.settings.default_chat_model.clone());
         let ollama_url = g.settings.ollama_url.clone();
         let lmstudio_url = g.settings.lmstudio_url.clone();
+        let active_account = g.settings.active_account.clone();
 
         let pos = g
             .threads
@@ -751,15 +872,16 @@ async fn api_chat_send(
         }
         g.threads[pos].updated_at = chrono::Utc::now().to_rfc3339();
         let history = g.threads[pos].messages.clone();
-        (provider, model, sys_prompt, history, ollama_url, lmstudio_url)
+        (provider, model, sys_prompt, history, ollama_url, lmstudio_url, active_account)
     };
 
     core.broadcast_snapshot(None);
 
-    match run_ai_chat(&provider, &model, &sys_prompt, &history, &ollama_url, &lmstudio_url).await {
-        Ok((reply_text, thinking, used_model)) => {
+    match run_ai_chat(&provider, &model, &sys_prompt, &history, &ollama_url, &lmstudio_url, &active_account).await {
+        Ok((reply_text, thinking, used_model, token_count)) => {
             {
                 let mut g = core.inner.lock().unwrap();
+                g.record_ai_request(&active_account, token_count, false, None);
                 if let Some(th) = g.threads.iter_mut().find(|t| t.id == req.thread_id) {
                     th.messages.push(ChatMessage {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -782,6 +904,8 @@ async fn api_chat_send(
         Err(err) => {
             {
                 let mut g = core.inner.lock().unwrap();
+                let is_429 = err.contains("429");
+                g.record_ai_request(&active_account, None, is_429, Some(err.clone()));
                 if let Some(th) = g.threads.iter_mut().find(|t| t.id == req.thread_id) {
                     th.messages.push(ChatMessage {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -842,6 +966,21 @@ async fn api_screen_snip() -> impl IntoResponse {
         .and_then(|r| r)
     {
         Ok(data_url) => (StatusCode::OK, Json(json!({ "ok": true, "dataUrl": data_url }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+async fn api_clipboard_image() -> impl IntoResponse {
+    match tokio::task::spawn_blocking(read_clipboard_image_data_url)
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+    {
+        Ok(Some((data_url, name))) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "dataUrl": data_url, "name": name })),
+        ),
+        Ok(None) => (StatusCode::OK, Json(json!({ "ok": false }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
     }
 }
@@ -908,10 +1047,16 @@ struct OpenEditorReq {
     file_path: String,
     line: Option<u32>,
     editor: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn api_open_editor(Json(req): Json<OpenEditorReq>) -> impl IntoResponse {
-    match open_in_editor(&req.file_path, req.line, req.editor.as_deref()) {
+    match open_in_editor(
+        &req.file_path,
+        req.line,
+        req.editor.as_deref(),
+        req.workspace_path.as_deref(),
+    ) {
         Ok(msg) => (StatusCode::OK, Json(json!({ "ok": true, "message": msg }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
     }
@@ -1115,7 +1260,7 @@ async fn api_voice_save_note(
     State(core): State<AppCore>,
     Json(req): Json<SaveVoiceNoteReq>,
 ) -> Json<Value> {
-    let (lang, provider, model, ollama_url, lmstudio_url) = {
+    let (lang, provider, model, ollama_url, lmstudio_url, active_account) = {
         let g = core.inner.lock().unwrap();
         (
             g.settings.language.clone(),
@@ -1123,6 +1268,7 @@ async fn api_voice_save_note(
             g.settings.default_chat_model.clone(),
             g.settings.ollama_url.clone(),
             g.settings.lmstudio_url.clone(),
+            g.settings.active_account.clone(),
         )
     };
 
@@ -1136,6 +1282,7 @@ async fn api_voice_save_note(
         &model,
         &ollama_url,
         &lmstudio_url,
+        &active_account,
     )
     .await;
 

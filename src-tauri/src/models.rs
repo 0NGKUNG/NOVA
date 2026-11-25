@@ -59,6 +59,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_active_account() -> String {
+    "main".to_string()
+}
+
+fn default_main_account_name() -> String {
+    "Main Account".to_string()
+}
+
+fn default_second_account_name() -> String {
+    "Second Account".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShortcutBinding {
@@ -93,6 +105,12 @@ pub struct NovaSettings {
     pub bilingual_cleanup: bool,
     pub default_chat_provider: String, // "cli-antigravity" | "gemini" | "anthropic" | "openai" | "groq" | "openrouter" | "ollama" | "lmstudio"
     pub default_chat_model: String,
+    #[serde(default = "default_active_account")]
+    pub active_account: String, // "main" | "second"
+    #[serde(default = "default_main_account_name")]
+    pub main_account_name: String,
+    #[serde(default = "default_second_account_name")]
+    pub second_account_name: String,
     pub ollama_url: String,
     pub lmstudio_url: String,
     pub remote_lan_enabled: bool,
@@ -126,7 +144,10 @@ impl Default for NovaSettings {
             stt_provider: "groq".to_string(),
             bilingual_cleanup: true,
             default_chat_provider: "gemini".to_string(),
-            default_chat_model: "gemini-2.5-flash".to_string(),
+            default_chat_model: "gemini-3.8-flash-high".to_string(),
+            active_account: "main".to_string(),
+            main_account_name: "Main Account".to_string(),
+            second_account_name: "Second Account".to_string(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             lmstudio_url: "http://127.0.0.1:1234".to_string(),
             remote_lan_enabled: false,
@@ -254,6 +275,8 @@ pub struct SessionStep {
     pub added_lines: Option<usize>,
     #[serde(default)]
     pub removed_lines: Option<usize>,
+    #[serde(default)]
+    pub unified_diff: Option<String>,
     pub status: String, // "running" | "done" | "error" | "waiting"
     pub timestamp: String,
 }
@@ -272,6 +295,8 @@ pub struct FocusGroup {
     pub title: String,
     #[serde(default)]
     pub explicit_focus: bool,
+    #[serde(default)]
+    pub pre_text: Option<String>,
     pub started_at: String,
     #[serde(default)]
     pub ended_at: Option<String>,
@@ -286,6 +311,33 @@ pub struct SubagentNode {
     pub role: String,
     pub status: String,
     pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurn {
+    pub id: String,
+    pub user_prompt: String,
+    #[serde(default)]
+    pub assistant_output: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub tool_calls_count: usize,
+    #[serde(default)]
+    pub files_touched_count: usize,
+    #[serde(default)]
+    pub focus_groups: Vec<FocusGroup>,
+    #[serde(default)]
+    pub diffs: Vec<FileDiffPreview>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +365,8 @@ pub struct AgentSession {
     pub plan_steps: Vec<PlanStepItem>,
     #[serde(default)]
     pub focus_groups: Vec<FocusGroup>,
+    #[serde(default)]
+    pub turns: Vec<SessionTurn>,
     #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
@@ -580,7 +634,7 @@ impl Default for FocusState {
             todos: vec![
                 TodoItem {
                     id: "todo-1".into(),
-                    text: "Connect Antigravity hooks in NOVA Hub".into(),
+                    text: "Connect Antigravity hooks in NOVA Settings".into(),
                     completed: false,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 },
@@ -638,6 +692,7 @@ pub struct MobilePairingInfo {
 #[serde(rename_all = "camelCase")]
 pub struct SecretPresenceMap {
     pub gemini: bool,
+    pub gemini_second: bool,
     pub anthropic: bool,
     pub openai: bool,
     pub groq: bool,
@@ -645,6 +700,37 @@ pub struct SecretPresenceMap {
     pub github: bool,
     pub telegram_token: bool,
     pub telegram_chat_id: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaInfo {
+    pub account_id: String, // "main" | "second"
+    pub account_name: String,
+    pub provider: String,
+    pub model: String,
+    pub tier: String,
+    pub rpm_limit: u32,
+    pub rpm_used: u32,
+    pub rpd_limit: u32,
+    pub rpd_used: u32,
+    pub tpm_limit: u64,
+    pub tpm_used: u64,
+    pub total_tokens_today: u64,
+    pub percentage_used: f32,
+    pub status: String, // "healthy" | "warning" | "exceeded" | "unconfigured"
+    pub reset_in_seconds: u64,
+    pub last_error: Option<String>,
+    pub last_updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeQuotaState {
+    pub main: AccountQuotaInfo,
+    pub second: AccountQuotaInfo,
+    pub active_account: String,
+    pub active_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,6 +758,8 @@ pub struct NovaSnapshot {
     pub analytics: AnalyticsCounters,
     pub agy_hooks: AgyHookStatus,
     pub secrets: SecretPresenceMap,
+    #[serde(default)]
+    pub quota: RealtimeQuotaState,
     pub mobile: MobilePairingInfo,
     #[serde(default)]
     pub recent_workspaces: Vec<WorkspaceEntry>,

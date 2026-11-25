@@ -1,28 +1,57 @@
 use crate::agy_hooks::{inspect_antigravity_hooks, nova_data_dir};
 use crate::ai_services::{build_mobile_pairing_info, secret_presence_map, send_telegram_approval_alert};
 use crate::models::{
-    AgentSession, AnalyticsCounters, ApprovalRule, ChatMessage, ChatPersona, ChatThread,
-    ClipboardEntry, FileDiffPreview, FocusGroup, FocusState, HookRelayResponse,
-    NormalizedHookEnvelope, NovaSettings, NovaSnapshot, PendingApproval, PlanStepItem, SessionStep,
-    SubagentNode, TechTerm, VoiceNote, VoiceSnippet,
+    AccountQuotaInfo, AgentSession, AnalyticsCounters, ApprovalRule, ChatMessage, ChatPersona,
+    ChatThread, ClipboardEntry, FileDiffPreview, FocusGroup, FocusState, HookRelayResponse,
+    NormalizedHookEnvelope, NovaSettings, NovaSnapshot, PendingApproval, PlanStepItem,
+    RealtimeQuotaState, SessionStep, SessionTurn, SubagentNode, TechTerm, VoiceNote, VoiceSnippet,
 };
 use crate::risk::{assess_tool_risk, build_file_diff_preview};
 use crate::system_tools::{
     annotate_altgr_conflicts, detect_antigravity_permission_mode, discover_recent_workspaces,
     kill_owned_child_tree, local_lan_ipv4, read_clipboard_text, resolve_agy_cli_path,
-    save_snip_png_to_disk, spawn_headless_agy_turn,
+    save_image_data_url_to_disk, spawn_headless_agy_turn,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokio::sync::{broadcast, oneshot};
 
 pub const CORE_PORT: u16 = 47920;
+
+#[derive(Debug, Clone)]
+pub struct AccountUsageHistory {
+    pub minute_requests: std::collections::VecDeque<std::time::Instant>,
+    pub daily_request_count: u32,
+    pub daily_reset_epoch_day: u64,
+    pub total_tokens_today: u64,
+    pub last_429: Option<std::time::Instant>,
+    pub last_probe_status: Option<String>,
+}
+
+impl Default for AccountUsageHistory {
+    fn default() -> Self {
+        Self {
+            minute_requests: std::collections::VecDeque::new(),
+            daily_request_count: 0,
+            daily_reset_epoch_day: chrono::Utc::now().timestamp() as u64 / 86400,
+            total_tokens_today: 0,
+            last_429: None,
+            last_probe_status: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuotaTracker {
+    pub main: AccountUsageHistory,
+    pub second: AccountUsageHistory,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +67,18 @@ struct PersistedStore {
     analytics: AnalyticsCounters,
 }
 
+pub struct WarmAgyWorker {
+    pub pid: u32,
+    pub stdin: Arc<Mutex<std::process::ChildStdin>>,
+    pub mode: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub workspace_path: String,
+    pub skip_permissions: bool,
+    pub turn_active: bool,
+    pub last_used_at: std::time::Instant,
+}
+
 pub struct InnerState {
     pub settings: NovaSettings,
     pub sessions: Vec<AgentSession>,
@@ -45,6 +86,7 @@ pub struct InnerState {
     pub approval_waiters: HashMap<String, oneshot::Sender<HookRelayResponse>>,
     pub pending_tool_diffs: HashMap<String, FileDiffPreview>,
     pub bg_pids: HashMap<String, u32>,
+    pub warm_workers: HashMap<String, WarmAgyWorker>,
     pub approval_rules: Vec<ApprovalRule>,
     pub threads: Vec<ChatThread>,
     pub personas: Vec<ChatPersona>,
@@ -54,16 +96,20 @@ pub struct InnerState {
     pub voice_notes: Vec<VoiceNote>,
     pub focus: FocusState,
     pub analytics: AnalyticsCounters,
+    pub quota_tracker: QuotaTracker,
     pub ipc_token: String,
     pub pairing_token: String,
     pub lan_ip: String,
 }
+
+pub type UiLivenessFn = Arc<dyn Fn() -> oneshot::Receiver<()> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppCore {
     pub inner: Arc<Mutex<InnerState>>,
     pub sys: Arc<Mutex<System>>,
     pub events_tx: broadcast::Sender<Value>,
+    pub ui_liveness: Arc<Mutex<Option<UiLivenessFn>>>,
 }
 
 fn default_personas() -> Vec<ChatPersona> {
@@ -143,40 +189,174 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Strips `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`, and `<SYSTEM_MESSAGE>` wrappers from prompts.
+fn strip_nova_prompt_wrappers(s: &str) -> String {
+    let mut cur = s.trim();
+
+    // 1. Strip structured `<NOVA_HANDOFF_CONTEXT>...</NOVA_HANDOFF_CONTEXT>` wrapper
+    if let (Some(start), Some(end)) = (
+        cur.find("<NOVA_HANDOFF_CONTEXT>"),
+        cur.find("</NOVA_HANDOFF_CONTEXT>"),
+    ) {
+        if start == 0 && end >= start {
+            cur = cur[end + "</NOVA_HANDOFF_CONTEXT>".len()..].trim();
+        }
+    }
+
+    // 2. Strip legacy `[Context from preceding Antigravity IDE session ...]\n\n` prefix
+    if cur.starts_with("[Context from preceding Antigravity IDE session") {
+        let summary_anchor = cur.find("Last assistant summary:").unwrap_or(0);
+        let tail = &cur[summary_anchor..];
+        if let Some(rel_close) = tail.find("]\n\n") {
+            let after = tail[rel_close + 3..].trim();
+            if !after.is_empty() {
+                cur = after;
+            }
+        } else if let Some(rel_close) = tail.find("]\n") {
+            let after = tail[rel_close + 2..].trim();
+            if !after.is_empty() {
+                cur = after;
+            }
+        }
+    }
+
+    // 3. Clean NOVA's internal screenshot/image tool instruction suffix if present
+    let mut owned = cur.to_string();
+    if let Some(att_idx) = owned.rfind("\n\n[Attached Screenshot: `") {
+        let suffix = &owned[att_idx + "\n\n[Attached Screenshot: `".len()..];
+        if let Some((path_part, rest)) = suffix.split_once('`') {
+            if rest.contains("inspect this image file") && rest.trim_end().ends_with(']') {
+                let base = Path::new(path_part)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "snip.png".to_string());
+                owned.truncate(att_idx);
+                owned.push_str(&format!("\n\n📎 Attached screenshot: `{base}`"));
+            }
+        }
+    } else if let Some(multi_idx) = owned.rfind("\n\n[Attached Images — inspect each image file with read_file:\n") {
+        let suffix = &owned[multi_idx..];
+        if suffix.trim_end().ends_with(']') {
+            let names: Vec<String> = suffix
+                .lines()
+                .filter_map(|l| {
+                    let (_, after) = l.split_once('`')?;
+                    let (p, _) = after.split_once('`')?;
+                    Path::new(p)
+                        .file_name()
+                        .map(|n| format!("`{}`", n.to_string_lossy()))
+                })
+                .collect();
+            if !names.is_empty() {
+                owned.truncate(multi_idx);
+                owned.push_str(&format!("\n\n📎 Attached images: {}", names.join(", ")));
+            }
+        }
+    } else if owned.starts_with("Inspect the attached screenshot at `")
+        && owned.ends_with("using read_file and fix any visual or UI issue you find.")
+    {
+        if let Some(rest) = owned.strip_prefix("Inspect the attached screenshot at `") {
+            if let Some((path_part, _)) = rest.split_once('`') {
+                let base = Path::new(path_part)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "snip.png".to_string());
+                owned = format!(
+                    "📎 Inspect attached screenshot (`{base}`) and fix any visual or UI issue"
+                );
+            }
+        }
+    } else if owned.starts_with("Inspect the attached images using read_file and address what they show:\n") {
+        let names: Vec<String> = owned
+            .lines()
+            .filter_map(|l| {
+                let (_, after) = l.split_once('`')?;
+                let (p, _) = after.split_once('`')?;
+                Path::new(p)
+                    .file_name()
+                    .map(|n| format!("`{}`", n.to_string_lossy()))
+            })
+            .collect();
+        if !names.is_empty() {
+            owned = format!("📎 Inspect attached images ({})", names.join(", "));
+        }
+    }
+
+    // 4. Fallback for pre-truncated legacy handoff strings with no trailing user prompt
+    if owned.starts_with("[Context from preceding Antigravity IDE session") {
+        owned = owned
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .replace("\nLast user request:", "\n**Last user request:**")
+            .replace(" Last user request:", "\n**Last user request:**")
+            .replace("\nLast assistant summary:", "\n**Last assistant summary:**")
+            .replace(" Last assistant summary:", "\n**Last assistant summary:**");
+    }
+
+    owned
+}
+
+/// Strips `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`, `<SYSTEM_MESSAGE>`,
+/// and NOVA handoff wrappers while preserving multi-line formatting and full prompt content.
 fn clean_user_prompt(raw: &str) -> Option<String> {
-    let has_image = raw.contains("uploaded") && raw.contains("image(s):");
+    let normalized_crlf;
+    let src = if raw.contains('\r') {
+        normalized_crlf = raw.replace("\r\n", "\n").replace('\r', "\n");
+        normalized_crlf.as_str()
+    } else {
+        raw
+    };
+
+    let has_image = src.contains("uploaded") && src.contains("image(s):");
     let extracted = if let (Some(start), Some(end)) =
-        (raw.find("<USER_REQUEST>"), raw.find("</USER_REQUEST>"))
+        (src.find("<USER_REQUEST>"), src.find("</USER_REQUEST>"))
     {
         let inner_start = start + "<USER_REQUEST>".len();
         if end >= inner_start {
-            &raw[inner_start..end]
+            &src[inner_start..end]
         } else {
-            raw
+            src
         }
     } else {
-        let cut = raw
-            .find("<ADDITIONAL_METADATA>")
-            .or_else(|| raw.find("<SYSTEM_MESSAGE>"))
-            .unwrap_or(raw.len());
-        &raw[..cut]
+        let cuts = [
+            src.find("<ADDITIONAL_METADATA>"),
+            src.find("<USER_SETTINGS_CHANGE>"),
+            src.find("<SYSTEM_MESSAGE>"),
+            src.find("\n\nThe following is a <SYSTEM_MESSAGE>"),
+        ];
+        let cut = cuts.into_iter().flatten().min().unwrap_or(src.len());
+        &src[..cut]
     };
 
-    let collapsed = extracted
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let stripped = strip_nova_prompt_wrappers(extracted);
 
-    if collapsed.is_empty() {
+    let mut lines_out: Vec<&str> = Vec::new();
+    let mut blank_run = 0usize;
+    for line in stripped.trim().lines() {
+        let rtrimmed = line.trim_end();
+        if rtrimmed.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 && !lines_out.is_empty() {
+                lines_out.push("");
+            }
+        } else {
+            blank_run = 0;
+            lines_out.push(rtrimmed);
+        }
+    }
+    while lines_out.last().is_some_and(|l| l.is_empty()) {
+        lines_out.pop();
+    }
+    let formatted = lines_out.join("\n");
+
+    if formatted.is_empty() {
         if has_image {
             return Some("📎 Screenshot / media attached".to_string());
         }
         return None;
     }
-    Some(truncate_chars(&collapsed, 240))
+    Some(truncate_chars(&formatted, 16_000))
 }
 
 fn humanize_model_name(raw: &str) -> Option<String> {
@@ -184,14 +364,52 @@ fn humanize_model_name(raw: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
         return None;
     }
+    if trimmed.contains(' ') || trimmed.contains('(') {
+        return Some(trimmed.to_string());
+    }
     let lower = trimmed.to_ascii_lowercase();
-    if lower == "gemini-4-carbon-high" {
-        return Some("Gemini 4 Carbon (High)".to_string());
-    }
-    if lower == "gemini-4-carbon" {
-        return Some("Gemini 4 Carbon".to_string());
-    }
-    Some(trimmed.to_string())
+    let (base, effort_label) = if let Some(b) = lower.strip_suffix("-xhigh") {
+        (b, Some("XHigh"))
+    } else if let Some(b) = lower.strip_suffix("-high") {
+        (b, Some("High"))
+    } else if let Some(b) = lower.strip_suffix("-medium") {
+        (b, Some("Med"))
+    } else if let Some(b) = lower.strip_suffix("-low") {
+        (b, Some("Low"))
+    } else {
+        (lower.as_str(), None)
+    };
+
+    let pretty_base = match base {
+        "gemini-3.8-flash" => "Gemini 3.8 Flash".to_string(),
+        "gemini-4-carbon" => "Gemini 4 Carbon".to_string(),
+        "gemini-4-hydrogen" => "Gemini 4 Hydrogen".to_string(),
+        "gemini-4-neon" => "Gemini 4 Neon".to_string(),
+        "gemini-4-argon" => "Gemini 4 Argon".to_string(),
+        "gemini-pro-orchestrator" => "Gemini Pro Orchestrator".to_string(),
+        "gemini-pro-orchestrator-neon" => "Gemini Pro Orchestrator (Neon)".to_string(),
+        "gemini-pro-orchestrator-argon" => "Gemini Pro Orchestrator (Argon)".to_string(),
+        "claude-sonnet-5-5" => "Claude Sonnet 5.5".to_string(),
+        "claude-opus-5-5" => "Claude Opus 5.5".to_string(),
+        "gpt-oss-120b" => "GPT-OSS 120B".to_string(),
+        other => other
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+
+    Some(match effort_label {
+        Some(eff) => format!("{pretty_base} ({eff})"),
+        None => pretty_base,
+    })
 }
 
 /// Unwraps protojson double-encoded string values found in `transcript.jsonl` tool_calls args.
@@ -479,16 +697,20 @@ fn discover_transcript_path(
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-            let candidate = PathBuf::from(home)
-                .join(".gemini")
-                .join("antigravity")
-                .join("brain")
-                .join(conversation_id)
-                .join(".system_generated")
-                .join("logs")
-                .join("transcript.jsonl");
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().to_string());
+            let base = PathBuf::from(home).join(".gemini");
+            for flavor in ["antigravity-cli", "antigravity"] {
+                for filename in ["transcript.jsonl", "transcript_full.jsonl"] {
+                    let candidate = base
+                        .join(flavor)
+                        .join("brain")
+                        .join(conversation_id)
+                        .join(".system_generated")
+                        .join("logs")
+                        .join(filename);
+                    if candidate.is_file() {
+                        return Some(candidate.to_string_lossy().to_string());
+                    }
+                }
             }
         }
     }
@@ -508,6 +730,7 @@ struct TranscriptInsights {
     focus_groups: Vec<FocusGroup>,
     diffs: Vec<FileDiffPreview>,
     detected_ide_permission: Option<String>,
+    turns: Vec<SessionTurn>,
 }
 
 fn auto_summarize_group_steps(steps: &[SessionStep]) -> String {
@@ -607,7 +830,7 @@ fn clean_assistant_output(raw: &str) -> Option<String> {
     }
 }
 
-fn read_untruncated_step_content(compact_path: &Path, step_index: u64) -> Option<String> {
+fn read_untruncated_raw_step_content(compact_path: &Path, step_index: u64) -> Option<String> {
     let full_path = compact_path.with_file_name("transcript_full.jsonl");
     let mut file = fs::File::open(full_path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -624,12 +847,17 @@ fn read_untruncated_step_content(compact_path: &Path, step_index: u64) -> Option
                     return obj
                         .get("content")
                         .and_then(|v| v.as_str())
-                        .and_then(clean_assistant_output);
+                        .map(|s| s.to_string());
                 }
             }
         }
     }
     None
+}
+
+fn read_untruncated_step_content(compact_path: &Path, step_index: u64) -> Option<String> {
+    read_untruncated_raw_step_content(compact_path, step_index)
+        .and_then(|s| clean_assistant_output(&s))
 }
 
 /// Fast tail-reader (~0.3 ms) that extracts live Thinking, Focus, Checklist Steps, and Output
@@ -646,7 +874,7 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
         return None;
     }
 
-    const TAIL_BYTES: u64 = 196_608;
+    const TAIL_BYTES: u64 = 1_048_576;
     let start = len.saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
 
@@ -661,6 +889,28 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
     }
 
     let mut out = TranscriptInsights::default();
+    let mut collected_turns: Vec<SessionTurn> = Vec::new();
+    let mut current_turn: Option<SessionTurn> = None;
+    let mut pending_pre_text: Option<String> = None;
+
+    let finalize_turn_snapshot =
+        |turn: &mut SessionTurn, groups: &[FocusGroup], diffs: &[FileDiffPreview]| {
+            let mut turn_groups = groups.to_vec();
+            dedup_and_merge_focus_groups(&mut turn_groups);
+            let fallback_end = turn.completed_at.clone().or_else(|| turn.started_at.clone());
+            for g in &mut turn_groups {
+                if g.ended_at.is_none() {
+                    g.ended_at = fallback_end.clone();
+                }
+            }
+            let mut turn_diffs: Vec<FileDiffPreview> = diffs.iter().rev().cloned().collect();
+            dedup_session_diffs(&mut turn_diffs);
+            if !turn_diffs.is_empty() {
+                turn.files_touched_count = turn_diffs.len();
+            }
+            turn.focus_groups = turn_groups;
+            turn.diffs = turn_diffs;
+        };
 
     for line in lines {
         let trimmed = line.trim();
@@ -683,10 +933,46 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                 }
                 if source == "USER_EXPLICIT" {
                     out.has_explicit_turn = true;
-                    if let Some(cleaned) = clean_user_prompt(c) {
-                        out.user_prompt = Some(cleaned);
+                    let content_truncated = obj
+                        .get("truncated_fields")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some("content")));
+                    let untruncated = if content_truncated {
+                        obj.get("step_index")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|idx| read_untruncated_raw_step_content(path, idx))
+                    } else {
+                        None
+                    };
+                    let effective_c = untruncated.as_deref().unwrap_or(c);
+                    if let Some(cleaned) = clean_user_prompt(effective_c) {
+                        if let Some(mut prev) = current_turn.take() {
+                            finalize_turn_snapshot(&mut prev, &out.focus_groups, &out.diffs);
+                            collected_turns.push(prev);
+                        }
+                        out.user_prompt = Some(cleaned.clone());
+                        let turn_ts = obj
+                            .get("created_at")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        current_turn = Some(SessionTurn {
+                            id: format!("turn-{}", collected_turns.len() + 1),
+                            user_prompt: cleaned,
+                            assistant_output: None,
+                            thinking: None,
+                            model_name: None,
+                            tool_calls_count: 0,
+                            files_touched_count: 0,
+                            focus_groups: Vec::new(),
+                            diffs: Vec::new(),
+                            started_at: turn_ts,
+                            completed_at: None,
+                            is_active: false,
+                        });
                     }
                     // Strictly scope steps, focus groups, diffs, notes & output to the CURRENT user turn only!
+                    pending_pre_text = None;
                     out.plan_steps = None;
                     out.current_focus = None;
                     out.focus_groups.clear();
@@ -709,12 +995,18 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
 
             if let Some(m) = obj.get("model").and_then(|v| v.as_str()) {
                 if let Some(hm) = humanize_model_name(m) {
-                    out.model_name = Some(hm);
+                    out.model_name = Some(hm.clone());
+                    if let Some(cur) = current_turn.as_mut() {
+                        cur.model_name = Some(hm);
+                    }
                 }
             }
             if let Some(th) = obj.get("thinking").and_then(|v| v.as_str()) {
                 if let Some(clean_th) = extract_latest_thinking_paragraph(th) {
-                    out.latest_thinking = Some(clean_th);
+                    out.latest_thinking = Some(clean_th.clone());
+                    if let Some(cur) = current_turn.as_mut() {
+                        cur.thinking = Some(clean_th);
+                    }
                 }
             }
             let tool_calls = obj.get("tool_calls").and_then(|v| v.as_array());
@@ -726,7 +1018,7 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                 .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some("content")));
 
             if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
-                let resolved_out = if !has_tool_calls && content_truncated {
+                let resolved_out = if content_truncated {
                     obj.get("step_index")
                         .and_then(|v| v.as_u64())
                         .and_then(|idx| read_untruncated_step_content(path, idx))
@@ -737,17 +1029,31 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
 
                 if let Some(clean_out) = resolved_out {
                     if has_tool_calls {
-                        // Mid-process status note emitted alongside tool calls (NOT final output)
-                        let compact_note = clean_out
-                            .lines()
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        out.mid_process_note = Some(truncate_chars(&compact_note, 230));
-                    } else {
-                        out.latest_output = Some(clean_out);
+                        // Mid-turn commentary written by the agent alongside tool calls:
+                        // attach as clean Markdown `pre_text` right above the upcoming tool/focus group
+                        // (NEVER stuff full sentences into `mid_process_note` spinner pills!).
+                        match pending_pre_text.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(&clean_out);
+                            }
+                            None => {
+                                pending_pre_text = Some(clean_out);
+                            }
+                        }
                         out.mid_process_note = None;
+                    } else {
+                        let final_md = if let Some(prefix) = pending_pre_text.take() {
+                            format!("{prefix}\n\n{clean_out}")
+                        } else {
+                            clean_out
+                        };
+                        out.latest_output = Some(final_md.clone());
+                        out.mid_process_note = None;
+                        if let Some(cur) = current_turn.as_mut() {
+                            cur.assistant_output = Some(final_md);
+                            cur.completed_at = Some(step_ts.clone());
+                        }
                     }
                 } else if !has_tool_calls {
                     out.mid_process_note = None;
@@ -765,6 +1071,15 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
             }
 
             if let Some(tcs) = tool_calls {
+                if let Some(cur) = current_turn.as_mut() {
+                    cur.tool_calls_count += tcs.len();
+                    for tc in tcs {
+                        let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                        if name == "edit_file" || name == "write_file" || name == "Edit" || name == "Write" {
+                            cur.files_touched_count += 1;
+                        }
+                    }
+                }
                 for tc in tcs {
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or_default();
                     let args = tc.get("args").unwrap_or(&Value::Null);
@@ -774,10 +1089,36 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                         if let Some(f) = extract_focus_phrase(args) {
                             out.current_focus = Some(f.clone());
                             if let Some(prev) = out.focus_groups.last_mut() {
-                                if prev.steps.is_empty() {
+                                if prev.title.trim().eq_ignore_ascii_case(f.trim())
+                                    && (prev.steps.is_empty() || pending_pre_text.is_none())
+                                {
+                                    prev.title = f;
+                                    prev.explicit_focus = true;
+                                    prev.ended_at = None;
+                                    if let Some(pt) = pending_pre_text.take() {
+                                        match prev.pre_text.as_mut() {
+                                            Some(ex) => {
+                                                ex.push_str("\n\n");
+                                                ex.push_str(&pt);
+                                            }
+                                            None => prev.pre_text = Some(pt),
+                                        }
+                                    }
+                                    continue;
+                                } else if prev.steps.is_empty() {
                                     prev.title = f;
                                     prev.explicit_focus = true;
                                     prev.started_at = step_ts.clone();
+                                    prev.ended_at = None;
+                                    if let Some(pt) = pending_pre_text.take() {
+                                        match prev.pre_text.as_mut() {
+                                            Some(ex) => {
+                                                ex.push_str("\n\n");
+                                                ex.push_str(&pt);
+                                            }
+                                            None => prev.pre_text = Some(pt),
+                                        }
+                                    }
                                     continue;
                                 } else if prev.ended_at.is_none() {
                                     prev.ended_at = Some(step_ts.clone());
@@ -787,6 +1128,7 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                                 id: format!("fg-{}", out.focus_groups.len() + 1),
                                 title: f,
                                 explicit_focus: true,
+                                pre_text: pending_pre_text.take(),
                                 started_at: step_ts.clone(),
                                 ended_at: None,
                                 steps: Vec::new(),
@@ -804,9 +1146,20 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                             .as_ref()
                             .and_then(|d| d.start_line)
                             .or(meta.start_line);
+                        let step_unified_diff = tr_diff.as_ref().map(|d| d.unified_diff.clone());
                         if let Some(mut dp) = tr_diff {
                             dp.timestamp = step_ts.clone();
                             out.diffs.push(dp);
+                        }
+
+                        // If the agent wrote new mid-turn prose before this tool call and the last group
+                        // already ran steps, start a fresh group so prose stays interleaved in order!
+                        if pending_pre_text.is_some() {
+                            if let Some(prev) = out.focus_groups.last_mut() {
+                                if !prev.steps.is_empty() && prev.ended_at.is_none() {
+                                    prev.ended_at = Some(step_ts.clone());
+                                }
+                            }
                         }
 
                         let need_new = out
@@ -816,12 +1169,26 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                         if need_new {
                             out.focus_groups.push(FocusGroup {
                                 id: format!("fg-{}", out.focus_groups.len() + 1),
-                                title: "Working…".to_string(),
-                                explicit_focus: false,
+                                title: out
+                                    .current_focus
+                                    .clone()
+                                    .unwrap_or_else(|| "Working…".to_string()),
+                                explicit_focus: out.current_focus.is_some(),
+                                pre_text: pending_pre_text.take(),
                                 started_at: step_ts.clone(),
                                 ended_at: None,
                                 steps: Vec::new(),
                             });
+                        } else if let Some(pt) = pending_pre_text.take() {
+                            if let Some(grp) = out.focus_groups.last_mut() {
+                                match grp.pre_text.as_mut() {
+                                    Some(ex) => {
+                                        ex.push_str("\n\n");
+                                        ex.push_str(&pt);
+                                    }
+                                    None => grp.pre_text = Some(pt),
+                                }
+                            }
                         }
                         if let Some(grp) = out.focus_groups.last_mut() {
                             grp.steps.push(SessionStep {
@@ -840,6 +1207,7 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                                 start_line: step_start_line,
                                 added_lines: step_added,
                                 removed_lines: step_removed,
+                                unified_diff: step_unified_diff,
                                 status: "done".to_string(),
                                 timestamp: step_ts.clone(),
                             });
@@ -853,17 +1221,300 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
         }
     }
 
+    // If agent emitted mid-turn text right before `update_steps` while still running (no tool group yet),
+    // expose it cleanly in `latest_output` until final output arrives so it renders as white text immediately!
+    if let Some(pending) = pending_pre_text.take() {
+        if out.latest_output.is_none() {
+            out.latest_output = Some(pending);
+        }
+    }
+
+    if let Some(mut last) = current_turn.take() {
+        finalize_turn_snapshot(&mut last, &out.focus_groups, &out.diffs);
+        collected_turns.push(last);
+    }
+    let total_turns = collected_turns.len();
+    out.turns = collected_turns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut t)| {
+            t.is_active = idx + 1 == total_turns;
+            t
+        })
+        .collect();
+
     Some(out)
 }
 
-fn apply_insights_to_session(sess: &mut AgentSession, ins: TranscriptInsights) -> bool {
+fn normalize_path_key(p: &str) -> String {
+    p.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn steps_represent_same_action(a: &SessionStep, b: &SessionStep) -> bool {
+    if a.tool_name != b.tool_name
+        || a.verb != b.verb
+        || a.summary != b.summary
+        || a.line_range != b.line_range
+    {
+        return false;
+    }
+    if let (Some(pa), Some(pb)) = (a.file_path.as_deref(), b.file_path.as_deref()) {
+        if !pa.is_empty() && !pb.is_empty() && normalize_path_key(pa) != normalize_path_key(pb) {
+            return false;
+        }
+    }
+    if let (Some(da), Some(db)) = (a.detail.as_deref(), b.detail.as_deref()) {
+        if !da.is_empty() && !db.is_empty() && da != db {
+            return false;
+        }
+    }
+    true
+}
+
+fn step_matches_meta(st: &SessionStep, tool_name: &str, meta: &FormattedStepMeta) -> bool {
+    let same_tool = match st.tool_name.as_deref() {
+        Some(t) if !t.is_empty() && !tool_name.is_empty() => t == tool_name,
+        _ => true,
+    };
+    if !same_tool
+        || st.verb != meta.verb
+        || st.summary != meta.summary
+        || st.line_range != meta.line_range
+    {
+        return false;
+    }
+    if let (Some(pa), Some(pb)) = (st.file_path.as_deref(), meta.file_path.as_deref()) {
+        if !pa.is_empty() && !pb.is_empty() && normalize_path_key(pa) != normalize_path_key(pb) {
+            return false;
+        }
+    }
+    if let (Some(da), Some(db)) = (st.detail.as_deref(), meta.detail.as_deref()) {
+        if !da.is_empty() && !db.is_empty() && da != db {
+            return false;
+        }
+    }
+    true
+}
+
+fn merge_step_into_vec(dst: &mut Vec<SessionStep>, incoming: SessionStep) {
+    // 1. Exact call_id match -> update in-place
+    if let Some(ref cid) = incoming.call_id {
+        if let Some(existing) = dst.iter_mut().find(|s| s.call_id.as_ref() == Some(cid)) {
+            if incoming.event != "Transcript" {
+                existing.event = incoming.event;
+                existing.status = incoming.status;
+                existing.timestamp = incoming.timestamp;
+            }
+            if incoming.detail.is_some() {
+                existing.detail = incoming.detail;
+            }
+            if incoming.file_path.is_some() {
+                existing.file_path = incoming.file_path;
+            }
+            if incoming.start_line.is_some() {
+                existing.start_line = incoming.start_line;
+            }
+            if incoming.added_lines.is_some() {
+                existing.added_lines = incoming.added_lines;
+                existing.removed_lines = incoming.removed_lines;
+            }
+            if incoming.unified_diff.is_some() {
+                existing.unified_diff = incoming.unified_diff;
+            }
+            return;
+        }
+    }
+
+    // 2. Real hook step (`call_id.is_some()`) upgrades an unclaimed `Transcript` placeholder 1-to-1
+    if incoming.call_id.is_some() {
+        if let Some(tr_slot) = dst.iter_mut().find(|s| {
+            s.call_id.is_none()
+                && s.event == "Transcript"
+                && steps_represent_same_action(s, &incoming)
+        }) {
+            let saved_diff = tr_slot.unified_diff.take();
+            *tr_slot = incoming;
+            if tr_slot.unified_diff.is_none() {
+                tr_slot.unified_diff = saved_diff;
+            }
+            return;
+        }
+    } else if incoming.event == "Transcript" {
+        // Ignore a `Transcript` step if a real hook step for the same action is already present
+        // and not yet paired with an earlier transcript placeholder.
+        let hook_count = dst
+            .iter()
+            .filter(|s| s.call_id.is_some() && steps_represent_same_action(s, &incoming))
+            .count();
+        let tr_count = dst
+            .iter()
+            .filter(|s| {
+                s.call_id.is_none()
+                    && s.event == "Transcript"
+                    && steps_represent_same_action(s, &incoming)
+            })
+            .count();
+        if hook_count > tr_count {
+            return;
+        }
+    }
+
+    dst.push(incoming);
+}
+
+/// Merges consecutive `FocusGroup`s with identical titles and reconciles `Transcript` vs live hook steps.
+fn dedup_and_merge_focus_groups(groups: &mut Vec<FocusGroup>) {
+    if groups.is_empty() {
+        return;
+    }
+    let old = std::mem::take(groups);
+    let mut merged: Vec<FocusGroup> = Vec::with_capacity(old.len());
+
+    for mut grp in old {
+        let mut clean_steps = Vec::with_capacity(grp.steps.len());
+        for st in grp.steps.drain(..) {
+            merge_step_into_vec(&mut clean_steps, st);
+        }
+        grp.steps = clean_steps;
+        if !grp.explicit_focus && !grp.steps.is_empty() {
+            grp.title = auto_summarize_group_steps(&grp.steps);
+        }
+
+        // Do not merge across a new mid-turn prose block once `prev` already has steps,
+        // so chronological interleaving (`steps -> AI prose -> next steps`) stays intact.
+        let should_merge_with_prev = merged.last().is_some_and(|prev| {
+            let can_combine = prev.steps.is_empty() || grp.pre_text.is_none();
+            can_combine
+                && (prev.title.trim().eq_ignore_ascii_case(grp.title.trim())
+                    || (!prev.explicit_focus && prev.steps.is_empty()))
+        });
+
+        if should_merge_with_prev {
+            if let Some(prev) = merged.last_mut() {
+                if grp.explicit_focus {
+                    prev.title = grp.title;
+                    prev.explicit_focus = true;
+                }
+                if let Some(pt) = grp.pre_text {
+                    match prev.pre_text.as_mut() {
+                        Some(ex) if !ex.contains(pt.trim()) => {
+                            ex.push_str("\n\n");
+                            ex.push_str(&pt);
+                        }
+                        None => prev.pre_text = Some(pt),
+                        _ => {}
+                    }
+                }
+                // Preserve earliest started_at; take latest group's ended_at (None if still active)
+                prev.ended_at = grp.ended_at;
+                for st in grp.steps {
+                    merge_step_into_vec(&mut prev.steps, st);
+                }
+                if prev.steps.len() > 500 {
+                    let excess = prev.steps.len() - 500;
+                    prev.steps.drain(0..excess);
+                }
+                if !prev.explicit_focus && !prev.steps.is_empty() {
+                    prev.title = auto_summarize_group_steps(&prev.steps);
+                }
+            }
+        } else {
+            merged.push(grp);
+        }
+    }
+
+    *groups = merged;
+}
+
+/// Deduplicates un-reverted `FileDiffPreview` entries with the same normalized path and unified diff.
+fn dedup_session_diffs(diffs: &mut Vec<FileDiffPreview>) {
+    if diffs.len() <= 1 {
+        return;
+    }
+    // `diffs` is stored newest-first; keep the newest occurrence of an identical `(path, unified_diff)`.
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    diffs.retain(|d| {
+        if d.reverted {
+            return true;
+        }
+        let key = (normalize_path_key(&d.file_path), d.unified_diff.trim().to_string());
+        seen.insert(key)
+    });
+}
+
+/// Snapshots the active session's `focus_groups` and `diffs` onto the latest `SessionTurn`
+/// before starting a new turn or finalizing, so past turns retain expandable logs & diffs.
+fn snapshot_logs_into_latest_turn(sess: &mut AgentSession) {
+    if let Some(last_turn) = sess.turns.last_mut() {
+        if !sess.focus_groups.is_empty() {
+            let mut fg_copy = sess.focus_groups.clone();
+            for fg in &mut fg_copy {
+                if fg.ended_at.is_none() {
+                    fg.ended_at = Some(sess.updated_at.clone());
+                }
+                for st in &mut fg.steps {
+                    if st.status == "running" {
+                        st.status = "done".into();
+                    }
+                }
+            }
+            last_turn.focus_groups = fg_copy;
+        }
+        if !sess.diffs.is_empty() {
+            last_turn.diffs = sess.diffs.clone();
+            last_turn.files_touched_count = sess.diffs.len();
+        }
+        if last_turn.tool_calls_count == 0 && !last_turn.focus_groups.is_empty() {
+            last_turn.tool_calls_count = last_turn.focus_groups.iter().map(|g| g.steps.len()).sum();
+        }
+    }
+}
+
+fn apply_insights_to_session(
+    sess: &mut AgentSession,
+    ins: TranscriptInsights,
+    allow_structural_backfill: bool,
+) -> bool {
     let mut changed = false;
+    let prompt_changed = ins
+        .user_prompt
+        .as_deref()
+        .is_some_and(|p| sess.last_user_input.as_deref() != Some(p));
+    let stale_bg_transcript = sess.bg_running
+        && !sess.turns.is_empty()
+        && ins.turns.len() < sess.turns.len()
+        && prompt_changed;
+
+    if stale_bg_transcript {
+        return false;
+    }
+
+    let turn_count_grew = !sess.turns.is_empty() && ins.turns.len() > sess.turns.len();
+    let had_prior_prompt = sess.last_user_input.is_some();
+
+    // If transcript moved to a brand-new user turn, archive prior turn logs before clearing!
+    if (had_prior_prompt && prompt_changed) || turn_count_grew {
+        snapshot_logs_into_latest_turn(sess);
+        sess.focus_groups.clear();
+        sess.steps.clear();
+        sess.diffs.clear();
+        sess.plan_steps.clear();
+        sess.current_focus = None;
+        if sess.bg_running || ins.latest_output.is_some() {
+            sess.last_error = None;
+        }
+        changed = true;
+    }
+
     if let Some(p) = ins.user_prompt {
-        if sess.last_user_input.as_deref() != Some(p.as_str()) {
+        if prompt_changed {
             sess.last_user_input = Some(p);
             changed = true;
         }
     }
+
     if let Some(m) = ins.model_name {
         if sess.model_name.as_deref() != Some(m.as_str()) {
             sess.model_name = Some(m);
@@ -876,12 +1527,16 @@ fn apply_insights_to_session(sess: &mut AgentSession, ins: TranscriptInsights) -
             changed = true;
         }
     }
-    if sess.latest_output != ins.latest_output {
-        sess.latest_output = ins.latest_output;
-        changed = true;
+    if ins.latest_output.is_some() || !sess.bg_running {
+        if sess.latest_output != ins.latest_output {
+            sess.latest_output = ins.latest_output;
+            changed = true;
+        }
     }
     if sess.status == "active" || sess.status == "waiting_approval" {
-        if sess.mid_process_note != ins.mid_process_note {
+        if (ins.mid_process_note.is_some() || !sess.bg_running)
+            && sess.mid_process_note != ins.mid_process_note
+        {
             sess.mid_process_note = ins.mid_process_note;
             changed = true;
         }
@@ -918,16 +1573,231 @@ fn apply_insights_to_session(sess: &mut AgentSession, ins: TranscriptInsights) -
         changed = true;
     }
 
-    if sess.focus_groups.is_empty() && !ins.focus_groups.is_empty() {
-        sess.focus_groups = ins.focus_groups;
-        changed = true;
+    if allow_structural_backfill {
+        if sess.focus_groups.is_empty() && !ins.focus_groups.is_empty() {
+            sess.focus_groups = ins.focus_groups;
+            dedup_and_merge_focus_groups(&mut sess.focus_groups);
+            changed = true;
+        } else if !ins.focus_groups.is_empty() {
+            for (idx, ig) in ins.focus_groups.iter().enumerate() {
+                if let Some(sg) = sess.focus_groups.get_mut(idx) {
+                    if sg.pre_text.is_none() && ig.pre_text.is_some() {
+                        sg.pre_text = ig.pre_text.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if sess.diffs.is_empty() && !ins.diffs.is_empty() {
+            sess.diffs = ins.diffs.into_iter().rev().collect();
+            dedup_session_diffs(&mut sess.diffs);
+            sess.files_touched_count = sess.diffs.len();
+            changed = true;
+        }
+    } else if !ins.focus_groups.is_empty() {
+        // Even while live hooks manage steps, hydrate mid-turn AI `pre_text` and step `unified_diff` from transcript!
+        for ig in &ins.focus_groups {
+            if let Some(sg) = sess
+                .focus_groups
+                .iter_mut()
+                .find(|g| g.title.trim().eq_ignore_ascii_case(ig.title.trim()) && g.pre_text.is_none())
+            {
+                if ig.pre_text.is_some() {
+                    sg.pre_text = ig.pre_text.clone();
+                    changed = true;
+                }
+            }
+            for ist in &ig.steps {
+                if ist.unified_diff.is_some() {
+                    for sg in &mut sess.focus_groups {
+                        if let Some(sst) = sg
+                            .steps
+                            .iter_mut()
+                            .find(|s| s.unified_diff.is_none() && steps_represent_same_action(s, ist))
+                        {
+                            sst.unified_diff = ist.unified_diff.clone();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
     }
-    if sess.diffs.is_empty() && !ins.diffs.is_empty() {
-        sess.files_touched_count = ins.diffs.len();
-        sess.diffs = ins.diffs.into_iter().rev().collect();
-        changed = true;
+    if !ins.turns.is_empty() && ins.turns.len() >= sess.turns.len() {
+        let mut next_turns = ins.turns;
+        for (idx, nt) in next_turns.iter_mut().enumerate() {
+            if let Some(prev_t) = sess.turns.get(idx) {
+                if nt.focus_groups.is_empty() && !prev_t.focus_groups.is_empty() {
+                    nt.focus_groups = prev_t.focus_groups.clone();
+                }
+                if nt.diffs.is_empty() && !prev_t.diffs.is_empty() {
+                    nt.diffs = prev_t.diffs.clone();
+                }
+            }
+        }
+        if let Some(last) = next_turns.last_mut() {
+            if last.assistant_output.is_none() && sess.latest_output.is_some() {
+                last.assistant_output = sess.latest_output.clone();
+            }
+            last.is_active = sess.status == "active" || sess.status == "waiting_approval";
+        }
+        let same_turns = sess.turns.len() == next_turns.len()
+            && sess.turns.iter().zip(next_turns.iter()).all(|(a, b)| {
+                a.id == b.id
+                    && a.user_prompt == b.user_prompt
+                    && a.assistant_output == b.assistant_output
+                    && a.thinking == b.thinking
+                    && a.model_name == b.model_name
+                    && a.tool_calls_count == b.tool_calls_count
+                    && a.files_touched_count == b.files_touched_count
+                    && a.is_active == b.is_active
+            });
+        if !same_turns {
+            sess.turns = next_turns;
+            changed = true;
+        }
     }
     changed
+}
+
+impl InnerState {
+    pub fn record_ai_request(
+        &mut self,
+        account: &str,
+        tokens: Option<u64>,
+        is_429: bool,
+        error: Option<String>,
+    ) {
+        let history = if account == "second" {
+            &mut self.quota_tracker.second
+        } else {
+            &mut self.quota_tracker.main
+        };
+
+        let now = std::time::Instant::now();
+        let current_day = chrono::Utc::now().timestamp() as u64 / 86400;
+        if history.daily_reset_epoch_day != current_day {
+            history.daily_request_count = 0;
+            history.total_tokens_today = 0;
+            history.daily_reset_epoch_day = current_day;
+        }
+
+        while let Some(front) = history.minute_requests.front() {
+            if now.duration_since(*front).as_secs() > 60 {
+                history.minute_requests.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        history.minute_requests.push_back(now);
+        history.daily_request_count = history.daily_request_count.saturating_add(1);
+        if let Some(toks) = tokens {
+            history.total_tokens_today = history.total_tokens_today.saturating_add(toks);
+        }
+        if is_429 {
+            history.last_429 = Some(now);
+            history.last_probe_status = Some("Quota limit exceeded (429 Too Many Requests)".to_string());
+        } else if let Some(err) = error {
+            history.last_probe_status = Some(err);
+        } else {
+            history.last_probe_status = None;
+        }
+    }
+
+    pub fn compute_quota_state(&self) -> RealtimeQuotaState {
+        let now = std::time::Instant::now();
+        let current_day = chrono::Utc::now().timestamp() as u64 / 86400;
+
+        let compute_for = |account_id: &str, account_name: &str, history: &AccountUsageHistory, has_key: bool| -> AccountQuotaInfo {
+            let model = self.settings.default_chat_model.clone();
+            let provider = self.settings.default_chat_provider.clone();
+
+            let is_pro = model.contains("pro") || model.contains("opus");
+            let (rpm_limit, rpd_limit, tpm_limit, tier) = if !has_key {
+                (0, 0, 0, "Not Configured".to_string())
+            } else if is_pro {
+                (2, 50, 32_000, "Pro (Reasoning Tier)".to_string())
+            } else {
+                (15, 1500, 1_000_000, "Free / Standard Tier".to_string())
+            };
+
+            let rpm_used = history
+                .minute_requests
+                .iter()
+                .filter(|t| now.duration_since(**t).as_secs() <= 60)
+                .count() as u32;
+
+            let rpd_used = if history.daily_reset_epoch_day == current_day {
+                history.daily_request_count
+            } else {
+                0
+            };
+
+            let tokens_today = if history.daily_reset_epoch_day == current_day {
+                history.total_tokens_today
+            } else {
+                0
+            };
+
+            let rpm_pct = if rpm_limit > 0 { (rpm_used as f32 / rpm_limit as f32) * 100.0 } else { 0.0 };
+            let rpd_pct = if rpd_limit > 0 { (rpd_used as f32 / rpd_limit as f32) * 100.0 } else { 0.0 };
+            let percentage_used = rpm_pct.max(rpd_pct).clamp(0.0, 100.0);
+
+            let is_recent_429 = history
+                .last_429
+                .map(|t| now.duration_since(t).as_secs() < 60)
+                .unwrap_or(false);
+
+            let (status, last_error) = if !has_key {
+                ("unconfigured".to_string(), Some("API Key not configured. Add in Settings -> AI & Keys".to_string()))
+            } else if is_recent_429 || (rpm_limit > 0 && rpm_used >= rpm_limit) || (rpd_limit > 0 && rpd_used >= rpd_limit) {
+                ("exceeded".to_string(), Some(format!("Quota limit reached on {account_name}. Switch account!")))
+            } else if percentage_used >= 80.0 {
+                ("warning".to_string(), Some(format!("High usage ({:.0}%). Consider switching account.", percentage_used)))
+            } else {
+                ("healthy".to_string(), None)
+            };
+
+            let oldest_in_window = history.minute_requests.iter().find(|t| now.duration_since(**t).as_secs() <= 60);
+            let reset_in_seconds = oldest_in_window
+                .map(|t| 60u64.saturating_sub(now.duration_since(*t).as_secs()))
+                .unwrap_or(60);
+
+            AccountQuotaInfo {
+                account_id: account_id.to_string(),
+                account_name: account_name.to_string(),
+                provider,
+                model,
+                tier,
+                rpm_limit,
+                rpm_used,
+                rpd_limit,
+                rpd_used,
+                tpm_limit,
+                tpm_used: 0,
+                total_tokens_today: tokens_today,
+                percentage_used,
+                status,
+                reset_in_seconds,
+                last_error,
+                last_updated: chrono::Utc::now().to_rfc3339(),
+            }
+        };
+
+        let has_gemini_main = crate::ai_services::get_secret("gemini").is_some() || std::env::var("GEMINI_API_KEY").is_ok();
+        let has_gemini_second = crate::ai_services::get_secret("gemini_second").is_some() || std::env::var("GEMINI_API_KEY_SECOND").is_ok();
+
+        let main = compute_for("main", &self.settings.main_account_name, &self.quota_tracker.main, has_gemini_main);
+        let second = compute_for("second", &self.settings.second_account_name, &self.quota_tracker.second, has_gemini_second);
+
+        RealtimeQuotaState {
+            main,
+            second,
+            active_account: self.settings.active_account.clone(),
+            active_model: self.settings.default_chat_model.clone(),
+        }
+    }
 }
 
 impl AppCore {
@@ -1003,6 +1873,7 @@ impl AppCore {
                 approval_waiters: HashMap::new(),
                 pending_tool_diffs: HashMap::new(),
                 bg_pids: HashMap::new(),
+                warm_workers: HashMap::new(),
                 approval_rules: persisted.approval_rules,
                 threads,
                 personas,
@@ -1012,12 +1883,14 @@ impl AppCore {
                 voice_notes: persisted.voice_notes,
                 focus: persisted.focus,
                 analytics: persisted.analytics,
+                quota_tracker: QuotaTracker::default(),
                 ipc_token,
                 pairing_token,
                 lan_ip,
             })),
             sys: Arc::new(Mutex::new(sys)),
             events_tx,
+            ui_liveness: Arc::new(Mutex::new(None)),
         };
 
         core.persist();
@@ -1075,6 +1948,8 @@ impl AppCore {
             if s.detected_ide_permission.is_none() {
                 s.detected_ide_permission = detected_ide_permission.clone();
             }
+            dedup_and_merge_focus_groups(&mut s.focus_groups);
+            dedup_session_diffs(&mut s.diffs);
         }
 
         NovaSnapshot {
@@ -1093,6 +1968,7 @@ impl AppCore {
             analytics: guard.analytics.clone(),
             agy_hooks,
             secrets,
+            quota: guard.compute_quota_state(),
             mobile,
             recent_workspaces,
             agy_cli_available,
@@ -1259,6 +2135,42 @@ impl AppCore {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(1100));
             loop {
                 interval.tick().await;
+                let missing_tps: Vec<String> = {
+                    let g = tr_core.inner.lock().unwrap();
+                    g.sessions
+                        .iter()
+                        .take(6)
+                        .filter(|s| {
+                            s.transcript_path.is_none()
+                                && !s.conversation_id.starts_with("pending-")
+                        })
+                        .map(|s| {
+                            s.cli_conversation_id
+                                .clone()
+                                .unwrap_or_else(|| s.conversation_id.clone())
+                        })
+                        .collect()
+                };
+                if !missing_tps.is_empty() {
+                    let discovered: Vec<(String, String)> = missing_tps
+                        .into_iter()
+                        .filter_map(|id| {
+                            discover_transcript_path(&id, None, &Value::Null).map(|tp| (id, tp))
+                        })
+                        .collect();
+                    if !discovered.is_empty() {
+                        let mut g = tr_core.inner.lock().unwrap();
+                        for (id, tp) in discovered {
+                            if let Some(sess) = g.sessions.iter_mut().find(|s| {
+                                s.conversation_id == id
+                                    || s.cli_conversation_id.as_deref() == Some(id.as_str())
+                            }) {
+                                sess.transcript_path = Some(tp);
+                            }
+                        }
+                    }
+                }
+
                 let targets: Vec<(String, String)> = {
                     let g = tr_core.inner.lock().unwrap();
                     g.sessions
@@ -1298,12 +2210,16 @@ impl AppCore {
 
                 let mut any_changed = false;
                 {
+                    let hooks_active = inspect_antigravity_hooks(false).nova_enabled;
                     let mut g = tr_core.inner.lock().unwrap();
                     for (cid, ins) in updates {
                         if let Some(sess) =
                             g.sessions.iter_mut().find(|s| s.conversation_id == cid)
                         {
-                            if apply_insights_to_session(sess, ins) {
+                            let is_live_run =
+                                sess.status == "active" || sess.status == "waiting_approval";
+                            let allow_backfill = !is_live_run || !hooks_active;
+                            if apply_insights_to_session(sess, ins, allow_backfill) {
                                 any_changed = true;
                             }
                         }
@@ -1437,7 +2353,7 @@ impl AppCore {
                     })
                 });
 
-            let idx = if let Some(pos) = session_pos {
+            let (idx, is_newly_discovered_session) = if let Some(pos) = session_pos {
                 let old_id = g.sessions[pos].conversation_id.clone();
                 if old_id.starts_with("pending-") && old_id != env.conversation_id {
                     g.sessions[pos].conversation_id = env.conversation_id.clone();
@@ -1445,8 +2361,11 @@ impl AppCore {
                     if let Some(pid) = g.bg_pids.remove(&old_id) {
                         g.bg_pids.insert(env.conversation_id.clone(), pid);
                     }
+                    if let Some(worker) = g.warm_workers.remove(&old_id) {
+                        g.warm_workers.insert(env.conversation_id.clone(), worker);
+                    }
                 }
-                pos
+                (pos, false)
             } else {
                 g.analytics.total_sessions += 1;
                 *g.analytics
@@ -1471,6 +2390,7 @@ impl AppCore {
                         latest_output: None,
                         plan_steps: Vec::new(),
                         focus_groups: Vec::new(),
+                        turns: Vec::new(),
                         transcript_path: resolved_transcript.clone(),
                         queued_messages: Vec::new(),
                         stop_requested: false,
@@ -1490,14 +2410,26 @@ impl AppCore {
                         files_touched_count: 0,
                     },
                 );
-                0
+                (0, true)
             };
 
             let mut early_reply: Option<HookRelayResponse> = None;
             let sess_perm_override: Option<String>;
+            let is_warm_persistent = g
+                .warm_workers
+                .contains_key(&g.sessions[idx].conversation_id)
+                || g.warm_workers.contains_key(&env.conversation_id)
+                || g.sessions[idx]
+                    .cli_conversation_id
+                    .as_deref()
+                    .is_some_and(|cid| g.warm_workers.contains_key(cid));
 
             {
                 let sess = &mut g.sessions[idx];
+                let was_finished_turn = matches!(
+                    sess.status.as_str(),
+                    "completed" | "error" | "idle"
+                );
                 sess.updated_at = now.clone();
                 if ide_perm_live.is_some() {
                     sess.detected_ide_permission = ide_perm_live.clone();
@@ -1508,37 +2440,54 @@ impl AppCore {
                 if let Some(m) = &cleaned_model {
                     sess.model_name = Some(m.clone());
                 }
-                if let Some(p) = &cleaned_prompt {
-                    if sess.last_user_input.as_deref() != Some(p.as_str()) {
+                // Reset prior-turn telemetry when starting a new turn on a completed session
+                // (even if the user repeated the exact same prompt such as "continue").
+                let new_prompt_arrived = cleaned_prompt
+                    .as_ref()
+                    .is_some_and(|p| sess.last_user_input.as_deref() != Some(p.as_str()));
+                if new_prompt_arrived || (was_finished_turn && is_pre_inv && sess.queued_messages.is_empty()) {
+                    snapshot_logs_into_latest_turn(sess);
+                    if let Some(p) = &cleaned_prompt {
                         sess.last_user_input = Some(p.clone());
-                        sess.latest_output = None;
-                        sess.last_error = None;
-                        sess.mid_process_note = None;
-                        sess.current_focus = None;
-                        sess.plan_steps.clear();
-                        sess.focus_groups.clear();
-                        sess.steps.clear();
-                        sess.diffs.clear();
                     }
+                    sess.latest_output = None;
+                    sess.last_error = None;
+                    sess.mid_process_note = None;
+                    sess.current_focus = None;
+                    sess.plan_steps.clear();
+                    sess.focus_groups.clear();
+                    sess.steps.clear();
+                    sess.diffs.clear();
                 }
                 if resolved_transcript.is_some() {
                     sess.transcript_path = resolved_transcript.clone();
                 }
                 if let Some(ins) = transcript_insights {
-                    let _ = apply_insights_to_session(sess, ins);
+                    // Only backfill focus_groups/diffs from transcript when attaching mid-turn to a
+                    // newly discovered session or finalizing on `Stop`; during live PreToolUse/PostToolUse,
+                    // hooks track running/waiting/done steps directly without premature transcript racing.
+                    let allow_backfill = is_stop || is_newly_discovered_session;
+                    let _ = apply_insights_to_session(sess, ins, allow_backfill);
                 }
                 if let Some(f) = focus_override {
                     sess.current_focus = Some(f.clone());
                     if is_pre_tool {
                         let promoted = if let Some(last_grp) = sess.focus_groups.last_mut() {
-                            if !last_grp.explicit_focus && last_grp.steps.len() <= 2 {
+                            if last_grp.title.trim().eq_ignore_ascii_case(f.trim()) {
                                 last_grp.title = f.clone();
                                 last_grp.explicit_focus = true;
+                                last_grp.ended_at = None;
+                                true
+                            } else if !last_grp.explicit_focus && last_grp.ended_at.is_none() {
+                                last_grp.title = f.clone();
+                                last_grp.explicit_focus = true;
+                                last_grp.ended_at = None;
                                 true
                             } else if last_grp.steps.is_empty() {
                                 last_grp.title = f.clone();
                                 last_grp.explicit_focus = true;
                                 last_grp.started_at = now.clone();
+                                last_grp.ended_at = None;
                                 true
                             } else {
                                 if last_grp.ended_at.is_none() {
@@ -1554,11 +2503,12 @@ impl AppCore {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 title: f,
                                 explicit_focus: true,
+                                pre_text: None,
                                 started_at: now.clone(),
                                 ended_at: None,
                                 steps: Vec::new(),
                             });
-                            if sess.focus_groups.len() > 24 {
+                            if sess.focus_groups.len() > 120 {
                                 sess.focus_groups.remove(0);
                             }
                         }
@@ -1644,19 +2594,31 @@ impl AppCore {
                                 .termination_reason
                                 .as_deref()
                                 .is_some_and(|r| r.eq_ignore_ascii_case("ERROR"));
-                        sess.status = if is_err_stop {
-                            "error".into()
+                        if is_warm_persistent {
+                            sess.status = "active".into();
+                            sess.phase = if is_err_stop { "error" } else { "working" }.into();
+                            sess.active_tool = None;
+                            sess.mid_process_note = Some(if is_err_stop {
+                                "Finalizing error details…".into()
+                            } else {
+                                "Finalizing response…".into()
+                            });
+                            sess.bg_running = true;
                         } else {
-                            "completed".into()
-                        };
-                        sess.phase = if is_err_stop {
-                            "error".into()
-                        } else {
-                            "done".into()
-                        };
-                        sess.active_tool = None;
-                        sess.mid_process_note = None;
-                        sess.bg_running = false;
+                            sess.status = if is_err_stop {
+                                "error".into()
+                            } else {
+                                "completed".into()
+                            };
+                            sess.phase = if is_err_stop {
+                                "error".into()
+                            } else {
+                                "done".into()
+                            };
+                            sess.active_tool = None;
+                            sess.mid_process_note = None;
+                            sess.bg_running = false;
+                        }
                         for st in &mut sess.steps {
                             if st.status == "running" {
                                 st.status = "done".into();
@@ -1706,6 +2668,7 @@ impl AppCore {
                         .as_ref()
                         .and_then(|d| d.start_line)
                         .or(meta.start_line);
+                    let step_unified_diff = effective_diff.as_ref().map(|d| d.unified_diff.clone());
 
                     if is_pre_tool {
                         let already_tracked = env.tool_call_id.as_ref().is_some_and(|cid| {
@@ -1718,47 +2681,81 @@ impl AppCore {
                                 step_idx: env.step_idx,
                                 event: env.event.clone(),
                                 tool_name: env.tool_name.clone(),
-                                summary: meta.summary,
-                                detail: meta.detail,
-                                verb: meta.verb,
-                                file_path: meta.file_path,
-                                line_range: meta.line_range,
+                                summary: meta.summary.clone(),
+                                detail: meta.detail.clone(),
+                                verb: meta.verb.clone(),
+                                file_path: meta.file_path.clone(),
+                                line_range: meta.line_range.clone(),
                                 start_line: step_start_line,
                                 added_lines: step_added,
                                 removed_lines: step_removed,
+                                unified_diff: step_unified_diff.clone(),
                                 status: "running".into(),
                                 timestamp: now.clone(),
                             };
                             sess.steps.insert(0, new_step.clone());
-                            sess.steps.truncate(60);
+                            sess.steps.truncate(250);
 
-                            // Append to active 2-layer FocusGroup (or create auto-summarized group)
-                            let need_group = sess
-                                .focus_groups
-                                .last()
-                                .is_none_or(|g| g.ended_at.is_some());
-                            if need_group {
-                                let fallback_title = sess
-                                    .current_focus
-                                    .clone()
-                                    .unwrap_or_else(|| "Working…".to_string());
-                                let is_exp = sess.current_focus.is_some();
-                                sess.focus_groups.push(FocusGroup {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    title: fallback_title,
-                                    explicit_focus: is_exp,
-                                    started_at: now.clone(),
-                                    ended_at: None,
-                                    steps: Vec::new(),
-                                });
-                            }
-                            if let Some(grp) = sess.focus_groups.last_mut() {
-                                grp.steps.push(new_step);
-                                if grp.steps.len() > 50 {
-                                    grp.steps.remove(0);
+                            let already_in_groups = env.tool_call_id.as_ref().is_some_and(|cid| {
+                                sess.focus_groups
+                                    .iter()
+                                    .any(|g| g.steps.iter().any(|st| st.call_id.as_ref() == Some(cid)))
+                            });
+
+                            if !already_in_groups {
+                                // Upgrade a matching unclaimed `Transcript` placeholder step in-place if present
+                                let mut claimed_transcript_step = false;
+                                for grp in sess.focus_groups.iter_mut().rev() {
+                                    if let Some(slot) = grp.steps.iter_mut().find(|st| {
+                                        st.call_id.is_none()
+                                            && st.event == "Transcript"
+                                            && step_matches_meta(st, &tool_name, &meta)
+                                    }) {
+                                        let saved_diff = slot.unified_diff.take();
+                                        *slot = new_step.clone();
+                                        if slot.unified_diff.is_none() {
+                                            slot.unified_diff = saved_diff;
+                                        }
+                                        grp.ended_at = None;
+                                        if !grp.explicit_focus {
+                                            grp.title = auto_summarize_group_steps(&grp.steps);
+                                        }
+                                        claimed_transcript_step = true;
+                                        break;
+                                    }
                                 }
-                                if !grp.explicit_focus {
-                                    grp.title = auto_summarize_group_steps(&grp.steps);
+
+                                if !claimed_transcript_step {
+                                    // Append to active 2-layer FocusGroup (or create auto-summarized group)
+                                    let need_group = sess
+                                        .focus_groups
+                                        .last()
+                                        .is_none_or(|g| g.ended_at.is_some());
+                                    if need_group {
+                                        let fallback_title = sess
+                                            .current_focus
+                                            .clone()
+                                            .unwrap_or_else(|| "Working…".to_string());
+                                        let is_exp = sess.current_focus.is_some();
+                                        sess.focus_groups.push(FocusGroup {
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            title: fallback_title,
+                                            explicit_focus: is_exp,
+                                            pre_text: None,
+                                            started_at: now.clone(),
+                                            ended_at: None,
+                                            steps: Vec::new(),
+                                        });
+                                    }
+                                    if let Some(grp) = sess.focus_groups.last_mut() {
+                                        grp.steps.push(new_step);
+                                        if grp.steps.len() > 500 {
+                                            grp.steps.remove(0);
+                                        }
+                                        if !grp.explicit_focus {
+                                            grp.title = auto_summarize_group_steps(&grp.steps);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1772,7 +2769,7 @@ impl AppCore {
                         }
                         .or_else(|| {
                             sess.steps.iter().position(|st| {
-                                st.status == "running"
+                                matches!(st.status.as_str(), "running" | "waiting")
                                     && st.tool_name.as_deref() == Some(tool_name.as_str())
                             })
                         });
@@ -1782,9 +2779,9 @@ impl AppCore {
                             env.error
                                 .as_deref()
                                 .map(|e| truncate_chars(e, 110))
-                                .or(meta.detail)
+                                .or(meta.detail.clone())
                         } else {
-                            meta.detail
+                            meta.detail.clone()
                         };
 
                         if let Some(pos) = existing_pos {
@@ -1798,6 +2795,9 @@ impl AppCore {
                             }
                             if step_start_line.is_some() {
                                 sess.steps[pos].start_line = step_start_line;
+                            }
+                            if step_unified_diff.is_some() {
+                                sess.steps[pos].unified_diff = step_unified_diff.clone();
                             }
                             sess.steps[pos].timestamp = now.clone();
                         } else {
@@ -1817,11 +2817,12 @@ impl AppCore {
                                     start_line: step_start_line,
                                     added_lines: step_added,
                                     removed_lines: step_removed,
+                                    unified_diff: step_unified_diff.clone(),
                                     status: final_status.into(),
                                     timestamp: now.clone(),
                                 },
                             );
-                            sess.steps.truncate(60);
+                            sess.steps.truncate(250);
                         }
 
                         // Update matching step in `focus_groups` in-place
@@ -1836,15 +2837,29 @@ impl AppCore {
                             }
                             .or_else(|| {
                                 grp.steps.iter().rposition(|st| {
-                                    st.status == "running"
+                                    matches!(st.status.as_str(), "running" | "waiting")
                                         && st.tool_name.as_deref() == Some(tool_name.as_str())
+                                })
+                            })
+                            .or_else(|| {
+                                grp.steps.iter().position(|st| {
+                                    st.call_id.is_none()
+                                        && st.event == "Transcript"
+                                        && step_matches_meta(st, &tool_name, &meta)
                                 })
                             });
 
                             if let Some(gp) = gpos {
+                                if grp.steps[gp].call_id.is_none() {
+                                    grp.steps[gp].call_id = env.tool_call_id.clone();
+                                }
+                                grp.steps[gp].event = env.event.clone();
                                 grp.steps[gp].status = final_status.into();
                                 if final_detail.is_some() {
                                     grp.steps[gp].detail = final_detail.clone();
+                                }
+                                if meta.file_path.is_some() && grp.steps[gp].file_path.is_none() {
+                                    grp.steps[gp].file_path = meta.file_path.clone();
                                 }
                                 if step_added.is_some() {
                                     grp.steps[gp].added_lines = step_added;
@@ -1852,6 +2867,9 @@ impl AppCore {
                                 }
                                 if step_start_line.is_some() {
                                     grp.steps[gp].start_line = step_start_line;
+                                }
+                                if step_unified_diff.is_some() {
+                                    grp.steps[gp].unified_diff = step_unified_diff.clone();
                                 }
                                 grp.steps[gp].timestamp = now.clone();
                                 updated_in_group = true;
@@ -1865,10 +2883,16 @@ impl AppCore {
                                 .last()
                                 .is_none_or(|g| g.ended_at.is_some())
                             {
+                                let fallback_title = sess
+                                    .current_focus
+                                    .clone()
+                                    .unwrap_or_else(|| "Working…".to_string());
+                                let is_exp = sess.current_focus.is_some();
                                 sess.focus_groups.push(FocusGroup {
                                     id: uuid::Uuid::new_v4().to_string(),
-                                    title: "Working…".to_string(),
-                                    explicit_focus: false,
+                                    title: fallback_title,
+                                    explicit_focus: is_exp,
+                                    pre_text: None,
                                     started_at: now.clone(),
                                     ended_at: None,
                                     steps: Vec::new(),
@@ -1889,6 +2913,7 @@ impl AppCore {
                                     start_line: step_start_line,
                                     added_lines: step_added,
                                     removed_lines: step_removed,
+                                    unified_diff: step_unified_diff,
                                     status: final_status.into(),
                                     timestamp: now.clone(),
                                 });
@@ -1900,18 +2925,35 @@ impl AppCore {
                     }
                 }
 
+                dedup_and_merge_focus_groups(&mut sess.focus_groups);
+
                 if let Some(dp) = &effective_diff {
                     if is_post_tool && !has_error {
-                        sess.files_touched_count += 1;
-                        sess.diffs.insert(0, dp.clone());
-                        sess.diffs.truncate(60);
+                        let norm_dp_path = normalize_path_key(&dp.file_path);
+                        let trimmed_diff = dp.unified_diff.trim();
+                        let dup_diff = sess.diffs.iter_mut().find(|existing| {
+                            !existing.reverted
+                                && normalize_path_key(&existing.file_path) == norm_dp_path
+                                && existing.unified_diff.trim() == trimmed_diff
+                        });
+                        if let Some(existing) = dup_diff {
+                            existing.timestamp = dp.timestamp.clone();
+                            if dp.undo_target.is_some() {
+                                existing.undo_target = dp.undo_target.clone();
+                                existing.undo_replacement = dp.undo_replacement.clone();
+                            }
+                        } else {
+                            sess.files_touched_count += 1;
+                            sess.diffs.insert(0, dp.clone());
+                            sess.diffs.truncate(60);
+                        }
                     }
                 }
 
                 sess_perm_override = sess.permission_override.clone();
             }
 
-            if is_stop && early_reply.is_none() {
+            if is_stop && early_reply.is_none() && !is_warm_persistent {
                 g.bg_pids.remove(&env.conversation_id);
             }
 
@@ -1974,32 +3016,51 @@ impl AppCore {
         }
 
         if is_stop {
-            if let Some(tp) = resolved_transcript {
-                let stop_core = self.clone();
-                let stop_cid = env.conversation_id.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(220)).await;
-                    if let Ok(Some(ins)) =
-                        tokio::task::spawn_blocking(move || read_transcript_insights(&tp)).await
-                    {
-                        let mut changed = false;
+            let has_warm_worker = {
+                let g = self.inner.lock().unwrap();
+                g.warm_workers.contains_key(&env.conversation_id)
+                    || g.sessions.iter().any(|s| {
+                        (s.conversation_id == env.conversation_id
+                            || s.cli_conversation_id.as_deref()
+                                == Some(env.conversation_id.as_str()))
+                            && (g.warm_workers.contains_key(&s.conversation_id)
+                                || s.cli_conversation_id
+                                    .as_deref()
+                                    .is_some_and(|c| g.warm_workers.contains_key(c)))
+                    })
+            };
+            if !has_warm_worker {
+                if let Some(tp) = resolved_transcript {
+                    let stop_core = self.clone();
+                    let stop_cid = env.conversation_id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+                        if let Ok(Some(ins)) =
+                            tokio::task::spawn_blocking(move || read_transcript_insights(&tp)).await
                         {
-                            let mut g = stop_core.inner.lock().unwrap();
-                            if let Some(sess) = g.sessions.iter_mut().find(|s| {
-                                s.conversation_id == stop_cid
-                                    || s.cli_conversation_id.as_deref() == Some(stop_cid.as_str())
-                            }) {
-                                changed = apply_insights_to_session(sess, ins);
+                            let mut changed = false;
+                            {
+                                let mut g = stop_core.inner.lock().unwrap();
+                                if let Some(sess) = g.sessions.iter_mut().find(|s| {
+                                    s.conversation_id == stop_cid
+                                        || s.cli_conversation_id.as_deref()
+                                            == Some(stop_cid.as_str())
+                                }) {
+                                    changed = apply_insights_to_session(sess, ins, true);
+                                }
+                            }
+                            if changed {
+                                stop_core.broadcast_snapshot(None);
                             }
                         }
-                        if changed {
-                            stop_core.broadcast_snapshot(None);
-                        }
-                    }
-                });
+                    });
+                }
+                self.persist();
+                self.broadcast_snapshot(Some("ready"));
+            } else {
+                self.persist();
+                self.broadcast_snapshot(None);
             }
-            self.persist();
-            self.broadcast_snapshot(Some("ready"));
             return HookRelayResponse::default();
         }
 
@@ -2289,37 +3350,137 @@ impl AppCore {
         Ok(())
     }
 
-    /// Sends a prompt to an active session (live hook injection) or launches/resumes a headless `agy.exe` turn.
+    /// Finalizes active turn, step states, and session status after a stream result or process exit.
+    fn finalize_session_turn(
+        sess: &mut AgentSession,
+        ok: bool,
+        final_output: Option<&str>,
+        err_msg: Option<String>,
+        now_done: &str,
+    ) {
+        if let Some(out) = final_output.map(str::trim).filter(|s| !s.is_empty()) {
+            sess.latest_output = Some(truncate_chars(out, 8_500));
+        }
+        sess.bg_running = false;
+        sess.active_tool = None;
+        sess.mid_process_note = None;
+        sess.updated_at = now_done.to_string();
+
+        for st in &mut sess.steps {
+            if st.status == "running" {
+                st.status = if ok { "done" } else { "error" }.into();
+            }
+        }
+        for fg in &mut sess.focus_groups {
+            if fg.ended_at.is_none() {
+                fg.ended_at = Some(now_done.to_string());
+            }
+            for st in &mut fg.steps {
+                if st.status == "running" {
+                    st.status = if ok { "done" } else { "error" }.into();
+                }
+            }
+        }
+        for sa in &mut sess.subagents {
+            sa.status = if ok { "completed" } else { "error" }.into();
+        }
+        snapshot_logs_into_latest_turn(sess);
+        if let Some(turn) = sess.turns.iter_mut().rfind(|t| t.is_active) {
+            turn.is_active = false;
+            turn.completed_at = Some(now_done.to_string());
+            if sess.latest_output.is_some() {
+                turn.assistant_output = sess.latest_output.clone();
+            }
+            if sess.latest_thinking.is_some() {
+                turn.thinking = sess.latest_thinking.clone();
+            }
+            if sess.model_name.is_some() {
+                turn.model_name = sess.model_name.clone();
+            }
+        }
+        if ok {
+            sess.status = "completed".into();
+            sess.phase = "done".into();
+            sess.last_error = None;
+        } else if sess.status != "completed" {
+            sess.status = "error".into();
+            sess.phase = "error".into();
+            if let Some(err) = err_msg.filter(|s| !s.trim().is_empty()) {
+                if err.to_ascii_lowercase().contains("trajectory not found") {
+                    sess.cli_conversation_id = None;
+                }
+                sess.last_error = Some(truncate_chars(&err, 500));
+            }
+        }
+    }
+
+    /// Sends a prompt to an active session (live hook injection), warm stream worker, or new headless `agy.exe` worker.
     pub fn dispatch_agent_prompt(
         &self,
         workspace_path: &str,
         conversation_id: Option<&str>,
         prompt: &str,
         mode: Option<&str>,
+        model: Option<&str>,
         effort: Option<&str>,
         image_data_url: Option<&str>,
+        images: Option<&[(String, Option<String>)]>,
     ) -> Result<Value, String> {
         let mut final_prompt = prompt.trim().to_string();
-        if let Some(durl) = image_data_url.map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some(snip_path) = save_snip_png_to_disk(durl) {
-                let sp = snip_path.to_string_lossy();
-                if final_prompt.is_empty() {
-                    final_prompt = format!(
-                        "Inspect the attached screenshot at `{sp}` using read_file and fix any visual or UI issue you find."
-                    );
-                } else {
-                    final_prompt = format!(
-                        "{final_prompt}\n\n[Attached Screenshot: `{sp}` — inspect this image file with read_file]"
-                    );
+        let mut saved_paths: Vec<PathBuf> = Vec::new();
+
+        if let Some(list) = images {
+            for (durl, name_hint) in list.iter().take(8) {
+                let trimmed = durl.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
+                if let Some(p) = save_image_data_url_to_disk(trimmed, name_hint.as_deref()) {
+                    saved_paths.push(p);
+                }
+            }
+        }
+        if saved_paths.is_empty() {
+            if let Some(durl) = image_data_url.map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(p) = save_image_data_url_to_disk(durl, None) {
+                    saved_paths.push(p);
+                }
+            }
+        }
+
+        if saved_paths.len() == 1 {
+            let sp = saved_paths[0].to_string_lossy();
+            if final_prompt.is_empty() {
+                final_prompt = format!(
+                    "Inspect the attached screenshot at `{sp}` using read_file and fix any visual or UI issue you find."
+                );
+            } else {
+                final_prompt = format!(
+                    "{final_prompt}\n\n[Attached Screenshot: `{sp}` — inspect this image file with read_file]"
+                );
+            }
+        } else if saved_paths.len() > 1 {
+            let bullets = saved_paths
+                .iter()
+                .map(|p| format!("- `{}`", p.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if final_prompt.is_empty() {
+                final_prompt = format!(
+                    "Inspect the attached images using read_file and address what they show:\n{bullets}"
+                );
+            } else {
+                final_prompt = format!(
+                    "{final_prompt}\n\n[Attached Images — inspect each image file with read_file:\n{bullets}]"
+                );
             }
         }
 
         if final_prompt.is_empty() {
             return Err("Prompt cannot be empty".to_string());
         }
-        if final_prompt.len() > 16_000 {
-            return Err("Prompt exceeds maximum length (16,000 chars)".to_string());
+        if final_prompt.len() > 20_000 {
+            return Err("Prompt exceeds maximum length (20,000 chars)".to_string());
         }
 
         // 1. If targeting an active/running session, queue for live hook injection (`PostInvocation` / `Stop`)
@@ -2410,9 +3571,9 @@ impl AppCore {
                         String::new()
                     } else {
                         format!(
-                            "[Context from preceding Antigravity IDE session in workspace `{}`:\nLast user request: {}\nLast assistant summary: {}]\n\n",
+                            "<NOVA_HANDOFF_CONTEXT>\nWorkspace: `{}`\nLast user request: {}\nLast assistant summary: {}\n</NOVA_HANDOFF_CONTEXT>\n\n",
                             s.workspace_name,
-                            truncate_chars(prev_q, 240),
+                            truncate_chars(prev_q, 400),
                             prev_a
                         )
                     }
@@ -2432,10 +3593,217 @@ impl AppCore {
         let skip_perms = effective_perm.eq_ignore_ascii_case("turbo")
             || (effective_perm.eq_ignore_ascii_case("follow_agy") && (ide_is_turbo || agy_mode == "auto"));
 
+        let req_model: Option<String> = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("auto"))
+            .map(str::to_string);
+        let req_effort: Option<String> = effort
+            .map(str::trim)
+            .filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max"))
+            .map(str::to_string);
+        let requested_display_model = req_model.as_deref().and_then(humanize_model_name);
+
         let prompt_for_agy = match ide_handoff_context.as_deref().filter(|s| !s.is_empty()) {
             Some(ctx) => format!("{ctx}{final_prompt}"),
             None => final_prompt.clone(),
         };
+        let ndjson_line = format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "event": "user",
+                "message": { "content": prompt_for_agy }
+            }))
+            .map_err(|e| format!("Failed serializing stream-json prompt: {e}"))?
+        );
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let summary_prompt = clean_user_prompt(&final_prompt)
+            .unwrap_or_else(|| truncate_chars(&final_prompt, 16_000));
+
+        // 1b. Reuse an idle compatible persistent stream-json worker (`Turn 2+` in ~3-6s!)
+        let mut stale_worker_pids: Vec<u32> = Vec::new();
+        let warm_candidate: Option<(String, String, u32, Arc<Mutex<std::process::ChildStdin>>)> = {
+            let mut g = self.inner.lock().unwrap();
+            let canonical = conversation_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|cid| {
+                    g.sessions
+                        .iter()
+                        .find(|s| {
+                            s.conversation_id == cid || s.cli_conversation_id.as_deref() == Some(cid)
+                        })
+                        .map(|s| s.conversation_id.clone())
+                });
+
+            if let Some(ref canon) = canonical {
+                let wk_key = if g.warm_workers.contains_key(canon) {
+                    Some(canon.clone())
+                } else {
+                    resume_cli_cid
+                        .as_ref()
+                        .filter(|c| g.warm_workers.contains_key(*c))
+                        .cloned()
+                };
+                if let Some(key) = wk_key {
+                    let compatible = g.warm_workers.get(&key).is_some_and(|w| {
+                        let same_ws = normalize_path_key(&w.workspace_path)
+                            == normalize_path_key(&clean_ws);
+                        let model_ok = match req_model.as_deref() {
+                            None => true,
+                            Some(rm) => w.model.as_deref() == Some(rm),
+                        };
+                        let effort_ok = match req_effort.as_deref() {
+                            None => true,
+                            Some(re) => {
+                                w.model
+                                    .as_deref()
+                                    .is_some_and(crate::system_tools::model_slug_has_effort_suffix)
+                                    || w.effort.as_deref() == Some(re)
+                            }
+                        };
+                        !w.turn_active
+                            && same_ws
+                            && w.mode == agy_mode
+                            && w.skip_permissions == skip_perms
+                            && model_ok
+                            && effort_ok
+                    });
+                    if compatible {
+                        if let Some(w) = g.warm_workers.get_mut(&key) {
+                            w.turn_active = true;
+                            w.last_used_at = std::time::Instant::now();
+                            let w_pid = w.pid;
+                            let w_stdin = w.stdin.clone();
+                            g.bg_pids.insert(canon.clone(), w_pid);
+                            if let Some(sess) =
+                                g.sessions.iter_mut().find(|s| s.conversation_id == *canon)
+                            {
+                                snapshot_logs_into_latest_turn(sess);
+                                sess.status = "active".into();
+                                sess.phase = "thinking".into();
+                                sess.bg_running = true;
+                                sess.stop_requested = false;
+                                sess.last_user_input = Some(summary_prompt.clone());
+                                for prev_turn in &mut sess.turns {
+                                    prev_turn.is_active = false;
+                                }
+                                sess.turns.push(SessionTurn {
+                                    id: format!("turn-{}", sess.turns.len() + 1),
+                                    user_prompt: summary_prompt.clone(),
+                                    assistant_output: None,
+                                    thinking: None,
+                                    model_name: requested_display_model
+                                        .clone()
+                                        .or_else(|| sess.model_name.clone()),
+                                    tool_calls_count: 0,
+                                    files_touched_count: 0,
+                                    focus_groups: Vec::new(),
+                                    diffs: Vec::new(),
+                                    started_at: Some(now.clone()),
+                                    completed_at: None,
+                                    is_active: true,
+                                });
+                                sess.latest_output = None;
+                                sess.last_error = None;
+                                sess.mid_process_note = Some("Warm session — reasoning…".into());
+                                sess.current_focus = None;
+                                if ide_perm_live.is_some() {
+                                    sess.detected_ide_permission = ide_perm_live.clone();
+                                }
+                                sess.plan_steps.clear();
+                                sess.focus_groups.clear();
+                                sess.steps.clear();
+                                sess.diffs.clear();
+                                sess.updated_at = now.clone();
+                            }
+                            Some((canon.clone(), key, w_pid, w_stdin))
+                        } else {
+                            None
+                        }
+                    } else {
+                        if let Some(old_w) = g.warm_workers.remove(&key) {
+                            g.bg_pids.remove(&key);
+                            g.bg_pids.remove(canon);
+                            stale_worker_pids.push(old_w.pid);
+                        }
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        for old_pid in stale_worker_pids {
+            let _ = kill_owned_child_tree(old_pid);
+        }
+
+        if let Some((canonical_cid, worker_key, w_pid, w_stdin)) = warm_candidate {
+            let write_ok = {
+                let mut pipe = w_stdin.lock().unwrap();
+                pipe.write_all(ndjson_line.as_bytes()).is_ok() && pipe.flush().is_ok()
+            };
+            if write_ok {
+                self.broadcast_snapshot(Some("step"));
+                return Ok(json!({
+                    "ok": true,
+                    "delivery": "warm_agy_stream",
+                    "conversationId": canonical_cid,
+                    "pid": w_pid
+                }));
+            }
+            // Broken pipe on warm worker: clean up and fall through to respawn cleanly.
+            let dead_pid = {
+                let mut g = self.inner.lock().unwrap();
+                g.bg_pids.remove(&worker_key);
+                g.bg_pids.remove(&canonical_cid);
+                if let Some(sess) = g
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.conversation_id == canonical_cid)
+                {
+                    if sess
+                        .turns
+                        .last()
+                        .is_some_and(|t| t.is_active && t.assistant_output.is_none())
+                    {
+                        sess.turns.pop();
+                    }
+                }
+                g.warm_workers.remove(&worker_key).map(|w| w.pid)
+            };
+            if let Some(dp) = dead_pid {
+                let _ = kill_owned_child_tree(dp);
+            }
+        }
+
+        // Cap warm workers to max 4 idle processes before spawning a new one
+        let evicted_pids: Vec<u32> = {
+            let mut g = self.inner.lock().unwrap();
+            let mut evicted = Vec::new();
+            while g.warm_workers.len() >= 4 {
+                let oldest_idle = g
+                    .warm_workers
+                    .iter()
+                    .filter(|(_, w)| !w.turn_active)
+                    .min_by_key(|(_, w)| w.last_used_at)
+                    .map(|(k, _)| k.clone());
+                let Some(ev_key) = oldest_idle else {
+                    break;
+                };
+                if let Some(old_w) = g.warm_workers.remove(&ev_key) {
+                    g.bg_pids.remove(&ev_key);
+                    evicted.push(old_w.pid);
+                }
+            }
+            evicted
+        };
+        for ev_pid in evicted_pids {
+            let _ = kill_owned_child_tree(ev_pid);
+        }
 
         let mut child = spawn_headless_agy_turn(
             &agy_exe,
@@ -2443,32 +3811,75 @@ impl AppCore {
             resume_cli_cid.as_deref(),
             &prompt_for_agy,
             agy_mode,
-            effort,
+            req_model.as_deref(),
+            req_effort.as_deref(),
             skip_perms,
+            true,
         )?;
         let pid = child.id();
+        let Some(mut child_stdin) = child.stdin.take() else {
+            let _ = kill_owned_child_tree(pid);
+            return Err("Failed to capture stdin for persistent agy.exe worker".to_string());
+        };
+        if child_stdin.write_all(ndjson_line.as_bytes()).is_err() || child_stdin.flush().is_err() {
+            let _ = kill_owned_child_tree(pid);
+            return Err("Failed writing initial prompt to persistent agy.exe stdin".to_string());
+        }
+        let worker_stdin = Arc::new(Mutex::new(child_stdin));
         let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
-        let now = chrono::Utc::now().to_rfc3339();
-        let summary_prompt = truncate_chars(&final_prompt, 240);
 
         let tracked_cid = {
             let mut g = self.inner.lock().unwrap();
-            if let Some(cid) = conversation_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let existing_cid = conversation_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|cid| {
+                    g.sessions
+                        .iter()
+                        .find(|s| {
+                            s.conversation_id == cid || s.cli_conversation_id.as_deref() == Some(cid)
+                        })
+                        .map(|s| s.conversation_id.clone())
+                });
+
+            let resolved_cid = if let Some(canonical) = existing_cid {
                 if let Some(sess) = g
                     .sessions
                     .iter_mut()
-                    .find(|s| s.conversation_id == cid || s.cli_conversation_id.as_deref() == Some(cid))
+                    .find(|s| s.conversation_id == canonical)
                 {
-                    let canonical = sess.conversation_id.clone();
+                    snapshot_logs_into_latest_turn(sess);
                     sess.status = "active".into();
                     sess.phase = "thinking".into();
                     sess.bg_running = true;
                     sess.stop_requested = false;
-                    sess.last_user_input = Some(summary_prompt);
+                    sess.last_user_input = Some(summary_prompt.clone());
+                    if let Some(m) = requested_display_model.clone() {
+                        sess.model_name = Some(m);
+                    }
+                    for prev_turn in &mut sess.turns {
+                        prev_turn.is_active = false;
+                    }
+                    sess.turns.push(SessionTurn {
+                        id: format!("turn-{}", sess.turns.len() + 1),
+                        user_prompt: summary_prompt.clone(),
+                        assistant_output: None,
+                        thinking: None,
+                        model_name: requested_display_model
+                            .clone()
+                            .or_else(|| sess.model_name.clone()),
+                        tool_calls_count: 0,
+                        files_touched_count: 0,
+                        focus_groups: Vec::new(),
+                        diffs: Vec::new(),
+                        started_at: Some(now.clone()),
+                        completed_at: None,
+                        is_active: true,
+                    });
                     sess.latest_output = None;
                     sess.last_error = None;
-                    sess.mid_process_note = Some("Warming up Antigravity CLI & tools…".into());
+                    sess.mid_process_note = Some("Starting Antigravity CLI…".into());
                     sess.current_focus = None;
                     if ide_perm_live.is_some() {
                         sess.detected_ide_permission = ide_perm_live.clone();
@@ -2477,54 +3888,11 @@ impl AppCore {
                     sess.focus_groups.clear();
                     sess.steps.clear();
                     sess.diffs.clear();
-                    sess.updated_at = now;
-                    g.bg_pids.insert(canonical.clone(), pid);
-                    canonical
-                } else {
-                    let pending_id = format!("pending-{}", uuid::Uuid::new_v4().simple());
-                    g.bg_pids.insert(pending_id.clone(), pid);
-                    g.sessions.insert(
-                        0,
-                        AgentSession {
-                            conversation_id: pending_id.clone(),
-                            agent: "antigravity".into(),
-                            workspace_path: clean_ws.clone(),
-                            workspace_name: ws_name,
-                            git_branch: detect_git_branch_for_dir(&clean_ws),
-                            model_name: None,
-                            last_user_input: Some(summary_prompt),
-                            status: "active".into(),
-                            phase: "thinking".into(),
-                            current_focus: None,
-                            mid_process_note: Some("Warming up Antigravity CLI & tools…".into()),
-                            latest_thinking: None,
-                            latest_output: None,
-                            plan_steps: Vec::new(),
-                            focus_groups: Vec::new(),
-                            transcript_path: None,
-                            queued_messages: Vec::new(),
-                            stop_requested: false,
-                            bg_running: true,
-                            cli_conversation_id: None,
-                            last_error: None,
-                            detected_ide_permission: ide_perm_live.clone(),
-                            permission_override: None,
-                            active_tool: None,
-                            steps: Vec::new(),
-                            diffs: Vec::new(),
-                            subagents: Vec::new(),
-                            process_chain: Vec::new(),
-                            started_at: now.clone(),
-                            updated_at: now,
-                            commands_count: 0,
-                            files_touched_count: 0,
-                        },
-                    );
-                    pending_id
+                    sess.updated_at = now.clone();
                 }
+                canonical
             } else {
                 let pending_id = format!("pending-{}", uuid::Uuid::new_v4().simple());
-                g.bg_pids.insert(pending_id.clone(), pid);
                 g.sessions.insert(
                     0,
                     AgentSession {
@@ -2533,16 +3901,30 @@ impl AppCore {
                         workspace_path: clean_ws.clone(),
                         workspace_name: ws_name,
                         git_branch: detect_git_branch_for_dir(&clean_ws),
-                        model_name: None,
-                        last_user_input: Some(summary_prompt),
+                        model_name: requested_display_model.clone(),
+                        last_user_input: Some(summary_prompt.clone()),
                         status: "active".into(),
                         phase: "thinking".into(),
                         current_focus: None,
-                        mid_process_note: Some("Warming up Antigravity CLI & tools…".into()),
+                        mid_process_note: Some("Starting Antigravity CLI…".into()),
                         latest_thinking: None,
                         latest_output: None,
                         plan_steps: Vec::new(),
                         focus_groups: Vec::new(),
+                        turns: vec![SessionTurn {
+                            id: "turn-1".into(),
+                            user_prompt: summary_prompt,
+                            assistant_output: None,
+                            thinking: None,
+                            model_name: requested_display_model.clone(),
+                            tool_calls_count: 0,
+                            files_touched_count: 0,
+                            focus_groups: Vec::new(),
+                            diffs: Vec::new(),
+                            started_at: Some(now.clone()),
+                            completed_at: None,
+                            is_active: true,
+                        }],
                         transcript_path: None,
                         queued_messages: Vec::new(),
                         stop_requested: false,
@@ -2563,7 +3945,24 @@ impl AppCore {
                     },
                 );
                 pending_id
-            }
+            };
+
+            g.bg_pids.insert(resolved_cid.clone(), pid);
+            g.warm_workers.insert(
+                resolved_cid.clone(),
+                WarmAgyWorker {
+                    pid,
+                    stdin: worker_stdin.clone(),
+                    mode: agy_mode.to_string(),
+                    model: req_model,
+                    effort: req_effort,
+                    workspace_path: clean_ws,
+                    skip_permissions: skip_perms,
+                    turn_active: true,
+                    last_used_at: std::time::Instant::now(),
+                },
+            );
+            resolved_cid
         };
 
         self.broadcast_snapshot(Some("step"));
@@ -2586,19 +3985,33 @@ impl AppCore {
             }
         });
 
-        // Stream NDJSON events from `agy.exe --output-format stream-json` live into session state!
+        // Stream NDJSON events from persistent `agy.exe --input-format stream-json --output-format stream-json`
         let reaper_core = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut active_cid = tracked_cid;
             let mut streamed_text = String::new();
-            let mut stream_succeeded = false;
-            let mut stream_error: Option<String> = None;
+            let mut captured_stdout_err: Option<String> = None;
             let mut last_broadcast = std::time::Instant::now();
 
             if let Some(out_stream) = child_stdout {
                 for line in BufReader::new(out_stream).lines().map_while(Result::ok) {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() || !trimmed.starts_with('{') {
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !trimmed.starts_with('{') {
+                        if let Some(rest) = trimmed.strip_prefix("AGY_ERROR:") {
+                            if let Ok(v) = serde_json::from_str::<Value>(rest.trim()) {
+                                if let Some(se) = v.get("short_error").and_then(|s| s.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                                    captured_stdout_err = Some(se.to_string());
+                                }
+                            }
+                        } else if let Some(rest) = trimmed.strip_prefix("error:") {
+                            let msg = rest.trim();
+                            if !msg.is_empty() && captured_stdout_err.is_none() {
+                                captured_stdout_err = Some(msg.to_string());
+                            }
+                        }
                         continue;
                     }
                     let Ok(ev) = serde_json::from_str::<Value>(trimmed) else {
@@ -2615,30 +4028,71 @@ impl AppCore {
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string);
+                            let init_model = ev
+                                .get("init")
+                                .and_then(|i| i.get("model"))
+                                .or_else(|| ev.get("model"))
+                                .and_then(|v| v.as_str())
+                                .and_then(humanize_model_name);
                             let mut g = reaper_core.inner.lock().unwrap();
+                            let pid_cid = g
+                                .bg_pids
+                                .iter()
+                                .find(|(_, &p)| p == pid)
+                                .map(|(k, _)| k.clone())
+                                .or_else(|| {
+                                    g.warm_workers
+                                        .iter()
+                                        .find(|(_, w)| w.pid == pid)
+                                        .map(|(k, _)| k.clone())
+                                });
                             let mut promoted_pair: Option<(String, String)> = None;
-                            if let Some(sess) = g
-                                .sessions
-                                .iter_mut()
-                                .find(|s| s.conversation_id == active_cid)
-                            {
+                            if let Some(sess) = g.sessions.iter_mut().find(|s| {
+                                s.conversation_id == active_cid
+                                    || pid_cid.as_deref() == Some(s.conversation_id.as_str())
+                                    || cli_cid.as_deref().is_some_and(|c| {
+                                        s.conversation_id == c
+                                            || s.cli_conversation_id.as_deref() == Some(c)
+                                    })
+                            }) {
                                 if let Some(ref cid_val) = cli_cid {
                                     sess.cli_conversation_id = Some(cid_val.clone());
                                     if sess.conversation_id.starts_with("pending-") {
                                         let old = sess.conversation_id.clone();
                                         sess.conversation_id = cid_val.clone();
-                                        active_cid = cid_val.clone();
                                         promoted_pair = Some((old, cid_val.clone()));
                                     }
                                 }
+                                active_cid = sess.conversation_id.clone();
+                                if let Some(m) = init_model {
+                                    sess.model_name = Some(m.clone());
+                                    if let Some(t) = sess.turns.iter_mut().rfind(|t| t.is_active) {
+                                        t.model_name = Some(m);
+                                    }
+                                }
+                                if sess.transcript_path.is_none() {
+                                    sess.transcript_path = discover_transcript_path(
+                                        &sess.conversation_id,
+                                        None,
+                                        &Value::Null,
+                                    )
+                                    .or_else(|| {
+                                        cli_cid.as_deref().and_then(|c| {
+                                            discover_transcript_path(c, None, &Value::Null)
+                                        })
+                                    });
+                                }
                                 sess.mid_process_note =
-                                    Some("Connected — waiting for agent response…".into());
+                                    Some("Connected — preparing prompt…".into());
                                 sess.updated_at = chrono::Utc::now().to_rfc3339();
                                 should_broadcast = true;
                             }
                             if let Some((old, new_id)) = promoted_pair {
                                 if let Some(p) = g.bg_pids.remove(&old) {
-                                    g.bg_pids.insert(new_id, p);
+                                    g.bg_pids.insert(new_id.clone(), p);
+                                }
+                                if let Some(w) = g.warm_workers.remove(&old) {
+                                    g.warm_workers.insert(new_id, w);
                                 }
                             }
                         }
@@ -2653,26 +4107,74 @@ impl AppCore {
                                     .or_else(|| su.get("delta"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
+                                let tool_name = su
+                                    .get("tool_name")
+                                    .or_else(|| su.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
                                 let mut g = reaper_core.inner.lock().unwrap();
-                                if let Some(sess) = g
-                                    .sessions
-                                    .iter_mut()
-                                    .find(|s| s.conversation_id == active_cid)
-                                {
+                                let pid_cid = g
+                                    .bg_pids
+                                    .iter()
+                                    .find(|(_, &p)| p == pid)
+                                    .map(|(k, _)| k.clone());
+                                if let Some(sess) = g.sessions.iter_mut().find(|s| {
+                                    s.conversation_id == active_cid
+                                        || pid_cid.as_deref() == Some(s.conversation_id.as_str())
+                                }) {
+                                    active_cid = sess.conversation_id.clone();
                                     if !delta.is_empty() {
                                         streamed_text.push_str(delta);
-                                        sess.latest_output =
-                                            Some(truncate_chars(streamed_text.trim(), 8_500));
+                                        let truncated = truncate_chars(streamed_text.trim(), 8_500);
+                                        sess.latest_output = Some(truncated.clone());
+                                        if let Some(t) = sess.turns.iter_mut().rfind(|t| t.is_active) {
+                                            t.assistant_output = Some(truncated);
+                                        }
                                         sess.phase = "working".into();
                                         sess.mid_process_note = None;
                                         sess.updated_at = chrono::Utc::now().to_rfc3339();
                                         if last_broadcast.elapsed().as_millis() >= 120 {
                                             should_broadcast = true;
                                         }
-                                    } else if step_type == "user_input" {
-                                        sess.mid_process_note = Some("Agent thinking…".into());
-                                        sess.updated_at = chrono::Utc::now().to_rfc3339();
-                                        should_broadcast = true;
+                                    } else {
+                                        match step_type {
+                                            "user_input" => {
+                                                sess.phase = "thinking".into();
+                                                sess.mid_process_note =
+                                                    Some("Prompt accepted — reasoning…".into());
+                                                sess.updated_at = chrono::Utc::now().to_rfc3339();
+                                                should_broadcast = true;
+                                            }
+                                            "tool" => {
+                                                sess.phase = "working".into();
+                                                if let Some(tname) = tool_name {
+                                                    sess.active_tool = Some(tname.to_string());
+                                                    sess.mid_process_note =
+                                                        Some(format!("Running {tname}…"));
+                                                } else {
+                                                    sess.mid_process_note =
+                                                        Some("Running tool…".into());
+                                                }
+                                                sess.updated_at = chrono::Utc::now().to_rfc3339();
+                                                should_broadcast = true;
+                                            }
+                                            "agent_response" if streamed_text.is_empty() => {
+                                                sess.phase = "working".into();
+                                                sess.mid_process_note =
+                                                    Some("Generating response…".into());
+                                                sess.updated_at = chrono::Utc::now().to_rfc3339();
+                                                should_broadcast = true;
+                                            }
+                                            "error_message" => {
+                                                sess.phase = "error".into();
+                                                sess.mid_process_note =
+                                                    Some("Finalizing error details…".into());
+                                                sess.updated_at = chrono::Utc::now().to_rfc3339();
+                                                should_broadcast = true;
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
@@ -2694,30 +4196,117 @@ impl AppCore {
                                     .map(str::trim)
                                     .filter(|s| !s.is_empty());
 
-                                if status_str.eq_ignore_ascii_case("SUCCESS") {
-                                    stream_succeeded = true;
-                                }
-                                if let Some(e) = err_str {
-                                    stream_error = Some(e.to_string());
-                                }
-                                let mut g = reaper_core.inner.lock().unwrap();
-                                if let Some(sess) = g
-                                    .sessions
-                                    .iter_mut()
-                                    .find(|s| s.conversation_id == active_cid)
+                                let turn_ok = status_str.eq_ignore_ascii_case("SUCCESS")
+                                    || (resp_str.is_some() && err_str.is_none());
+                                let err_for_turn = err_str
+                                    .map(str::to_string)
+                                    .or_else(|| {
+                                        (!turn_ok)
+                                            .then(|| captured_stdout_err.clone())
+                                            .flatten()
+                                    })
+                                    .or_else(|| {
+                                        (!turn_ok).then(|| {
+                                            "Antigravity CLI returned an error.".to_string()
+                                        })
+                                    });
+                                let fallback_stream = (!streamed_text.trim().is_empty())
+                                    .then(|| streamed_text.trim().to_string());
+                                let final_out =
+                                    resp_str.map(str::to_string).or(fallback_stream);
+                                let now_done = chrono::Utc::now().to_rfc3339();
+
+                                let mut tp_to_backfill: Option<String> = None;
                                 {
-                                    if let Some(r) = resp_str {
-                                        sess.latest_output = Some(truncate_chars(r, 8_500));
-                                    }
-                                    if let Some(e) = err_str {
-                                        sess.last_error = Some(truncate_chars(e, 500));
-                                        if e.to_ascii_lowercase().contains("trajectory not found") {
-                                            sess.cli_conversation_id = None;
+                                    let mut g = reaper_core.inner.lock().unwrap();
+                                    let pid_cid = g
+                                        .bg_pids
+                                        .iter()
+                                        .find(|(_, &p)| p == pid)
+                                        .map(|(k, _)| k.clone());
+                                    if let Some(sess) = g.sessions.iter_mut().find(|s| {
+                                        s.conversation_id == active_cid
+                                            || pid_cid.as_deref() == Some(s.conversation_id.as_str())
+                                    }) {
+                                        active_cid = sess.conversation_id.clone();
+                                        Self::finalize_session_turn(
+                                            sess,
+                                            turn_ok,
+                                            final_out.as_deref(),
+                                            err_for_turn.clone(),
+                                            &now_done,
+                                        );
+                                        if sess.transcript_path.is_none() {
+                                            sess.transcript_path = discover_transcript_path(
+                                                &sess.conversation_id,
+                                                None,
+                                                &Value::Null,
+                                            )
+                                            .or_else(|| {
+                                                sess.cli_conversation_id.as_deref().and_then(|c| {
+                                                    discover_transcript_path(c, None, &Value::Null)
+                                                })
+                                            });
                                         }
+                                        tp_to_backfill = sess.transcript_path.clone();
                                     }
-                                    sess.updated_at = chrono::Utc::now().to_rfc3339();
-                                    should_broadcast = true;
+                                    if turn_ok {
+                                        if let Some(w) = g.warm_workers.get_mut(&active_cid) {
+                                            w.turn_active = false;
+                                            w.last_used_at = std::time::Instant::now();
+                                        }
+                                    } else {
+                                        // `agy.exe` shuts down on error results, so evict the worker handle right away.
+                                        g.warm_workers.remove(&active_cid);
+                                        g.warm_workers.retain(|_, w| w.pid != pid);
+                                        g.bg_pids.remove(&active_cid);
+                                        g.bg_pids.retain(|_, &mut p| p != pid);
+                                    }
                                 }
+
+                                reaper_core.persist();
+                                reaper_core.broadcast_snapshot(Some(if turn_ok {
+                                    "ready"
+                                } else {
+                                    "denied"
+                                }));
+
+                                if let Some(tp) = tp_to_backfill {
+                                    let bf_core = reaper_core.clone();
+                                    let bf_cid = active_cid.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(180))
+                                            .await;
+                                        if let Ok(Some(ins)) = tokio::task::spawn_blocking(move || {
+                                            read_transcript_insights(&tp)
+                                        })
+                                        .await
+                                        {
+                                            let mut changed = false;
+                                            {
+                                                let mut g = bf_core.inner.lock().unwrap();
+                                                if let Some(sess) =
+                                                    g.sessions.iter_mut().find(|s| {
+                                                        s.conversation_id == bf_cid
+                                                            || s.cli_conversation_id.as_deref()
+                                                                == Some(bf_cid.as_str())
+                                                    })
+                                                {
+                                                    changed =
+                                                        apply_insights_to_session(sess, ins, true);
+                                                }
+                                            }
+                                            if changed {
+                                                bf_core.broadcast_snapshot(None);
+                                            }
+                                        }
+                                    });
+                                }
+
+                                // Reset per-turn buffers and keep reading stdout for subsequent warm turns.
+                                streamed_text.clear();
+                                captured_stdout_err = None;
+                                last_broadcast = std::time::Instant::now();
                             }
                         }
                         _ => {}
@@ -2742,7 +4331,7 @@ impl AppCore {
                     .cloned()
             };
 
-            let final_ok = stream_succeeded || (exit_ok && stream_error.is_none());
+            let final_ok = exit_ok;
             let now_done = chrono::Utc::now().to_rfc3339();
             let mut changed = false;
             {
@@ -2752,53 +4341,49 @@ impl AppCore {
                     .iter()
                     .find(|(_, &p)| p == pid)
                     .map(|(k, _)| k.clone())
+                    .or_else(|| {
+                        g.warm_workers
+                            .iter()
+                            .find(|(_, w)| w.pid == pid)
+                            .map(|(k, _)| k.clone())
+                    })
                     .unwrap_or_else(|| active_cid.clone());
                 g.bg_pids.remove(&matching_cid);
+                g.warm_workers.remove(&matching_cid);
+                g.bg_pids.retain(|_, &mut p| p != pid);
+                g.warm_workers.retain(|_, w| w.pid != pid);
+
                 if let Some(sess) = g
                     .sessions
                     .iter_mut()
                     .find(|s| s.conversation_id == matching_cid || s.conversation_id == active_cid)
                 {
-                    sess.bg_running = false;
-                    sess.active_tool = None;
-                    sess.mid_process_note = None;
-                    sess.updated_at = now_done.clone();
-                    for st in &mut sess.steps {
-                        if st.status == "running" {
-                            st.status = if final_ok { "done" } else { "error" }.into();
-                        }
+                    // Only finalize on process exit if a turn was actually still running without a `result` event.
+                    if sess.bg_running {
+                        let fallback_out = (!streamed_text.trim().is_empty())
+                            .then(|| streamed_text.trim().to_string());
+                        let err_msg = if final_ok {
+                            None
+                        } else {
+                            Some(
+                                captured_stdout_err
+                                    .or(captured_stderr_err)
+                                    .unwrap_or_else(|| "Antigravity CLI exited with an error.".into()),
+                            )
+                        };
+                        Self::finalize_session_turn(
+                            sess,
+                            final_ok,
+                            fallback_out.as_deref(),
+                            err_msg,
+                            &now_done,
+                        );
+                        changed = true;
                     }
-                    for fg in &mut sess.focus_groups {
-                        if fg.ended_at.is_none() {
-                            fg.ended_at = Some(now_done.clone());
-                        }
-                        for st in &mut fg.steps {
-                            if st.status == "running" {
-                                st.status = if final_ok { "done" } else { "error" }.into();
-                            }
-                        }
-                    }
-                    if final_ok {
-                        sess.status = "completed".into();
-                        sess.phase = "done".into();
-                        sess.last_error = None;
-                    } else if sess.status != "completed" {
-                        sess.status = "error".into();
-                        sess.phase = "error".into();
-                        if sess.last_error.is_none() {
-                            let err_msg = stream_error
-                                .or(captured_stderr_err)
-                                .unwrap_or_else(|| "Antigravity CLI exited with an error.".into());
-                            if err_msg.to_ascii_lowercase().contains("trajectory not found") {
-                                sess.cli_conversation_id = None;
-                            }
-                            sess.last_error = Some(truncate_chars(&err_msg, 500));
-                        }
-                    }
-                    changed = true;
                 }
             }
             if changed {
+                reaper_core.persist();
                 reaper_core.broadcast_snapshot(Some(if final_ok { "ready" } else { "denied" }));
             }
         });
@@ -2810,20 +4395,57 @@ impl AppCore {
         }))
     }
 
+    /// Gracefully terminates all warm persistent `agy.exe` worker processes and background PIDs.
+    pub fn shutdown_warm_workers(&self) {
+        let mut pids: Vec<u32> = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            for (_, w) in g.warm_workers.drain() {
+                if !pids.contains(&w.pid) {
+                    pids.push(w.pid);
+                }
+            }
+            for (_, p) in g.bg_pids.drain() {
+                if !pids.contains(&p) {
+                    pids.push(p);
+                }
+            }
+        }
+        for pid in pids {
+            let _ = kill_owned_child_tree(pid);
+        }
+    }
+
     /// Halts an active session via hook termination + pending approval denial + owned headless PID kill.
     pub fn stop_agent_session(&self, conversation_id: &str) -> Result<(), String> {
         let pid_to_kill: Option<u32>;
         let mut approval_ids_to_deny: Vec<String> = Vec::new();
+        let now_done = chrono::Utc::now().to_rfc3339();
 
         {
             let mut g = self.inner.lock().unwrap();
-            pid_to_kill = g.bg_pids.remove(conversation_id);
+            let bg_pid = g.bg_pids.remove(conversation_id);
+            let worker_pid = g.warm_workers.remove(conversation_id).map(|w| w.pid);
+            let mut extra_pid: Option<u32> = None;
 
             for p in &g.pending_approvals {
                 if p.conversation_id == conversation_id {
                     approval_ids_to_deny.push(p.id.clone());
                 }
             }
+
+            let cli_cid_opt = g
+                .sessions
+                .iter()
+                .find(|s| s.conversation_id == conversation_id)
+                .and_then(|s| s.cli_conversation_id.clone());
+            if let Some(ref cli_cid) = cli_cid_opt {
+                extra_pid = g
+                    .bg_pids
+                    .remove(cli_cid)
+                    .or_else(|| g.warm_workers.remove(cli_cid).map(|w| w.pid));
+            }
+            pid_to_kill = bg_pid.or(worker_pid).or(extra_pid);
 
             if let Some(sess) = g
                 .sessions
@@ -2834,15 +4456,8 @@ impl AppCore {
                 sess.queued_messages.clear();
                 sess.mid_process_note = None;
                 sess.active_tool = None;
-                if pid_to_kill.is_some() {
-                    sess.bg_running = false;
-                    sess.status = "completed".into();
-                    sess.phase = "done".into();
-                    for st in &mut sess.steps {
-                        if st.status == "running" {
-                            st.status = "done".into();
-                        }
-                    }
+                if pid_to_kill.is_some() || sess.bg_running {
+                    Self::finalize_session_turn(sess, true, None, None, &now_done);
                 }
             } else {
                 return Err("Session not found".to_string());
@@ -3027,5 +4642,266 @@ impl AppCore {
         }
 
         md
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_insights_to_session, clean_user_prompt, dedup_and_merge_focus_groups,
+        dedup_session_diffs, AgentSession, FileDiffPreview, FocusGroup, SessionStep,
+        SessionTurn, TranscriptInsights,
+    };
+
+    #[test]
+    fn dedup_merges_transcript_and_hook_focus_groups_without_collapsing_distinct_parallel_calls() {
+        let mk_step = |id: &str,
+                       call_id: Option<&str>,
+                       event: &str,
+                       verb: &str,
+                       summary: &str,
+                       range: Option<&str>,
+                       status: &str| SessionStep {
+            id: id.to_string(),
+            call_id: call_id.map(str::to_string),
+            step_idx: None,
+            event: event.to_string(),
+            tool_name: Some(if verb == "Ran" { "run_command" } else { "read_file" }.to_string()),
+            summary: summary.to_string(),
+            detail: None,
+            verb: verb.to_string(),
+            file_path: None,
+            line_range: range.map(str::to_string),
+            start_line: None,
+            added_lines: None,
+            removed_lines: None,
+            unified_diff: None,
+            status: status.to_string(),
+            timestamp: "2026-11-25T07:51:30Z".to_string(),
+        };
+
+        let title = "Inspecting headless agy runner, live NOVA session state, and CLI flags";
+        let mut groups = vec![
+            FocusGroup {
+                id: "fg-1".to_string(),
+                title: title.to_string(),
+                explicit_focus: true,
+                pre_text: None,
+                started_at: "2026-11-25T07:51:30Z".to_string(),
+                ended_at: Some("2026-11-25T07:52:05Z".to_string()),
+                steps: vec![
+                    mk_step("tr-0", None, "Transcript", "Analyzed", "state.rs", Some("#L1800-2600"), "done"),
+                    mk_step("tr-1", None, "Transcript", "Analyzed", "state.rs", Some("#L2601-3545"), "done"),
+                    mk_step("tr-2", None, "Transcript", "Analyzed", "SKILL.md", None, "done"),
+                    mk_step("tr-3", None, "Transcript", "Analyzed", "SKILL.md", None, "done"),
+                    mk_step("tr-4", None, "Transcript", "Ran", "Inspect live NOVA session snapshot", None, "done"),
+                ],
+            },
+            FocusGroup {
+                id: "uuid-fg-2".to_string(),
+                title: title.to_string(),
+                explicit_focus: true,
+                pre_text: None,
+                started_at: "2026-11-25T07:52:05Z".to_string(),
+                ended_at: None,
+                steps: vec![
+                    mk_step("hk-0", Some("call_1"), "PreToolUse", "Analyzed", "state.rs", Some("#L1800-2600"), "done"),
+                    mk_step("hk-1", Some("call_2"), "PreToolUse", "Analyzed", "state.rs", Some("#L2601-3545"), "done"),
+                    mk_step("hk-2", Some("call_3"), "PreToolUse", "Analyzed", "SKILL.md", None, "done"),
+                    mk_step("hk-3", Some("call_4"), "PreToolUse", "Analyzed", "SKILL.md", None, "running"),
+                    mk_step("hk-4", Some("call_5"), "PreToolUse", "Ran", "Inspect live NOVA session snapshot", None, "running"),
+                ],
+            },
+        ];
+
+        dedup_and_merge_focus_groups(&mut groups);
+
+        assert_eq!(groups.len(), 1, "Duplicate consecutive focus groups must merge into 1");
+        assert_eq!(groups[0].started_at, "2026-11-25T07:51:30Z");
+        assert_eq!(groups[0].ended_at, None, "Merged active group must stay open");
+        assert_eq!(
+            groups[0].steps.len(),
+            5,
+            "All 5 steps (including 2 distinct SKILL.md reads) must be preserved without doubling to 10"
+        );
+        assert_eq!(groups[0].steps[2].call_id.as_deref(), Some("call_3"));
+        assert_eq!(groups[0].steps[3].call_id.as_deref(), Some("call_4"));
+        assert_eq!(groups[0].steps[3].status, "running");
+    }
+
+    #[test]
+    fn dedup_session_diffs_removes_identical_unreverted_hunks() {
+        let mut diffs = vec![
+            FileDiffPreview {
+                file_path: "c:\\Users\\ongch\\Desktop\\NOVA\\src\\App.tsx".into(),
+                added_lines: 4,
+                removed_lines: 1,
+                unified_diff: "@@ -1,2 +1,5 @@\n+const a = 1;".into(),
+                timestamp: "2026-11-25T07:52:10Z".into(),
+                start_line: Some(1),
+                undo_target: None,
+                undo_replacement: None,
+                reverted: false,
+            },
+            FileDiffPreview {
+                file_path: "C:/Users/ongch/Desktop/NOVA/src/App.tsx".into(),
+                added_lines: 4,
+                removed_lines: 1,
+                unified_diff: "@@ -1,2 +1,5 @@\n+const a = 1;\n".into(),
+                timestamp: "2026-11-25T07:52:05Z".into(),
+                start_line: Some(1),
+                undo_target: None,
+                undo_replacement: None,
+                reverted: false,
+            },
+        ];
+        dedup_session_diffs(&mut diffs);
+        assert_eq!(diffs.len(), 1);
+    }
+
+    #[test]
+    fn apply_insights_skips_premature_backfill_and_protects_newer_bg_turn() {
+        let mut sess = AgentSession {
+            conversation_id: "c1".into(),
+            agent: "antigravity".into(),
+            workspace_path: "c:\\repo".into(),
+            workspace_name: "repo".into(),
+            git_branch: None,
+            model_name: None,
+            last_user_input: Some("turn 2".into()),
+            status: "active".into(),
+            phase: "thinking".into(),
+            current_focus: None,
+            mid_process_note: Some("Warm session — reasoning…".into()),
+            latest_thinking: None,
+            latest_output: None,
+            plan_steps: Vec::new(),
+            focus_groups: Vec::new(),
+            turns: vec![
+                SessionTurn {
+                    id: "turn-1".into(),
+                    user_prompt: "turn 1".into(),
+                    assistant_output: Some("old output".into()),
+                    thinking: None,
+                    model_name: None,
+                    tool_calls_count: 1,
+                    files_touched_count: 0,
+                    focus_groups: Vec::new(),
+                    diffs: Vec::new(),
+                    started_at: None,
+                    completed_at: None,
+                    is_active: false,
+                },
+                SessionTurn {
+                    id: "turn-2".into(),
+                    user_prompt: "turn 2".into(),
+                    assistant_output: None,
+                    thinking: None,
+                    model_name: None,
+                    tool_calls_count: 0,
+                    files_touched_count: 0,
+                    focus_groups: Vec::new(),
+                    diffs: Vec::new(),
+                    started_at: None,
+                    completed_at: None,
+                    is_active: true,
+                },
+            ],
+            transcript_path: None,
+            queued_messages: Vec::new(),
+            stop_requested: false,
+            bg_running: true,
+            cli_conversation_id: None,
+            last_error: None,
+            detected_ide_permission: None,
+            permission_override: None,
+            active_tool: None,
+            steps: Vec::new(),
+            diffs: Vec::new(),
+            subagents: Vec::new(),
+            process_chain: Vec::new(),
+            started_at: "2026-11-25T07:50:00Z".into(),
+            updated_at: "2026-11-25T07:51:00Z".into(),
+            commands_count: 0,
+            files_touched_count: 0,
+        };
+
+        let stale_ins = TranscriptInsights {
+            has_explicit_turn: true,
+            user_prompt: Some("turn 1".into()),
+            latest_output: Some("old output".into()),
+            turns: vec![sess.turns[0].clone()],
+            ..Default::default()
+        };
+        assert!(!apply_insights_to_session(&mut sess, stale_ins, true));
+        assert_eq!(sess.last_user_input.as_deref(), Some("turn 2"));
+        assert_eq!(sess.turns.len(), 2);
+        assert!(sess.latest_output.is_none());
+
+        // Same turn, allow_structural_backfill = false must NOT inject transcript focus_groups
+        sess.bg_running = false;
+        let same_turn_ins = TranscriptInsights {
+            has_explicit_turn: true,
+            user_prompt: Some("turn 2".into()),
+            focus_groups: vec![FocusGroup {
+                id: "fg-1".into(),
+                title: "Reading files".into(),
+                explicit_focus: true,
+                pre_text: None,
+                started_at: "2026-11-25T07:51:01Z".into(),
+                ended_at: None,
+                steps: Vec::new(),
+            }],
+            turns: sess.turns.clone(),
+            ..Default::default()
+        };
+        let _ = apply_insights_to_session(&mut sess, same_turn_ins, false);
+        assert!(
+            sess.focus_groups.is_empty(),
+            "Backfill must stay disabled while hooks manage live focus_groups"
+        );
+    }
+
+    #[test]
+    fn clean_user_prompt_preserves_multiline_formatting_and_full_length() {
+        let long_body = format!(
+            "<USER_REQUEST>\nFix the following UI issues:\n1. Make prompt expandable\n2. Preserve code indentation:\n```ts\nconst x = () => {{\n  return {};\n}};\n```\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nuploaded 1 image(s):\n</ADDITIONAL_METADATA>",
+            "a".repeat(600)
+        );
+        let cleaned = clean_user_prompt(&long_body).expect("should clean prompt");
+        assert!(cleaned.contains("1. Make prompt expandable\n2. Preserve code indentation:"));
+        assert!(cleaned.contains("  return aaaaa"));
+        assert!(cleaned.len() > 600, "full prompt must not be truncated at 240 chars");
+        assert!(!cleaned.contains("ADDITIONAL_METADATA"));
+    }
+
+    #[test]
+    fn clean_user_prompt_strips_legacy_and_tagged_handoff_context() {
+        let legacy = "<USER_REQUEST>[Context from preceding Antigravity IDE session in workspace `NOVA`:\nLast user request: start git init here remote url https://github.com/0NGKUNG/NOVA.git\nLast assistant summary: Git is initialized in `C:\\Users\\ongch\\Desktop\\NOVA`, connected [README.md](file:///C:/README.md).]\n\nexpand able to see full promt\ncorrect the promt format</USER_REQUEST>";
+        assert_eq!(
+            clean_user_prompt(legacy).as_deref(),
+            Some("expand able to see full promt\ncorrect the promt format")
+        );
+
+        let tagged = "<USER_REQUEST><NOVA_HANDOFF_CONTEXT>\nWorkspace: `NOVA`\nLast user request: init\nLast assistant summary: done\n</NOVA_HANDOFF_CONTEXT>\n\nPlease run tests and verify build</USER_REQUEST>";
+        assert_eq!(
+            clean_user_prompt(tagged).as_deref(),
+            Some("Please run tests and verify build")
+        );
+    }
+
+    #[test]
+    fn clean_user_prompt_formats_screenshot_attachment_cleanly() {
+        let with_snip = "Check alignment on top bar\n\n[Attached Screenshot: `C:\\Users\\ongch\\AppData\\Local\\Temp\\nova-snip-123.png` — inspect this image file with read_file]";
+        assert_eq!(
+            clean_user_prompt(with_snip).as_deref(),
+            Some("Check alignment on top bar\n\n📎 Attached screenshot: `nova-snip-123.png`")
+        );
+
+        let with_multi = "Compare these two designs\n\n[Attached Images — inspect each image file with read_file:\n- `C:\\Users\\ongch\\AppData\\Local\\NOVA\\snips\\mockup-1.png`\n- `C:\\Users\\ongch\\AppData\\Local\\NOVA\\snips\\photo-2.jpg`]";
+        assert_eq!(
+            clean_user_prompt(with_multi).as_deref(),
+            Some("Compare these two designs\n\n📎 Attached images: `mockup-1.png`, `photo-2.jpg`")
+        );
     }
 }

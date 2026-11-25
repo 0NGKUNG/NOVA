@@ -7,6 +7,7 @@ import {
   NovaSettings,
   NovaSnapshot,
   PortProcessInfo,
+  RealtimeQuotaState,
   TechTerm,
   TodoItem,
   VoiceNote,
@@ -31,6 +32,50 @@ export function isTauriRuntime(): boolean {
   );
 }
 
+type InvokeFn = <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+type ListenFn = <T = unknown>(
+  event: string,
+  handler: (event: { payload: T }) => void
+) => Promise<() => void>;
+
+let cachedInvoke: InvokeFn | null = null;
+let cachedListen: ListenFn | null = null;
+let coreLoadPromise: Promise<InvokeFn | null> | null = null;
+let eventLoadPromise: Promise<ListenFn | null> | null = null;
+
+function getTauriInvoke(): Promise<InvokeFn | null> {
+  if (cachedInvoke) return Promise.resolve(cachedInvoke);
+  if (!isTauriRuntime()) return Promise.resolve(null);
+  if (!coreLoadPromise) {
+    coreLoadPromise = import("@tauri-apps/api/core")
+      .then((m) => {
+        cachedInvoke = m.invoke as InvokeFn;
+        return cachedInvoke;
+      })
+      .catch(() => null);
+  }
+  return coreLoadPromise;
+}
+
+function getTauriListen(): Promise<ListenFn | null> {
+  if (cachedListen) return Promise.resolve(cachedListen);
+  if (!isTauriRuntime()) return Promise.resolve(null);
+  if (!eventLoadPromise) {
+    eventLoadPromise = import("@tauri-apps/api/event")
+      .then((m) => {
+        cachedListen = m.listen as ListenFn;
+        return cachedListen;
+      })
+      .catch(() => null);
+  }
+  return eventLoadPromise;
+}
+
+if (typeof window !== "undefined" && isTauriRuntime()) {
+  void getTauriInvoke();
+  void getTauriListen();
+}
+
 function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:47920";
   const { protocol, hostname, port } = window.location;
@@ -48,22 +93,31 @@ function getApiBase(): string {
 let cachedAuthToken: string | null = null;
 let pendingTokenPromise: Promise<string> | null = null;
 
-async function resolveAuthToken(): Promise<string> {
-  if (cachedAuthToken) return cachedAuthToken;
+async function resolveAuthToken(forceRefresh = false): Promise<string> {
+  if (!forceRefresh && cachedAuthToken) return cachedAuthToken;
   if (typeof window === "undefined") return "";
 
   const urlToken = new URLSearchParams(window.location.search).get("token") ?? "";
   if (urlToken) {
     cachedAuthToken = urlToken;
+    try {
+      localStorage.setItem("nova_token", urlToken);
+    } catch {}
     return urlToken;
   }
 
+  // Inside Tauri desktop windows, always prefer the live IPC token over potentially stale localStorage
   if (isTauriRuntime()) {
     if (!pendingTokenPromise) {
-      pendingTokenPromise = import("@tauri-apps/api/core")
-        .then(({ invoke }) => invoke<string>("get_ipc_token"))
+      pendingTokenPromise = getTauriInvoke()
+        .then((invoke) => (invoke ? invoke<string>("get_ipc_token") : ""))
         .then((tok) => {
           cachedAuthToken = tok || "";
+          if (tok) {
+            try {
+              localStorage.setItem("nova_token", tok);
+            } catch {}
+          }
           return cachedAuthToken;
         })
         .catch(() => "")
@@ -71,8 +125,17 @@ async function resolveAuthToken(): Promise<string> {
           pendingTokenPromise = null;
         });
     }
-    return pendingTokenPromise;
+    const ipcTok = await pendingTokenPromise;
+    if (ipcTok) return ipcTok;
   }
+
+  try {
+    const saved = localStorage.getItem("nova_token");
+    if (saved) {
+      cachedAuthToken = saved;
+      return saved;
+    }
+  } catch {}
 
   return "";
 }
@@ -91,8 +154,8 @@ async function getWsUrl(): Promise<string> {
 }
 
 async function postJson<T = Record<string, unknown>>(path: string, body: unknown): Promise<T> {
-  const token = await resolveAuthToken();
-  const res = await fetch(`${getApiBase()}${path}`, {
+  let token = await resolveAuthToken();
+  let res = await fetch(`${getApiBase()}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -100,14 +163,34 @@ async function postJson<T = Record<string, unknown>>(path: string, body: unknown
     },
     body: JSON.stringify(body),
   });
+  if (res.status === 401 && isTauriRuntime()) {
+    token = await resolveAuthToken(true);
+    res = await fetch(`${getApiBase()}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { "X-Nova-Token": token } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  }
   return (await res.json()) as T;
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const token = await resolveAuthToken();
-  const res = await fetch(`${getApiBase()}${path}`, {
+  let token = await resolveAuthToken();
+  let res = await fetch(`${getApiBase()}${path}`, {
     headers: token ? { "X-Nova-Token": token } : undefined,
   });
+  if (res.status === 401 && isTauriRuntime()) {
+    token = await resolveAuthToken(true);
+    res = await fetch(`${getApiBase()}${path}`, {
+      headers: token ? { "X-Nova-Token": token } : undefined,
+    });
+  }
+  if (!res.ok) {
+    throw new Error(`NOVA API ${path} failed with HTTP ${res.status}`);
+  }
   return (await res.json()) as T;
 }
 
@@ -140,8 +223,10 @@ export const novaApi = {
     conversationId?: string | null;
     prompt: string;
     mode?: "auto" | "accept-edits" | "plan";
+    model?: string | null;
     effort?: string;
     imageDataUrl?: string | null;
+    images?: Array<{ dataUrl: string; name?: string }>;
   }) =>
     postJson<{ ok: boolean; delivery?: string; error?: string }>("/api/session/send", payload),
 
@@ -167,12 +252,14 @@ export const novaApi = {
     const out = await postJson("/api/settings", settings);
     if (isTauriRuntime()) {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("apply_snap_zone", {
-          zone: settings.snapZone,
-          monitorIndex: settings.monitorIndex,
-        });
-        await invoke("toggle_detached_orb", { visible: settings.detachedOrbVisible });
+        const invoke = cachedInvoke ?? (await getTauriInvoke());
+        if (invoke) {
+          await invoke("apply_snap_zone", {
+            zone: settings.snapZone,
+            monitorIndex: settings.monitorIndex,
+          });
+          await invoke("toggle_detached_orb", { visible: settings.detachedOrbVisible });
+        }
       } catch {
         // Ignore outside Tauri window
       }
@@ -181,6 +268,10 @@ export const novaApi = {
   },
 
   setSecret: (name: string, value: string) => postJson<{ ok: boolean; error?: string }>("/api/secrets/set", { name, value }),
+  switchAccount: (account: "main" | "second" | string) =>
+    postJson<{ ok: boolean; activeAccount: string }>("/api/account/switch", { account }),
+  getQuota: () => getJson<RealtimeQuotaState>("/api/quota"),
+  refreshQuota: () => postJson<RealtimeQuotaState>("/api/quota/refresh", {}),
   applyAntigravityHooks: (action: "install" | "uninstall" | "disable_coucou" | "enable_coucou") =>
     postJson<{ ok: boolean; backupPath?: string; error?: string }>("/api/hooks/antigravity", { action }),
 
@@ -198,12 +289,14 @@ export const novaApi = {
   deleteChatThread: (id: string) => postJson("/api/chat/delete", { id }),
 
   captureScreenSnip: () => postJson<{ ok: boolean; dataUrl?: string; error?: string }>("/api/context/snip", {}),
+  readClipboardImage: () =>
+    postJson<{ ok: boolean; dataUrl?: string; name?: string; error?: string }>("/api/context/clipboard-image", {}),
   copyToClipboard: (text: string) => postJson("/api/context/clipboard-copy", { text }),
   toggleClipboardPin: (id: string) => postJson("/api/context/clipboard-pin", { id }),
 
   focusSessionWindow: (conversationId: string) => postJson("/api/workspace/focus", { conversationId }),
-  openInEditor: (filePath: string, line?: number, editor?: string) =>
-    postJson("/api/workspace/open-editor", { filePath, line, editor }),
+  openInEditor: (filePath: string, line?: number, editor?: string, workspacePath?: string) =>
+    postJson("/api/workspace/open-editor", { filePath, line, editor, workspacePath }),
   launchSession: (workspacePath: string, agentCli: string, initialPrompt?: string) =>
     postJson("/api/workspace/launch", { workspacePath, agentCli, initialPrompt }),
   openExternalUrl: (url: string) => postJson("/api/workspace/open-url", { url }),
@@ -245,34 +338,38 @@ export const novaApi = {
   ) => {
     if (!isTauriRuntime()) return;
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("apply_snap_zone", {
-        zone,
-        monitorIndex,
-        expanded,
-        foldedW,
-        foldedH,
-      });
+      const invoke = cachedInvoke ?? (await getTauriInvoke());
+      if (invoke) {
+        await invoke("apply_snap_zone", {
+          zone,
+          monitorIndex,
+          expanded,
+          foldedW,
+          foldedH,
+        });
+      }
     } catch {
       // ignore
     }
   },
-  setIslandRect: async (x: number, y: number, w: number, h: number) => {
+  setIslandRect: (x: number, y: number, w: number, h: number): void => {
     if (!isTauriRuntime()) return;
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("set_island_rect", { x, y, w, h });
-    } catch {
-      // ignore
+    if (cachedInvoke) {
+      void cachedInvoke("set_island_rect", { x, y, w, h }).catch(() => {});
+      return;
     }
+    void getTauriInvoke().then((invoke) => {
+      if (invoke) void invoke("set_island_rect", { x, y, w, h }).catch(() => {});
+    });
   },
   onIslandPointer: async (
-    handler: (payload: { inside: boolean; x: number; y: number }) => void
+    handler: (payload: { inside: boolean; x: number; y: number; proximity?: number }) => void
   ): Promise<() => void> => {
     if (!isTauriRuntime()) return () => {};
     try {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten = await listen<{ inside: boolean; x: number; y: number }>(
+      const listen = cachedListen ?? (await getTauriListen());
+      if (!listen) return () => {};
+      const unlisten = await listen<{ inside: boolean; x: number; y: number; proximity?: number }>(
         "nova-island-pointer",
         (ev) => handler(ev.payload)
       );
@@ -284,8 +381,8 @@ export const novaApi = {
   setIslandPassthrough: async (ignore: boolean) => {
     if (!isTauriRuntime()) return;
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("set_island_passthrough", { ignore });
+      const invoke = cachedInvoke ?? (await getTauriInvoke());
+      if (invoke) await invoke("set_island_passthrough", { ignore });
     } catch {
       // ignore
     }
@@ -293,8 +390,8 @@ export const novaApi = {
   focusIslandWindow: async () => {
     if (!isTauriRuntime()) return;
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("focus_island_window");
+      const invoke = cachedInvoke ?? (await getTauriInvoke());
+      if (invoke) await invoke("focus_island_window");
     } catch {
       // ignore
     }
@@ -302,9 +399,11 @@ export const novaApi = {
   openHubWindow: async () => {
     if (isTauriRuntime()) {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("show_hub_window");
-        return;
+        const invoke = cachedInvoke ?? (await getTauriInvoke());
+        if (invoke) {
+          await invoke("show_hub_window");
+          return;
+        }
       } catch {
         // fallback below
       }

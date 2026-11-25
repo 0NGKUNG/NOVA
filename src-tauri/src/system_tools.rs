@@ -280,6 +280,7 @@ pub fn open_in_editor(
     file_path: &str,
     line: Option<u32>,
     preferred_editor: Option<&str>,
+    workspace_path: Option<&str>,
 ) -> Result<String, String> {
     let trimmed = file_path.trim();
     if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
@@ -290,9 +291,34 @@ pub fn open_in_editor(
         return Err("Target file or workspace path does not exist".to_string());
     }
 
+    let valid_ws = workspace_path
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && !w.chars().any(|c| c.is_control()) && Path::new(w).is_dir());
+
     let goto_target = match line {
         Some(l) if path_obj.is_file() => format!("{trimmed}:{l}"),
         _ => trimmed.to_string(),
+    };
+
+    let build_editor_args = |ws: Option<&str>| -> Vec<String> {
+        if path_obj.is_file() {
+            if let Some(w) = ws {
+                vec![
+                    "--reuse-window".to_string(),
+                    w.to_string(),
+                    "--goto".to_string(),
+                    goto_target.clone(),
+                ]
+            } else {
+                vec![
+                    "--reuse-window".to_string(),
+                    "--goto".to_string(),
+                    goto_target.clone(),
+                ]
+            }
+        } else {
+            vec!["--reuse-window".to_string(), trimmed.to_string()]
+        }
     };
 
     if preferred_editor.unwrap_or("antigravity") == "antigravity" {
@@ -304,11 +330,7 @@ pub fn open_in_editor(
                 .join("antigravity-ide.cmd");
             if ide_cmd.is_file() {
                 let prog = ide_cmd.to_string_lossy().to_string();
-                let args: Vec<&str> = if path_obj.is_file() {
-                    vec!["--reuse-window", "--goto", &goto_target]
-                } else {
-                    vec!["--reuse-window", trimmed]
-                };
+                let args = build_editor_args(valid_ws);
                 if silent_cmd(&prog).args(&args).spawn().is_ok() {
                     return Ok(format!("Opened {goto_target} in Antigravity IDE"));
                 }
@@ -334,12 +356,8 @@ pub fn open_in_editor(
         ],
     };
 
+    let args = build_editor_args(valid_ws);
     for bin in candidates {
-        let args: Vec<&str> = if path_obj.is_file() {
-            vec!["--reuse-window", "--goto", &goto_target]
-        } else {
-            vec!["--reuse-window", trimmed]
-        };
         if silent_cmd(bin).args(&args).spawn().is_ok() {
             return Ok(format!("Opened {goto_target} via {bin}"));
         }
@@ -380,19 +398,35 @@ pub fn resolve_agy_cli_path() -> Option<PathBuf> {
     None
 }
 
-/// Spawns `agy.exe` silently (`CREATE_NO_WINDOW`) in `--output-format stream-json` mode with piped stdout/stderr.
+/// Returns true if an `agy` model slug already carries an explicit reasoning-effort suffix.
+pub fn model_slug_has_effort_suffix(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.ends_with("-low")
+        || lower.ends_with("-medium")
+        || lower.ends_with("-high")
+        || lower.ends_with("-xhigh")
+}
+
+/// Spawns `agy.exe` silently (`CREATE_NO_WINDOW`) in headless `stream-json` mode with piped stdout/stderr.
+/// When `persistent_stream` is true, pipes `stdin` and omits `-p` so turns can stream over NDJSON stdin.
 pub fn spawn_headless_agy_turn(
     agy_exe: &Path,
     workspace_dir: &Path,
     conversation_id: Option<&str>,
     prompt: &str,
     mode: &str,
+    model: Option<&str>,
     effort: Option<&str>,
     skip_permissions: bool,
+    persistent_stream: bool,
 ) -> Result<std::process::Child, String> {
     let mut cmd = silent_cmd(&agy_exe.to_string_lossy());
     cmd.current_dir(workspace_dir)
-        .stdin(Stdio::null())
+        .stdin(if persistent_stream {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -410,17 +444,32 @@ pub fn spawn_headless_agy_turn(
         cmd.args(["--mode", mode]);
     }
 
-    if let Some(eff) = effort.map(str::trim).filter(|e| {
-        matches!(*e, "low" | "medium" | "high" | "xhigh" | "max")
-    }) {
-        cmd.args(["--effort", eff]);
+    let clean_model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("auto"));
+    if let Some(m) = clean_model {
+        cmd.args(["--model", m]);
+    }
+
+    // Suffixed `agy` slugs (e.g. `gemini-3.8-flash-medium`) fail if paired with `--effort`.
+    let model_has_suffix = clean_model.map(model_slug_has_effort_suffix).unwrap_or(false);
+    if !model_has_suffix {
+        if let Some(eff) = effort.map(str::trim).filter(|e| {
+            matches!(*e, "low" | "medium" | "high" | "xhigh" | "max")
+        }) {
+            cmd.args(["--effort", eff]);
+        }
     }
 
     if skip_permissions {
         cmd.arg("--dangerously-skip-permissions");
     }
 
-    cmd.args(["--output-format", "stream-json", "-p", prompt]);
+    if persistent_stream {
+        cmd.args(["--input-format", "stream-json", "--output-format", "stream-json"]);
+    } else {
+        cmd.args(["--output-format", "stream-json", "-p", prompt]);
+    }
     cmd.spawn()
         .map_err(|e| format!("Failed to start headless agy.exe: {e}"))
 }
@@ -536,33 +585,100 @@ pub fn kill_owned_child_tree(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Saves a base64 PNG data URL to `%LOCALAPPDATA%\NOVA\snips\` so `agy.exe` can inspect screenshots directly.
-pub fn save_snip_png_to_disk(data_url: &str) -> Option<PathBuf> {
-    let b64_part = data_url
-        .trim()
-        .split_once(";base64,")
-        .map(|(_, b)| b)
-        .unwrap_or_else(|| data_url.trim());
+fn detect_image_extension(mime_header: Option<&str>, bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "png";
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "jpg";
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "webp";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "gif";
+    }
+    if bytes.starts_with(b"BM") {
+        return "bmp";
+    }
+    if let Some(hdr) = mime_header {
+        let lower = hdr.to_ascii_lowercase();
+        if lower.contains("image/jpeg") || lower.contains("image/jpg") {
+            return "jpg";
+        }
+        if lower.contains("image/webp") {
+            return "webp";
+        }
+        if lower.contains("image/gif") {
+            return "gif";
+        }
+        if lower.contains("image/bmp") {
+            return "bmp";
+        }
+    }
+    "png"
+}
+
+fn sanitize_image_stem(name_hint: Option<&str>) -> String {
+    let Some(raw) = name_hint.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "snip".to_string();
+    };
+    let stem = Path::new(raw)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    let cleaned: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(28)
+        .collect();
+    if cleaned.is_empty() {
+        "img".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Saves a base64 image data URL (`png`, `jpg`, `webp`, `gif`, `bmp`) to `%LOCALAPPDATA%\NOVA\snips\`
+/// so both Antigravity IDE hooks and `agy.exe` can inspect attached images directly via `read_file`.
+pub fn save_image_data_url_to_disk(data_url: &str, name_hint: Option<&str>) -> Option<PathBuf> {
+    let trimmed = data_url.trim();
+    let (mime_hdr, b64_part) = match trimmed.split_once(";base64,") {
+        Some((h, b)) => (Some(h), b.trim()),
+        None => (None, trimmed),
+    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64_part)
         .ok()?;
-    if bytes.is_empty() || bytes.len() > 12 * 1024 * 1024 {
+    if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
         return None;
     }
+
+    let ext = detect_image_extension(mime_hdr, &bytes);
+    let stem = sanitize_image_stem(name_hint);
 
     let snips_dir = nova_data_dir().join("snips");
     let _ = std::fs::create_dir_all(&snips_dir);
 
-    // Prune older snips beyond 20 files to keep disk clean
+    // Prune older snips beyond 40 files to keep disk clean
     if let Ok(entries) = std::fs::read_dir(&snips_dir) {
         let mut files: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.is_file())
             .collect();
-        if files.len() > 20 {
+        if files.len() > 40 {
             files.sort();
-            for old in files.iter().take(files.len().saturating_sub(20)) {
+            for old in files.iter().take(files.len().saturating_sub(40)) {
                 let _ = std::fs::remove_file(old);
             }
         }
@@ -570,9 +686,14 @@ pub fn save_snip_png_to_disk(data_url: &str) -> Option<PathBuf> {
 
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let short_id = &uuid::Uuid::new_v4().simple().to_string()[..6];
-    let out_path = snips_dir.join(format!("snip-{stamp}-{short_id}.png"));
+    let out_path = snips_dir.join(format!("{stem}-{stamp}-{short_id}.{ext}"));
     std::fs::write(&out_path, bytes).ok()?;
     Some(out_path)
+}
+
+/// Saves a base64 PNG/image data URL to `%LOCALAPPDATA%\NOVA\snips\` so `agy.exe` can inspect screenshots directly.
+pub fn save_snip_png_to_disk(data_url: &str) -> Option<PathBuf> {
+    save_image_data_url_to_disk(data_url, None)
 }
 
 /// Discovers active and nearby developer workspaces for the Island workspace selector.
@@ -783,7 +904,7 @@ pub fn focus_session_window(chain: &[ProcessAncestor], fallback_workspace: &str)
     }
 
     if !fallback_workspace.is_empty() {
-        return open_in_editor(fallback_workspace, None, Some("antigravity"));
+        return open_in_editor(fallback_workspace, None, Some("antigravity"), None);
     }
     Err("Could not locate session window".to_string())
 }
@@ -964,6 +1085,88 @@ pub fn capture_screen_data_url() -> Result<String, String> {
     let _ = std::fs::remove_file(&temp_png);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/png;base64,{b64}"))
+}
+
+/// Reads an image from the Windows Clipboard (either raw bitmap pixels or a copied Explorer image file)
+/// and returns `(data_url, filename)` so `Ctrl+V` works even when copying image files from File Explorer.
+pub fn read_clipboard_image_data_url() -> Result<Option<(String, String)>, String> {
+    let temp_png = std::env::temp_dir().join(format!("nova-cb-{}.png", uuid::Uuid::new_v4()));
+    let path_escaped = temp_png.to_string_lossy().replace('\'', "''");
+
+    let ps_script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{ \
+             $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+             if ($null -ne $img) {{ \
+                 $img.Save('{path_escaped}', [System.Drawing.Imaging.ImageFormat]::Png); \
+                 $img.Dispose(); \
+                 Write-Output 'BITMAP|clipboard.png'; \
+             }} \
+         }} elseif ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {{ \
+             $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); \
+             foreach ($f in $files) {{ \
+                 if ($f -match '\\.(png|jpg|jpeg|webp|gif|bmp)$') {{ \
+                     Write-Output ('FILE|' + $f); \
+                     break; \
+                 }} \
+             }} \
+         }}"
+    );
+
+    let out = silent_cmd("powershell")
+        .args(["-NoProfile", "-Sta", "-Command", &ps_script])
+        .output()
+        .map_err(|e| format!("Clipboard image check failed: {e}"))?;
+
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&temp_png);
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty());
+    let Some(line) = line else {
+        let _ = std::fs::remove_file(&temp_png);
+        return Ok(None);
+    };
+
+    if line.starts_with("BITMAP|") {
+        let bytes = std::fs::read(&temp_png).map_err(|e| format!("Failed reading clipboard PNG: {e}"))?;
+        let _ = std::fs::remove_file(&temp_png);
+        if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
+            return Ok(None);
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(Some((format!("data:image/png;base64,{b64}"), "clipboard.png".to_string())));
+    }
+
+    let _ = std::fs::remove_file(&temp_png);
+    if let Some(file_path) = line.strip_prefix("FILE|") {
+        let p = Path::new(file_path.trim());
+        if !p.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(p).map_err(|e| format!("Failed reading copied image file: {e}"))?;
+        if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
+            return Ok(None);
+        }
+        let ext = detect_image_extension(None, &bytes);
+        let mime = match ext {
+            "jpg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("clipboard.{ext}"));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(Some((format!("data:{mime};base64,{b64}"), name)));
+    }
+
+    Ok(None)
 }
 
 pub fn read_clipboard_text() -> Option<String> {
