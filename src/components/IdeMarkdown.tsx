@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
+import { Copy, Check } from "lucide-react";
 import { novaApi } from "../lib/novaClient";
 import { Lang } from "../i18n";
 
@@ -58,22 +58,206 @@ function renderInlineCodeContent(code: string): React.ReactNode {
   return code;
 }
 
-function renderInlineTokens(text: string, keyPrefix: string): React.ReactNode[] {
-  const nodes: React.ReactNode[] = [];
-  // Matches: [label](url), `code`, **bold**
-  const tokenRe = /\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*/g;
-  let lastIdx = 0;
-  let match: RegExpExecArray | null;
-  let part = 0;
+interface InlineToken {
+  type: "text" | "bold" | "italic" | "bold_italic" | "code" | "del" | "link" | "url";
+  text?: string;
+  label?: string;
+  url?: string;
+}
 
-  while ((match = tokenRe.exec(text)) !== null) {
-    if (match.index > lastIdx) {
-      nodes.push(text.slice(lastIdx, match.index));
+export function tokenizeInline(input: string): InlineToken[] {
+  const tokens: InlineToken[] = [];
+  let i = 0;
+  const len = input.length;
+
+  while (i < len) {
+    // 1. Links: [label](url)
+    if (input[i] === "[") {
+      const closeBracket = input.indexOf("]", i + 1);
+      if (closeBracket !== -1 && input[closeBracket + 1] === "(") {
+        const closeParen = input.indexOf(")", closeBracket + 2);
+        if (closeParen !== -1) {
+          const label = input.slice(i + 1, closeBracket);
+          const url = input.slice(closeBracket + 2, closeParen);
+          tokens.push({ type: "link", label, url });
+          i = closeParen + 1;
+          continue;
+        }
+      }
     }
-    const k = `${keyPrefix}-${part++}`;
-    if (match[1] !== undefined && match[2] !== undefined) {
-      const label = match[1];
-      const url = match[2].trim();
+
+    // 2. Inline code: `code`
+    if (input[i] === "`") {
+      const closeTick = input.indexOf("`", i + 1);
+      if (closeTick !== -1) {
+        const code = input.slice(i + 1, closeTick);
+        tokens.push({ type: "code", text: code });
+        i = closeTick + 1;
+        continue;
+      }
+    }
+
+    // 3. Strikethrough: ~~del~~
+    if (input.startsWith("~~", i)) {
+      const closeDel = input.indexOf("~~", i + 2);
+      if (closeDel !== -1) {
+        const delText = input.slice(i + 2, closeDel);
+        tokens.push({ type: "del", text: delText });
+        i = closeDel + 2;
+        continue;
+      }
+    }
+
+    // 4. Bold / Italic / Bold-Italic (* or _)
+    // Check for bold-italic ***text*** or ___text___
+    if (input.startsWith("***", i)) {
+      const close = input.indexOf("***", i + 3);
+      if (close !== -1) {
+        tokens.push({ type: "bold_italic", text: input.slice(i + 3, close) });
+        i = close + 3;
+        continue;
+      }
+    }
+    if (input.startsWith("___", i)) {
+      const close = input.indexOf("___", i + 3);
+      if (close !== -1) {
+        tokens.push({ type: "bold_italic", text: input.slice(i + 3, close) });
+        i = close + 3;
+        continue;
+      }
+    }
+
+    // Check for bold **...**
+    if (input.startsWith("**", i)) {
+      let closeIdx = -1;
+      let searchPos = i + 2;
+      while (searchPos < len) {
+        const nextTwo = input.indexOf("**", searchPos);
+        if (nextTwo === -1) break;
+        let candidate = nextTwo;
+        // Handle bold with adjacent italic, e.g. **Why the header says *"Ran commands 9s"***:
+        if (input[nextTwo + 2] === "*" && input[nextTwo + 3] !== "*") {
+          const innerBefore = input.slice(i + 2, candidate);
+          const starCount = (innerBefore.match(/(?<!\*)\*(?!\*)/g) || []).length;
+          if (starCount % 2 === 1) {
+            candidate = nextTwo + 1;
+          }
+        }
+        closeIdx = candidate;
+        break;
+      }
+
+      if (closeIdx !== -1) {
+        const boldText = input.slice(i + 2, closeIdx);
+        tokens.push({ type: "bold", text: boldText });
+        i = closeIdx + 2;
+        continue;
+      }
+    }
+
+    // Check for bold __...__
+    if (input.startsWith("__", i)) {
+      const closeUnderscore = input.indexOf("__", i + 2);
+      if (closeUnderscore !== -1) {
+        tokens.push({ type: "bold", text: input.slice(i + 2, closeUnderscore) });
+        i = closeUnderscore + 2;
+        continue;
+      }
+    }
+
+    // Check for italic *text* (single *)
+    if (input[i] === "*" && input[i + 1] !== "*" && (i === 0 || input[i - 1] !== "*")) {
+      const closeStar = input.indexOf("*", i + 1);
+      if (
+        closeStar !== -1 &&
+        input[closeStar + 1] !== "*" &&
+        (closeStar === 0 || input[closeStar - 1] !== "*")
+      ) {
+        tokens.push({ type: "italic", text: input.slice(i + 1, closeStar) });
+        i = closeStar + 1;
+        continue;
+      }
+    }
+
+    // Check for italic _text_ (single _)
+    if (input[i] === "_" && input[i + 1] !== "_" && (i === 0 || input[i - 1] !== "_")) {
+      const closeUnder = input.indexOf("_", i + 1);
+      if (
+        closeUnder !== -1 &&
+        input[closeUnder + 1] !== "_" &&
+        (closeUnder === 0 || input[closeUnder - 1] !== "_")
+      ) {
+        tokens.push({ type: "italic", text: input.slice(i + 1, closeUnder) });
+        i = closeUnder + 1;
+        continue;
+      }
+    }
+
+    // 5. Bare URLs: https?://
+    if (input.startsWith("http://", i) || input.startsWith("https://", i)) {
+      const urlMatch = input.slice(i).match(/^(https?:\/\/[^\s<>"`]+)/);
+      if (urlMatch) {
+        const rawUrl = urlMatch[1];
+        const cleanUrl = rawUrl.replace(/[.,;:!?)\]]+$/, "");
+        tokens.push({ type: "url", url: cleanUrl });
+        i += cleanUrl.length;
+        continue;
+      }
+    }
+
+    // 6. Plain character accumulation
+    const lastTok = tokens[tokens.length - 1];
+    if (lastTok && lastTok.type === "text") {
+      lastTok.text = (lastTok.text ?? "") + input[i];
+    } else {
+      tokens.push({ type: "text", text: input[i] });
+    }
+    i++;
+  }
+
+  return tokens;
+}
+
+export function renderInlineTokens(text: string, keyPrefix: string): React.ReactNode[] {
+  const tokens = tokenizeInline(text);
+  const nodes: React.ReactNode[] = [];
+
+  tokens.forEach((t, idx) => {
+    const k = `${keyPrefix}-${idx}`;
+    if (t.type === "text") {
+      nodes.push(t.text ?? "");
+    } else if (t.type === "bold") {
+      nodes.push(
+        <strong key={k} className="md-strong">
+          {renderInlineTokens(t.text ?? "", `${k}-b`)}
+        </strong>
+      );
+    } else if (t.type === "italic") {
+      nodes.push(
+        <em key={k} className="md-em">
+          {renderInlineTokens(t.text ?? "", `${k}-i`)}
+        </em>
+      );
+    } else if (t.type === "bold_italic") {
+      nodes.push(
+        <strong key={k} className="md-strong">
+          <em className="md-em">{renderInlineTokens(t.text ?? "", `${k}-bi`)}</em>
+        </strong>
+      );
+    } else if (t.type === "del") {
+      nodes.push(
+        <del key={k} className="md-del">
+          {renderInlineTokens(t.text ?? "", `${k}-d`)}
+        </del>
+      );
+    } else if (t.type === "code") {
+      nodes.push(
+        <code key={k} className="md-code-inline">
+          {renderInlineCodeContent(t.text ?? "")}
+        </code>
+      );
+    } else if (t.type === "link" && t.label && t.url) {
+      const url = t.url.trim();
       const fileTarget = parseFileUriTarget(url);
       if (fileTarget) {
         const badge = getFileBadgeMeta(fileTarget.filePath);
@@ -92,7 +276,7 @@ function renderInlineTokens(text: string, keyPrefix: string): React.ReactNode[] 
             }
           >
             <span className={`ide-badge ${badge.cls}`}>{badge.text}</span>
-            <span>{label}</span>
+            <span>{t.label}</span>
           </button>
         );
       } else if (url.startsWith("http://") || url.startsWith("https://")) {
@@ -103,27 +287,31 @@ function renderInlineTokens(text: string, keyPrefix: string): React.ReactNode[] 
             className="md-ext-link"
             onClick={() => void novaApi.openExternalUrl(url)}
           >
-            {label}
+            {t.label}
           </button>
         );
       } else {
-        nodes.push(<code key={k} className="md-code-inline">{label}</code>);
+        nodes.push(
+          <code key={k} className="md-code-inline">
+            {t.label}
+          </code>
+        );
       }
-    } else if (match[3] !== undefined) {
+    } else if (t.type === "url" && t.url) {
+      const url = t.url;
       nodes.push(
-        <code key={k} className="md-code-inline">
-          {renderInlineCodeContent(match[3])}
-        </code>
+        <button
+          key={k}
+          type="button"
+          className="md-ext-link"
+          onClick={() => void novaApi.openExternalUrl(url)}
+        >
+          {url}
+        </button>
       );
-    } else if (match[4] !== undefined) {
-      nodes.push(<strong key={k} className="md-strong">{match[4]}</strong>);
     }
-    lastIdx = match.index + match[0].length;
-  }
+  });
 
-  if (lastIdx < text.length) {
-    nodes.push(text.slice(lastIdx));
-  }
   return nodes;
 }
 
@@ -151,20 +339,11 @@ const CodeFenceBlock: React.FC<{ langLabel: string; code: string }> = ({ langLab
   );
 };
 
-interface IdeMarkdownProps {
-  markdown: string;
-  compact?: boolean;
-  lang: Lang;
-}
-
-export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({ markdown, compact = false, lang }) => {
-  const [expanded, setExpanded] = useState(false);
+export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
   const trimmed = markdown.trim();
-  if (!trimmed) return null;
+  if (!trimmed) return [];
 
   const lines = trimmed.split("\n");
-  const isLong = compact && (trimmed.length > 560 || lines.length > 10);
-
   const blocks: React.ReactNode[] = [];
   let i = 0;
 
@@ -239,6 +418,23 @@ export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({ markdown, compact = fa
       continue;
     }
 
+    // Blockquote
+    if (t.startsWith(">")) {
+      const bqLines: string[] = [];
+      while (i < lines.length) {
+        const cur = lines[i].trim();
+        if (!cur.startsWith(">")) break;
+        bqLines.push(cur.replace(/^>\s?/, ""));
+        i++;
+      }
+      blocks.push(
+        <blockquote key={`bq-${i}`} className="md-blockquote">
+          {renderInlineTokens(bqLines.join(" "), `bq-${i}`)}
+        </blockquote>
+      );
+      continue;
+    }
+
     // Paragraph
     blocks.push(
       <p key={`p-${i}`} className="md-para">
@@ -248,28 +444,24 @@ export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({ markdown, compact = fa
     i++;
   }
 
+  return blocks;
+}
+
+interface IdeMarkdownProps {
+  markdown: string;
+  compact?: boolean;
+  lang: Lang;
+}
+
+export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({ markdown }) => {
+  const trimmed = markdown.trim();
+  if (!trimmed) return null;
+
+  const blocks = renderMarkdownBlocks(trimmed);
+
   return (
     <div className="ide-md-wrap">
-      <div className={`ide-md-body ${isLong && !expanded ? "is-clamped" : ""}`}>{blocks}</div>
-      {isLong && (
-        <button
-          type="button"
-          className="ide-md-toggle"
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded ? (
-            <>
-              <ChevronUp size={11} />
-              <span>{lang === "th" ? "ย่อคำตอบ" : "Collapse response"}</span>
-            </>
-          ) : (
-            <>
-              <ChevronDown size={11} />
-              <span>{lang === "th" ? "อ่านคำตอบเต็ม" : "Show full response"}</span>
-            </>
-          )}
-        </button>
-      )}
+      <div className="ide-md-body">{blocks}</div>
     </div>
   );
 };
