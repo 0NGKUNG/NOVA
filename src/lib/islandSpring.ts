@@ -81,7 +81,7 @@ export class Spring {
   }
 
   get settled(): boolean {
-    return Math.abs(this.target - this.value) < 0.04 && Math.abs(this.velocity) < 0.25;
+    return Math.abs(this.target - this.value) < 0.2 && Math.abs(this.velocity) < 1.2;
   }
 
   step(dtSeconds: number): void {

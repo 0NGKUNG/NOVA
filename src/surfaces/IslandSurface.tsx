@@ -639,17 +639,11 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       foldTimerRef.current = null;
     }
 
-    // Re-entering mid-collapse immediately reverses into spring open!
-    if (!expandedRef.current && widthTrackRef.current.animating && !pillHoveredRef.current) {
-      openIsland({ silent: true });
-      return;
-    }
-
     if (expandedRef.current) return;
     if (suppressFullscreenRef.current && pendingCountRef.current === 0) {
       return;
     }
-    openIsland({ silent: widthTrackRef.current.animating && !pillHoveredRef.current });
+    openIsland();
   }, [openIsland]);
 
   const leaveHover = useCallback(() => {
@@ -1001,6 +995,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const useNativePointerPoll = !embeddedPreview && isTauriRuntime();
 
   const handleShellPointerEnter = () => {
+    if (useNativePointerPoll) return;
     enterHover();
   };
 

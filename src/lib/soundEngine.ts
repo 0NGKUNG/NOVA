@@ -43,20 +43,22 @@ const CUE_RECIPES: Record<SoundCue, PartialNote[]> = {
     { freq: 1046.5, start: 0.3, dur: 0.35, peak: 0.085, type: "triangle" },
   ],
   island_open: [
-    { freq: 392.0, start: 0, dur: 0.085, peak: 0.024, type: "sine" },
-    { freq: 587.33, start: 0.028, dur: 0.12, peak: 0.028, type: "sine" },
+    { freq: 392.0, start: 0, dur: 0.105, peak: 0.045, type: "sine" },
+    { freq: 587.33, start: 0.026, dur: 0.14, peak: 0.05, type: "sine" },
   ],
   island_close: [
-    { freq: 493.88, start: 0, dur: 0.075, peak: 0.022, type: "sine" },
-    { freq: 329.63, start: 0.025, dur: 0.105, peak: 0.02, type: "sine" },
+    { freq: 493.88, start: 0, dur: 0.095, peak: 0.042, type: "sine" },
+    { freq: 329.63, start: 0.024, dur: 0.13, peak: 0.038, type: "sine" },
   ],
 };
 
 let audioCtx: AudioContext | null = null;
 let cachedSampleRate = 0;
 const bufferCache = new Map<SoundCue, AudioBuffer>();
+const lastCueFiredAt = new Map<SoundCue, number>();
 let keepAliveSource: AudioBufferSourceNode | null = null;
 let unlockListenersAttached = false;
+let shouldHoldKeepAlive = false;
 let cachedCosmicNoise: AudioBuffer | null = null;
 let activeBootCleanup: (() => void) | null = null;
 
@@ -144,8 +146,10 @@ function getCosmicNoiseBuffer(ac: AudioContext): AudioBuffer {
 }
 
 // Keeps Chromium's SilentSinkSuspender & Windows WASAPI / Bluetooth / USB DAC stream awake
-// using a -114 dBFS (2e-6 amplitude) 24 Hz AC loop — completely inaudible and zero DC offset.
+// using a -87 dBFS (4.5e-5 amplitude = ~1.5 LSB in 16-bit PCM so WASAPI never quantizes it to 0x0000!)
+// 19 Hz sub-audible AC loop — 100% physically inaudible and zero DC offset.
 function syncKeepAlive(ac: AudioContext, shouldKeepAlive: boolean) {
+  shouldHoldKeepAlive = shouldKeepAlive;
   if (!shouldKeepAlive) {
     if (keepAliveSource) {
       try {
@@ -165,9 +169,9 @@ function syncKeepAlive(ac: AudioContext, shouldKeepAlive: boolean) {
   const frames = sr;
   const kaBuf = ac.createBuffer(1, frames, sr);
   const ch = kaBuf.getChannelData(0);
-  const twoPi24 = (Math.PI * 2 * 24) / sr;
+  const twoPi19 = (Math.PI * 2 * 19) / sr;
   for (let i = 0; i < frames; i++) {
-    ch[i] = 2e-6 * Math.sin(i * twoPi24);
+    ch[i] = 4.5e-5 * Math.sin(i * twoPi19);
   }
 
   const src = ac.createBufferSource();
@@ -182,27 +186,40 @@ function attachUnlockListeners() {
   if (unlockListenersAttached || typeof window === "undefined") return;
   unlockListenersAttached = true;
   const unlock = () => {
-    if (audioCtx && audioCtx.state === "suspended") {
+    if (audioCtx && audioCtx.state !== "running" && audioCtx.state !== "closed") {
       audioCtx
         .resume()
         .then(() => {
-          if (audioCtx) syncKeepAlive(audioCtx, true);
+          if (audioCtx && shouldHoldKeepAlive) syncKeepAlive(audioCtx, true);
         })
         .catch(() => {});
     }
   };
   window.addEventListener("pointerdown", unlock, { passive: true });
+  window.addEventListener("pointermove", unlock, { passive: true });
   window.addEventListener("keydown", unlock, { passive: true });
 }
 
 function getOrCreateContext(): AudioContext | null {
   if (typeof window === "undefined") return null;
-  if (!audioCtx) {
+  if (!audioCtx || audioCtx.state === "closed") {
     const Ctor =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!Ctor) return null;
+    keepAliveSource = null;
     audioCtx = new Ctor({ latencyHint: "interactive" });
+    audioCtx.onstatechange = () => {
+      if (!audioCtx) return;
+      if (audioCtx.state === "running" && shouldHoldKeepAlive) {
+        syncKeepAlive(audioCtx, true);
+      } else if (
+        shouldHoldKeepAlive &&
+        (audioCtx.state === "suspended" || (audioCtx.state as string) === "interrupted")
+      ) {
+        audioCtx.resume().catch(() => {});
+      }
+    };
     attachUnlockListeners();
   }
   ensureBuffers(audioCtx);
@@ -211,12 +228,14 @@ function getOrCreateContext(): AudioContext | null {
 
 export function warmNovaAudio(enabled: boolean) {
   if (!enabled) {
+    shouldHoldKeepAlive = false;
     if (audioCtx) syncKeepAlive(audioCtx, false);
     return;
   }
+  shouldHoldKeepAlive = true;
   const ac = getOrCreateContext();
   if (!ac) return;
-  if (ac.state === "suspended") {
+  if (ac.state !== "running") {
     ac.resume()
       .then(() => syncKeepAlive(ac, true))
       .catch(() => {});
@@ -226,6 +245,11 @@ export function warmNovaAudio(enabled: boolean) {
 }
 
 function fireBuffer(ac: AudioContext, cue: SoundCue) {
+  const nowMs = performance.now();
+  const prevMs = lastCueFiredAt.get(cue) ?? -1000;
+  if (nowMs - prevMs < 42) return;
+  lastCueFiredAt.set(cue, nowMs);
+
   const buf = bufferCache.get(cue) ?? buildCueBuffer(ac, cue);
   const src = ac.createBufferSource();
   src.buffer = buf;
@@ -244,18 +268,16 @@ export function playNovaCue(cue: SoundCue, enabled: boolean) {
     return;
   }
 
-  if (ac.state === "suspended") {
-    const requestedAt = performance.now();
-    const maxDelayMs = cue === "island_open" || cue === "island_close" ? 75 : 300;
-    ac.resume()
-      .then(() => {
-        syncKeepAlive(ac, true);
-        if (performance.now() - requestedAt <= maxDelayMs) {
-          fireBuffer(ac, cue);
-        }
-      })
-      .catch(() => {});
-  }
+  const requestedAt = performance.now();
+  const maxDelayMs = cue === "island_open" || cue === "island_close" ? 260 : 400;
+  ac.resume()
+    .then(() => {
+      syncKeepAlive(ac, true);
+      if (performance.now() - requestedAt <= maxDelayMs) {
+        fireBuffer(ac, cue);
+      }
+    })
+    .catch(() => {});
 }
 
 /**
