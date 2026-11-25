@@ -53,6 +53,7 @@ import { NovaOrb, NovaOrbIntroPose, OrbState } from "../components/NovaOrb";
 import { SupernovaIntroOverlay } from "../components/SupernovaIntroOverlay";
 import { ApprovalCard } from "../components/ApprovalCard";
 import { DiffViewer } from "../components/DiffViewer";
+import { renderMarkdownBlocks } from "../components/IdeMarkdown";
 import { getPhaseLabel, SessionTelemetryView } from "../components/SessionTelemetryView";
 import {
   fileToDataUrl,
@@ -1734,7 +1735,11 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                             className="chat-snip-thumb"
                           />
                         )}
-                        <div className="chat-text">{m.content}</div>
+                        {m.role === "assistant" ? (
+                          <div className="chat-md-body">{renderMarkdownBlocks(m.content)}</div>
+                        ) : (
+                          <div className="chat-text">{m.content}</div>
+                        )}
                       </div>
                     ))}
                     {chatSending && (

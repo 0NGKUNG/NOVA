@@ -4,6 +4,7 @@ import { NovaSnapshot } from "../types";
 import { novaApi } from "../lib/novaClient";
 import { NovaOrb } from "../components/NovaOrb";
 import { DiffViewer } from "../components/DiffViewer";
+import { renderMarkdownBlocks } from "../components/IdeMarkdown";
 
 interface MobilePwaSurfaceProps {
   snapshot: NovaSnapshot;
@@ -120,7 +121,11 @@ export const MobilePwaSurface: React.FC<MobilePwaSurfaceProps> = ({ snapshot }) 
             <div className="nova-chat-messages">
               {thread?.messages.map((m) => (
                 <div key={m.id} className={`chat-bubble role-${m.role}`}>
-                  {m.content}
+                  {m.role === "assistant" ? (
+                    <div className="chat-md-body">{renderMarkdownBlocks(m.content)}</div>
+                  ) : (
+                    m.content
+                  )}
                 </div>
               ))}
             </div>
