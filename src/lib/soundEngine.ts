@@ -72,7 +72,134 @@ function sampleWave(phase01: number, type: PartialNote["type"]): number {
   return 2 * (phase01 - Math.floor(phase01 + 0.5));
 }
 
+// Pre-bakes the softened 2.90s Capsule Dock stem from Pure 1D ("Event Horizon Velvet Dark")
+// into a zero-latency 2-channel stereo AudioBuffer:
+// - Expand (`island_open`): 46.25 -> 103.83 Hz velvet magnetic cushion + Eb4 -> Bb4 (311.13 -> 466.16 Hz) glide
+// - Collapse (`island_close`): 103.83 -> 46.25 Hz airlock settle + Bb4 -> Eb4 (466.16 -> 311.13 Hz) reverse glide
+function buildDockHoverBuffer(ac: AudioContext, direction: "open" | "close"): AudioBuffer {
+  const sr = ac.sampleRate;
+  const totalSec = direction === "open" ? 0.27 : 0.25;
+  const len = Math.max(1, Math.ceil(totalSec * sr));
+  const buf = ac.createBuffer(2, len, sr);
+  const outL = buf.getChannelData(0);
+  const outR = buf.getChannelData(1);
+  const wetSend = new Float32Array(len);
+
+  const addGlide = (opts: {
+    f0: number;
+    f1: number;
+    start: number;
+    attack: number;
+    dur: number;
+    peak: number;
+    pan: number;
+    wet: number;
+  }) => {
+    const { f0, f1, start, attack, dur, peak, pan, wet } = opts;
+    const sIdx = Math.max(0, Math.floor(start * sr));
+    const eIdx = Math.min(len, Math.ceil((start + dur) * sr));
+    const decaySpan = Math.max(0.01, dur - attack);
+    // Equal-power stereo panner gains
+    const panAngle = ((pan + 1) * Math.PI) / 4;
+    const gainL = Math.cos(panAngle);
+    const gainR = Math.sin(panAngle);
+    let phase = 0;
+
+    for (let i = sIdx; i < eIdx; i++) {
+      const t = (i - sIdx) / sr;
+      const prog = t / dur;
+      const freq = f0 * Math.pow(f1 / f0, prog);
+      let env: number;
+      if (t < attack) {
+        env = peak * 0.5 * (1 - Math.cos(Math.PI * (t / attack)));
+      } else {
+        // Matches WebAudio exponentialRampToValueAtTime(0.0001) with soft velvet taper
+        env = peak * Math.pow(0.0018, (t - attack) / decaySpan);
+      }
+      const rem = dur - t;
+      if (rem < 0.008) {
+        env *= Math.max(0, rem / 0.008);
+      }
+      const sample = Math.sin(phase * Math.PI * 2) * env;
+      outL[i] += sample * gainL;
+      outR[i] += sample * gainR;
+      if (wet > 0) wetSend[i] += sample * wet;
+      phase += freq / sr;
+      if (phase >= 1) phase -= 1;
+    }
+  };
+
+  if (direction === "open") {
+    addGlide({
+      f0: 46.25,
+      f1: 103.83,
+      start: 0,
+      attack: 0.012,
+      dur: 0.135,
+      peak: 0.036,
+      pan: 0,
+      wet: 0,
+    });
+    addGlide({
+      f0: 311.13,
+      f1: 466.16,
+      start: 0.008,
+      attack: 0.016,
+      dur: 0.215,
+      peak: 0.021,
+      pan: 0.08,
+      wet: 0.11,
+    });
+  } else {
+    addGlide({
+      f0: 103.83,
+      f1: 46.25,
+      start: 0,
+      attack: 0.01,
+      dur: 0.125,
+      peak: 0.034,
+      pan: 0,
+      wet: 0,
+    });
+    addGlide({
+      f0: 466.16,
+      f1: 311.13,
+      start: 0.006,
+      attack: 0.015,
+      dur: 0.195,
+      peak: 0.019,
+      pan: -0.08,
+      wet: 0.09,
+    });
+  }
+
+  // One-pole 1650 Hz velvet low-pass + subtle 28ms(L)/41ms(R) micro-room (zero long echo)
+  const rc = 1 / (2 * Math.PI * 1650);
+  const dt = 1 / sr;
+  const alpha = dt / (rc + dt);
+  let lp = 0;
+  for (let i = 0; i < len; i++) {
+    lp += alpha * (wetSend[i] - lp);
+    wetSend[i] = lp;
+  }
+  const delayL = Math.floor(0.028 * sr);
+  const delayR = Math.floor(0.041 * sr);
+  const endFadeSamples = Math.max(1, Math.floor(0.045 * sr));
+  for (let i = 0; i < len; i++) {
+    const tailFade = i > len - endFadeSamples ? (len - i) / endFadeSamples : 1;
+    if (i >= delayL) outL[i] += wetSend[i - delayL] * tailFade;
+    if (i >= delayR) outR[i] += wetSend[i - delayR] * tailFade;
+    outL[i] *= tailFade;
+    outR[i] *= tailFade;
+  }
+
+  return buf;
+}
+
 function buildCueBuffer(ac: AudioContext, cue: SoundCue): AudioBuffer {
+  if (cue === "island_open") return buildDockHoverBuffer(ac, "open");
+  if (cue === "island_close") return buildDockHoverBuffer(ac, "close");
+
   const notes = CUE_RECIPES[cue];
   const sr = ac.sampleRate;
   let totalSec = 0.05;
