@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Check,
   Copy,
@@ -9,6 +10,7 @@ import {
   ExternalLink,
   FileText,
   FolderGit2,
+  Gauge,
   Github,
   KeyRound,
   Languages,
@@ -21,10 +23,13 @@ import {
   Search,
   Shield,
   Smartphone,
+  Sparkles,
   Trash2,
+  User,
   Wrench,
 } from "lucide-react";
 import {
+  AVAILABLE_MODELS,
   GitHubOverview,
   HardwareTelemetry,
   MediaStatus,
@@ -79,6 +84,36 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
   // Secret inputs
   const [secretInputs, setSecretInputs] = useState<Record<string, string>>({});
   const [hookNotice, setHookNotice] = useState<string | null>(null);
+
+  // Dual Account & Quota State
+  const [mainAccountNameInput, setMainAccountNameInput] = useState(
+    settings.mainAccountName || "Main Account"
+  );
+  const [secondAccountNameInput, setSecondAccountNameInput] = useState(
+    settings.secondAccountName || "Second Account"
+  );
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+
+  const handleSaveAccountNames = async () => {
+    await novaApi.saveSettings({
+      ...settings,
+      mainAccountName: mainAccountNameInput.trim() || "Main Account",
+      secondAccountName: secondAccountNameInput.trim() || "Second Account",
+    });
+  };
+
+  const handleSwitchAccount = async (target: "main" | "second") => {
+    await novaApi.switchAccount(target);
+  };
+
+  const handleRefreshQuota = async () => {
+    setQuotaRefreshing(true);
+    try {
+      await novaApi.refreshQuota();
+    } finally {
+      setQuotaRefreshing(false);
+    }
+  };
 
   // Rule creator
   const [rulePattern, setRulePattern] = useState("");
@@ -591,10 +626,201 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
                 All secrets are stored directly in <strong>Windows Credential Manager</strong> (`app.nova.missioncontrol`)—never written to JSON files on disk.
               </p>
 
+              {/* DUAL ACCOUNT & REAL-TIME QUOTA CARD */}
+              <div className="hub-card" style={{ marginBottom: 16 }}>
+                <div className="nova-row-between">
+                  <div>
+                    <h3>{lang === "th" ? "จัดการบัญชีคู่ & โควตาเรียลไทม์" : "Dual Account & Real-Time Quota Manager"}</h3>
+                    <p className="muted-note">
+                      {lang === "th"
+                        ? "สลับบัญชีหลักและบัญชีสำรองได้ทันที พร้อมตรวจวัด RPM, RPD, TPM แบบสดเพื่อเลี่ยงข้อจำกัด 429"
+                        : "Directly toggle Main and Second accounts with live RPM, RPD, and TPM meters to avoid rate limits."}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className={`nova-btn nova-btn-ghost nova-btn-xs ${quotaRefreshing ? "spinning" : ""}`}
+                    onClick={handleRefreshQuota}
+                  >
+                    <RefreshCw size={12} />
+                    <span>{quotaRefreshing ? "Probing..." : "Refresh Quota"}</span>
+                  </button>
+                </div>
+
+                {/* Active Account Switcher Tabs & Names */}
+                <div className="hub-account-switch-row" style={{ marginTop: 12 }}>
+                  <div className="account-switch-pill-group">
+                    <button
+                      type="button"
+                      className={`account-switch-btn ${settings.activeAccount !== "second" ? "active" : ""}`}
+                      onClick={() => handleSwitchAccount("main")}
+                    >
+                      <User size={13} />
+                      <span>{settings.mainAccountName || "Main Account"}</span>
+                      {settings.activeAccount !== "second" && <span className="active-glow-tag">ACTIVE</span>}
+                    </button>
+                    <button
+                      type="button"
+                      className={`account-switch-btn ${settings.activeAccount === "second" ? "active" : ""}`}
+                      onClick={() => handleSwitchAccount("second")}
+                    >
+                      <User size={13} />
+                      <span>{settings.secondAccountName || "Second Account"}</span>
+                      {settings.activeAccount === "second" && <span className="active-glow-tag">ACTIVE</span>}
+                    </button>
+                  </div>
+
+                  <div className="account-name-inputs">
+                    <input
+                      className="nova-input nova-input-sm"
+                      placeholder="Main Account Label..."
+                      value={mainAccountNameInput}
+                      onChange={(e) => setMainAccountNameInput(e.target.value)}
+                    />
+                    <input
+                      className="nova-input nova-input-sm"
+                      placeholder="Second Account Label..."
+                      value={secondAccountNameInput}
+                      onChange={(e) => setSecondAccountNameInput(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="nova-btn nova-btn-primary nova-btn-xs"
+                      onClick={handleSaveAccountNames}
+                    >
+                      Save Names
+                    </button>
+                  </div>
+                </div>
+
+                {/* Default AI Model Selector */}
+                <div className="hub-model-selector-bar" style={{ marginTop: 14 }}>
+                  <span className="muted-note" style={{ marginRight: 8 }}>Default AI Model:</span>
+                  <select
+                    className="nova-select"
+                    value={settings.defaultChatModel}
+                    onChange={(e) => {
+                      const found = AVAILABLE_MODELS.find((m) => m.id === e.target.value);
+                      novaApi.saveSettings({
+                        ...settings,
+                        defaultChatModel: e.target.value,
+                        defaultChatProvider: found ? found.provider : settings.defaultChatProvider,
+                      });
+                    }}
+                  >
+                    {AVAILABLE_MODELS.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name} ({m.provider.toUpperCase()})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Side-by-Side Live Quota Cards */}
+                <div className="hub-grid-2" style={{ marginTop: 16 }}>
+                  {/* MAIN ACCOUNT QUOTA */}
+                  <div className={`hub-quota-card ${settings.activeAccount !== "second" ? "is-active" : ""}`}>
+                    <div className="nova-row-between">
+                      <div className="quota-card-title">
+                        <strong>{settings.mainAccountName || "Main Account"}</strong>
+                        <span className={`status-badge status-${snapshot.quota?.main.status || "healthy"}`}>
+                          {snapshot.quota?.main.status || "healthy"}
+                        </span>
+                      </div>
+                      {settings.activeAccount !== "second" ? (
+                        <span className="active-pill-badge">Active</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="nova-btn nova-btn-ghost nova-btn-xs"
+                          onClick={() => handleSwitchAccount("main")}
+                        >
+                          Switch Here
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="quota-row-metric" style={{ marginTop: 10 }}>
+                      <span className="metric-label">Requests / Min:</span>
+                      <strong className="metric-val">
+                        {snapshot.quota?.main.rpmUsed ?? 0} / {snapshot.quota?.main.rpmLimit ?? 15} RPM
+                      </strong>
+                    </div>
+                    <div className="quota-bar-track">
+                      <div
+                        className={`quota-bar-fill status-${snapshot.quota?.main.status || "healthy"}`}
+                        style={{ width: `${Math.min(100, snapshot.quota?.main.percentageUsed ?? 0)}%` }}
+                      />
+                    </div>
+
+                    <div className="quota-row-metric" style={{ marginTop: 8 }}>
+                      <span className="metric-label">Requests / Day:</span>
+                      <strong className="metric-val">
+                        {snapshot.quota?.main.rpdUsed ?? 0} / {snapshot.quota?.main.rpdLimit ?? 1500} RPD
+                      </strong>
+                    </div>
+
+                    <div className="quota-footer-details">
+                      <span>Tokens Today: {(snapshot.quota?.main.totalTokensToday ?? 0).toLocaleString()}</span>
+                      <span>Reset in: {snapshot.quota?.main.resetInSeconds ?? 0}s</span>
+                    </div>
+                  </div>
+
+                  {/* SECOND ACCOUNT QUOTA */}
+                  <div className={`hub-quota-card ${settings.activeAccount === "second" ? "is-active" : ""}`}>
+                    <div className="nova-row-between">
+                      <div className="quota-card-title">
+                        <strong>{settings.secondAccountName || "Second Account"}</strong>
+                        <span className={`status-badge status-${snapshot.quota?.second.status || "healthy"}`}>
+                          {snapshot.quota?.second.status || "healthy"}
+                        </span>
+                      </div>
+                      {settings.activeAccount === "second" ? (
+                        <span className="active-pill-badge">Active</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="nova-btn nova-btn-ghost nova-btn-xs"
+                          onClick={() => handleSwitchAccount("second")}
+                        >
+                          Switch Here
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="quota-row-metric" style={{ marginTop: 10 }}>
+                      <span className="metric-label">Requests / Min:</span>
+                      <strong className="metric-val">
+                        {snapshot.quota?.second.rpmUsed ?? 0} / {snapshot.quota?.second.rpmLimit ?? 15} RPM
+                      </strong>
+                    </div>
+                    <div className="quota-bar-track">
+                      <div
+                        className={`quota-bar-fill status-${snapshot.quota?.second.status || "healthy"}`}
+                        style={{ width: `${Math.min(100, snapshot.quota?.second.percentageUsed ?? 0)}%` }}
+                      />
+                    </div>
+
+                    <div className="quota-row-metric" style={{ marginTop: 8 }}>
+                      <span className="metric-label">Requests / Day:</span>
+                      <strong className="metric-val">
+                        {snapshot.quota?.second.rpdUsed ?? 0} / {snapshot.quota?.second.rpdLimit ?? 1500} RPD
+                      </strong>
+                    </div>
+
+                    <div className="quota-footer-details">
+                      <span>Tokens Today: {(snapshot.quota?.second.totalTokensToday ?? 0).toLocaleString()}</span>
+                      <span>Reset in: {snapshot.quota?.second.resetInSeconds ?? 0}s</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="hub-grid-2">
                 {(
                   [
-                    ["gemini", "Google Gemini API Key", secrets.gemini],
+                    ["gemini", "Google Gemini API Key (Main Account)", secrets.gemini],
+                    ["gemini_second", "Google Gemini API Key (Second Account)", secrets.geminiSecond],
                     ["anthropic", "Anthropic Claude API Key", secrets.anthropic],
                     ["openai", "OpenAI API Key", secrets.openai],
                     ["groq", "Groq API Key (Fast Chat + Whisper STT)", secrets.groq],

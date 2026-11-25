@@ -13,6 +13,7 @@ const KEYRING_SERVICE: &str = "app.nova.missioncontrol";
 
 const SECRET_KEYS: &[&str] = &[
     "gemini",
+    "gemini_second",
     "anthropic",
     "openai",
     "groq",
@@ -39,9 +40,24 @@ pub fn get_secret(name: &str) -> Option<String> {
     entry.get_password().ok().filter(|v| !v.trim().is_empty())
 }
 
+pub fn get_gemini_key_for_account(account: &str) -> Option<String> {
+    if account == "second" {
+        get_secret("gemini_second")
+            .or_else(|| std::env::var("GEMINI_API_KEY_SECOND").ok())
+            .or_else(|| get_secret("gemini"))
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+    } else {
+        get_secret("gemini")
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .or_else(|| get_secret("gemini_second"))
+            .or_else(|| std::env::var("GEMINI_API_KEY_SECOND").ok())
+    }
+}
+
 pub fn secret_presence_map() -> SecretPresenceMap {
     SecretPresenceMap {
         gemini: get_secret("gemini").is_some(),
+        gemini_second: get_secret("gemini_second").is_some(),
         anthropic: get_secret("anthropic").is_some(),
         openai: get_secret("openai").is_some(),
         groq: get_secret("groq").is_some(),
@@ -65,11 +81,40 @@ fn split_thinking(raw: &str) -> (String, Option<String>) {
     (raw.trim().to_string(), None)
 }
 
+/// Probes Gemini API key quota & connectivity
+pub async fn probe_gemini_quota(api_key: &str) -> (bool, Option<String>) {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return (false, Some("No API key configured".to_string()));
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (false, Some(e.to_string())),
+    };
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={key}");
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                (true, None)
+            } else if status.as_u16() == 429 {
+                (false, Some("Quota limit exceeded (429 Too Many Requests)".to_string()))
+            } else {
+                (false, Some(format!("HTTP {}", status)))
+            }
+        }
+        Err(e) => (false, Some(e.to_string())),
+    }
+}
+
 /// Sends a chat request to any supported backend:
 /// - `gemini` (Google Generative Language API, supports inline base64 Vision)
 /// - `anthropic` (Claude Messages API, supports inline base64 Vision)
 /// - `openai` / `groq` / `openrouter` / `ollama` / `lmstudio` (OpenAI-compatible Chat Completions)
-/// - `cli-gemini` / `cli-claude` / `cli-codex` (Zero-Key CLI Subscription Relay)
+/// - `cli-gemini` / `cli-claude` / `cli-antigravity` (Zero-Key CLI Subscription Relay)
 pub async fn run_ai_chat(
     provider: &str,
     model: &str,
@@ -77,7 +122,8 @@ pub async fn run_ai_chat(
     history: &[ChatMessage],
     ollama_url: &str,
     lmstudio_url: &str,
-) -> Result<(String, Option<String>, String), String> {
+    active_account: &str,
+) -> Result<(String, Option<String>, String, Option<u64>), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(65))
         .build()
@@ -85,13 +131,14 @@ pub async fn run_ai_chat(
 
     match provider {
         "gemini" => {
-            let api_key = get_secret("gemini")
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-                .ok_or_else(|| {
-                    "No Gemini API key stored. Add one in NOVA Hub -> AI & Keys, or switch to Ollama / CLI Relay.".to_string()
-                })?;
+            let api_key = get_gemini_key_for_account(active_account).ok_or_else(|| {
+                format!(
+                    "No Gemini API key stored for {} account. Add one in NOVA Settings -> AI & Keys.",
+                    if active_account == "second" { "Second" } else { "Main" }
+                )
+            })?;
             let chosen_model = if model.is_empty() {
-                "gemini-2.5-flash"
+                "gemini-3.8-flash-high"
             } else {
                 model
             };
@@ -140,17 +187,26 @@ pub async fn run_ai_chat(
             let status = resp.status();
             let val: Value = resp.json().await.map_err(|e| e.to_string())?;
             if !status.is_success() {
+                if status.as_u16() == 429 {
+                    let other = if active_account == "main" { "Second" } else { "Main" };
+                    return Err(format!(
+                        "Gemini Quota Exceeded (429 Rate Limit) on {} account. Click the Account Switcher in the top bar to switch to {} account!",
+                        if active_account == "main" { "Main" } else { "Second" },
+                        other
+                    ));
+                }
                 let msg = val["error"]["message"]
                     .as_str()
                     .unwrap_or("Gemini API returned an error");
                 return Err(format!("Gemini ({status}): {msg}"));
             }
+            let token_count = val["usageMetadata"]["totalTokenCount"].as_u64();
             let text = val["candidates"][0]["content"]["parts"][0]["text"]
                 .as_str()
                 .unwrap_or("(Empty response)")
                 .to_string();
             let (clean, think) = split_thinking(&text);
-            Ok((clean, think, chosen_model.to_string()))
+            Ok((clean, think, chosen_model.to_string(), token_count))
         }
 
         "anthropic" => {
@@ -213,12 +269,15 @@ pub async fn run_ai_chat(
                     .unwrap_or("Anthropic API error");
                 return Err(format!("Anthropic ({status}): {msg}"));
             }
+            let token_count = val["usage"]["input_tokens"]
+                .as_u64()
+                .and_then(|i| val["usage"]["output_tokens"].as_u64().map(|o| i + o));
             let text = val["content"][0]["text"]
                 .as_str()
                 .unwrap_or("(Empty response)")
                 .to_string();
             let (clean, think) = split_thinking(&text);
-            Ok((clean, think, chosen_model.to_string()))
+            Ok((clean, think, chosen_model.to_string(), token_count))
         }
 
         "openai" | "groq" | "openrouter" | "ollama" | "lmstudio" => {
@@ -305,12 +364,13 @@ pub async fn run_ai_chat(
                     .unwrap_or("Chat completion error");
                 return Err(format!("{provider} ({status}): {msg}"));
             }
+            let token_count = val["usage"]["total_tokens"].as_u64();
             let text = val["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("(Empty response)")
                 .to_string();
             let (clean, think) = split_thinking(&text);
-            Ok((clean, think, chosen_model.to_string()))
+            Ok((clean, think, chosen_model.to_string(), token_count))
         }
 
         "cli-gemini" | "cli-claude" | "cli-antigravity" => {
@@ -321,7 +381,7 @@ pub async fn run_ai_chat(
             let full_prompt = format!("{system_prompt}\n\nUser: {last_prompt}");
             let cli_name = match provider {
                 "cli-claude" => "claude.cmd",
-                "cli-gemini" => "gemini.cmd",
+                "cli-antigravity" => "agy.exe",
                 _ => "gemini.cmd",
             };
             let output = tokio::task::spawn_blocking(move || {
@@ -340,7 +400,7 @@ pub async fn run_ai_chat(
             }
             let reply = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let (clean, think) = split_thinking(&reply);
-            Ok((clean, think, format!("{provider}-subscription")))
+            Ok((clean, think, format!("{provider}-subscription"), None))
         }
 
         other => Err(format!("Unsupported chat provider: {other}")),
@@ -451,7 +511,7 @@ pub async fn transcribe_audio_bytes(
         (
             "https://api.groq.com/openai/v1/audio/transcriptions",
             get_secret("groq").ok_or_else(|| {
-                "No Groq API key configured. Add a Groq/Gemini/OpenAI key in Hub -> AI & Keys, or switch STT to Browser Web Speech.".to_string()
+                "No Groq API key configured. Add a Groq/Gemini/OpenAI key in Settings -> AI & Keys, or switch STT to Browser Web Speech.".to_string()
             })?,
             "whisper-large-v3-turbo",
         )
@@ -498,6 +558,7 @@ pub async fn summarize_voice_note(
     chat_model: &str,
     ollama_url: &str,
     lmstudio_url: &str,
+    active_account: &str,
 ) -> VoiceNote {
     let word_count = transcript.split_whitespace().count();
     let sys = if language == "th" {
@@ -525,10 +586,11 @@ pub async fn summarize_voice_note(
         &[user_msg],
         ollama_url,
         lmstudio_url,
+        active_account,
     )
     .await
     {
-        Ok((reply, _, _)) => {
+        Ok((reply, _, _, _)) => {
             let (sum_part, todo_part) = reply
                 .split_once("TODOS:")
                 .unwrap_or((reply.as_str(), ""));
