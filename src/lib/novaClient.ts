@@ -396,6 +396,15 @@ export const novaApi = {
       // ignore
     }
   },
+  revealIslandWindow: async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const invoke = cachedInvoke ?? (await getTauriInvoke());
+      if (invoke) await invoke("reveal_island_window");
+    } catch {
+      // ignore
+    }
+  },
   openHubWindow: async () => {
     if (isTauriRuntime()) {
       try {

@@ -27,8 +27,15 @@ html,
 body {
   font-family: var(--font-sans);
   color: var(--text-main);
-  background: #060911;
+  background: transparent;
   -webkit-font-smoothing: antialiased;
+}
+
+html[data-surface="hub"],
+body[data-surface="hub"],
+html[data-surface="mobile"],
+body[data-surface="mobile"] {
+  background: #060911;
 }
 
 body[data-surface="island"],
@@ -198,6 +205,9 @@ html[data-surface="orb"] {
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-subtle);
   min-width: 0;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  will-change: transform, opacity;
 }
 .nova-brand-cluster {
   display: flex;
@@ -298,6 +308,9 @@ html[data-surface="orb"] {
   max-height: none;
   overflow-y: visible;
   padding-right: 2px;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  will-change: transform, opacity;
 }
 
 /* MISSION CONTROL SPLIT */
@@ -1715,6 +1728,11 @@ select:focus-visible,
   transition: none !important;
 }
 
+.nova-island-shell.is-supernova-intro {
+  contain: layout style;
+  overflow: visible;
+}
+
 .nova-island-shell.is-embedded {
   position: relative;
   contain: layout paint style;
@@ -1761,15 +1779,8 @@ select:focus-visible,
   border-color: rgba(251, 191, 36, 0.58);
 }
 
-.nova-island-shell.is-morphing * {
-  scroll-behavior: auto !important;
-}
-
-.nova-island-shell.is-folded.is-morphing .nova-expanded-layer,
-.nova-island-shell.is-folded.is-morphing .nova-expanded-layer * {
-  animation-play-state: paused !important;
-  transition: none !important;
-  pointer-events: none !important;
+.nova-island-shell.is-folded .nova-expanded-layer {
+  pointer-events: none;
 }
 
 /* Layer A: Constant-Box Compact Pill (pure GPU transform + opacity, zero flex resize) */
@@ -1789,6 +1800,32 @@ select:focus-visible,
   backface-visibility: hidden;
   user-select: none;
   will-change: transform, opacity;
+}
+
+.nova-island-shell.is-supernova-intro .nova-pill-layer {
+  contain: layout style;
+  overflow: visible;
+  transform-origin: 0 0;
+  will-change: auto;
+}
+
+.nova-pill-orb-slot {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nova-island-shell.is-supernova-intro .nova-pill-orb-slot > canvas {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  margin-left: -48px;
+  margin-top: -48px;
+  will-change: auto;
 }
 
 .nova-pill-measure {

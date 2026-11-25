@@ -1,19 +1,34 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useLayoutEffect, useRef } from "react";
 import { isTauriRuntime, novaApi } from "../lib/novaClient";
 
 export type OrbState = "idle" | "active" | "alert" | "listening";
 export type OrbAura = "cyan" | "amber" | "violet" | "emerald";
+
+export interface NovaOrbIntroPose {
+  active: boolean;
+  yaw: number;
+  pitch: number;
+  eyeOpen: number;
+  happySmile: number;
+  ringScale: number;
+  moonAngle: number;
+  moonTrail: number;
+  glowBoost: number;
+  blendToLive: number;
+}
 
 interface NovaOrbProps {
   mode: "orb" | "hud";
   aura: OrbAura;
   state: OrbState;
   size?: number;
+  renderScale?: number;
   activeCount?: number;
   paused?: boolean;
   activeRef?: React.MutableRefObject<boolean>;
   wakeRef?: React.MutableRefObject<(() => void) | null>;
   morphingRef?: React.MutableRefObject<boolean>;
+  introPoseRef?: React.MutableRefObject<NovaOrbIntroPose | null>;
 }
 
 const AURA_COLORS: Record<OrbAura, { primary: string; secondary: string; rgb: [number, number, number] }> = {
@@ -49,11 +64,13 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
   aura,
   state,
   size = 34,
+  renderScale = 1,
   activeCount = 0,
   paused = false,
   activeRef,
   wakeRef,
   morphingRef,
+  introPoseRef,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<OrbState>(state);
@@ -72,7 +89,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     }
   }, [paused, activeRef]);
 
-  // Persistent gaze & blink physics across state/aura changes so eyes never reset mid-look
+  // Persistent gaze, blink, and orbital phase across state/aura/size changes so handoffs never jump
   const gazeRef = useRef({
     lookX: 0,
     lookY: 0,
@@ -80,6 +97,8 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     lastMoveMs: 0,
     yaw: 0,
     pitch: 0,
+    phase: 0,
+    moonPhase: 0,
     wanderX: 0,
     wanderY: 0,
     nextWanderMs: 0,
@@ -99,7 +118,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     }
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (mode !== "orb") return;
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -107,13 +126,12 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = size * dpr;
-    canvas.height = size * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const renderDpr = dpr * Math.max(1, renderScale);
+    canvas.width = size * renderDpr;
+    canvas.height = size * renderDpr;
+    ctx.setTransform(renderDpr, 0, 0, renderDpr, 0, 0);
 
     let rafId = 0;
-    let phase = 0;
-    let moonPhase = 0;
     let lastFrame = performance.now();
     let lastRectSync = 0;
     let cachedCenterX = 0;
@@ -203,11 +221,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       return 1;
     };
 
-    const render = () => {
-      if (isOrbPaused()) {
-        rafId = 0;
-        return;
-      }
+    const drawFrame = (advanceTime: boolean) => {
       const curState = stateRef.current;
       const curAura = auraRef.current;
       const palette =
@@ -215,7 +229,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       const [r, green, b] = palette.rgb;
 
       const nowMs = performance.now();
-      const dtMs = Math.min(40, Math.max(1, nowMs - lastFrame));
+      const dtMs = advanceTime ? Math.min(40, Math.max(1, nowMs - lastFrame)) : 0;
       const dtSec = dtMs / 1000;
       lastFrame = nowMs;
 
@@ -227,8 +241,8 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
           : curState === "active"
           ? 0.0009
           : 0.00022;
-      phase += dtMs * motionRate;
-      moonPhase += dtMs * (curState === "idle" ? 0.0002 : curState === "active" ? 0.0004 : 0.0005);
+      g.phase += dtMs * motionRate;
+      g.moonPhase += dtMs * (curState === "idle" ? 0.0002 : curState === "active" ? 0.0004 : 0.0005);
 
       // Keep tracking the cursor continuously across all states (including idle!).
       // Only drift into gentle autonomous glances if the mouse hasn't moved for >8s.
@@ -245,7 +259,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       // Coucou spherical target angles & exponential smoothing (`1 - 0.0025^dt`)
       const tgYaw = activeLookX * 0.68;
       const tgPitch = activeLookY * 0.54;
-      const kLook = 1 - Math.pow(0.0025, dtSec);
+      const kLook = dtSec > 0 ? 1 - Math.pow(0.0025, dtSec) : 0;
       g.yaw += (tgYaw - g.yaw) * kLook;
       g.pitch += (tgPitch - g.pitch) * kLook;
 
@@ -257,14 +271,29 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       } else if (g.squintStartMs > 0) {
         g.squintStartMs = 0;
       }
-      const eyeOpen = Math.min(blinkOpen, clickSquintOpen);
+      const liveEyeOpen = Math.min(blinkOpen, clickSquintOpen);
+
+      const intro = introPoseRef?.current;
+      const inIntro = Boolean(intro?.active);
+      const blend = inIntro ? Math.max(0, Math.min(1, intro!.blendToLive)) : 1;
+      const drawYaw = inIntro ? intro!.yaw * (1 - blend) + g.yaw * blend : g.yaw;
+      const drawPitch = inIntro ? intro!.pitch * (1 - blend) + g.pitch * blend : g.pitch;
+      const eyeOpen = inIntro ? intro!.eyeOpen * (1 - blend) + liveEyeOpen * blend : liveEyeOpen;
+      const happySmile = inIntro ? intro!.happySmile * (1 - blend) : 0;
+      const ringScale = inIntro ? intro!.ringScale * (1 - blend) + blend : 1;
+      const glowBoost = inIntro ? intro!.glowBoost * (1 - blend) : 0;
+      const moonTrail = inIntro ? intro!.moonTrail * (1 - blend) : 0;
+      if (inIntro) {
+        // Keep persistent moonPhase synced to the intro's orbital sweep so handoff has zero phase jump
+        g.moonPhase = intro!.moonAngle;
+      }
 
       ctx.clearRect(0, 0, size, size);
       const cx = size / 2;
       const cy = size / 2;
       const baseR = size * 0.34;
 
-      // Ambient aura halo (cached per aura/size to avoid per-frame gradient allocation)
+      // Ambient aura halo (cached per aura/size at rest; boosted during Supernova awakening)
       const gradKey = `${r},${green},${b},${size}`;
       if (!cachedHalo || cachedGradientKey !== gradKey) {
         const halo = ctx.createRadialGradient(cx, cy, baseR * 0.15, cx, cy, size * 0.49);
@@ -274,29 +303,40 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
         cachedHalo = halo;
         cachedGradientKey = gradKey;
       }
-      ctx.fillStyle = cachedHalo;
+      if (glowBoost > 0.01) {
+        const boostHalo = ctx.createRadialGradient(cx, cy, baseR * 0.1, cx, cy, size * 0.5);
+        boostHalo.addColorStop(0, `rgba(${r}, ${green}, ${b}, ${Math.min(0.72, 0.3 + glowBoost * 0.38)})`);
+        boostHalo.addColorStop(0.68, `rgba(${r}, ${green}, ${b}, ${Math.min(0.28, 0.08 + glowBoost * 0.14)})`);
+        boostHalo.addColorStop(1, `rgba(${r}, ${green}, ${b}, 0)`);
+        ctx.fillStyle = boostHalo;
+      } else {
+        ctx.fillStyle = cachedHalo;
+      }
       ctx.beginPath();
       ctx.arc(cx, cy, size * 0.49, 0, Math.PI * 2);
       ctx.fill();
 
       // Orbital ring
-      const ringRadius = baseR * 1.17;
-      ctx.strokeStyle = `rgba(${r}, ${green}, ${b}, 0.56)`;
+      const ringRadius = baseR * 1.17 * ringScale;
+      ctx.strokeStyle = `rgba(${r}, ${green}, ${b}, ${inIntro ? 0.68 : 0.56})`;
       ctx.lineWidth = Math.max(1, size * 0.035);
       ctx.beginPath();
       ctx.arc(cx, cy, ringRadius, 0, Math.PI * 2);
       ctx.stroke();
 
       // Solid purple core
-      const pulse =
-        curState === "idle" ? 1 + 0.006 * Math.sin(phase) : 1 + 0.025 * Math.sin(phase * 1.8);
+      const pulse = inIntro
+        ? 1
+        : curState === "idle"
+        ? 1 + 0.006 * Math.sin(g.phase)
+        : 1 + 0.025 * Math.sin(g.phase * 1.8);
       const coreR = baseR * 0.94 * pulse;
       ctx.fillStyle = "#a78bfa";
       ctx.beginPath();
       ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
       ctx.fill();
 
-      // Coucou-style 3D spherical eyes clipped inside NOVA's purple core
+      // Coucou-style 3D spherical eyes (plus happy ^_^ crescent smile during Supernova greeting!)
       ctx.save();
       ctx.beginPath();
       ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
@@ -305,10 +345,11 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       const eyeW = Math.max(1.5, size * 0.078);
       const eyeH = Math.max(3.3, size * 0.168);
       ctx.fillStyle = "rgba(3, 5, 12, 0.94)";
+      ctx.strokeStyle = "rgba(3, 5, 12, 0.94)";
 
       for (const sd of [-1, 1]) {
-        const eyeYaw = sd * EYE_SP + g.yaw;
-        const eyePitch = EYE_P + g.pitch;
+        const eyeYaw = sd * EYE_SP + drawYaw;
+        const eyePitch = EYE_P + drawPitch;
         const cp = Math.cos(eyePitch);
         if (Math.cos(eyeYaw) * cp <= 0.04) continue;
 
@@ -322,18 +363,47 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
         ctx.save();
         ctx.translate(ex, ey);
         ctx.scale(fx, fy);
-        drawRoundedPill(ctx, -eyeW * 0.5, -hh * 0.5, eyeW, hh);
-        ctx.fill();
+        if (happySmile > 0.5) {
+          ctx.lineWidth = Math.max(1.3, eyeW * 0.82);
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.arc(0, eyeH * 0.18, eyeW * 0.88, Math.PI * 1.15, Math.PI * 1.85);
+          ctx.stroke();
+        } else {
+          drawRoundedPill(ctx, -eyeW * 0.5, -hh * 0.5, eyeW, hh);
+          ctx.fill();
+        }
         ctx.restore();
       }
       ctx.restore();
 
-      // Orbiting moon along the ring
+      // Orbiting moon along the ring (with luminous comet trail during Supernova sweep)
       const burstElapsed = nowMs - orbitBurstStartRef.current;
       const burstProgress = Math.max(0, Math.min(1, burstElapsed / 5000));
       const easedBurst = burstProgress * burstProgress * (3 - 2 * burstProgress);
-      const bonusOrbit = orbitBurstStartRef.current > 0 && burstProgress < 1 ? Math.PI * 2 * easedBurst : 0;
-      const visibleMoonPhase = moonPhase + bonusOrbit;
+      const bonusOrbit =
+        !inIntro && orbitBurstStartRef.current > 0 && burstProgress < 1
+          ? Math.PI * 2 * easedBurst
+          : 0;
+      const visibleMoonPhase = g.moonPhase + bonusOrbit;
+
+      if (moonTrail > 0.02) {
+        const steps = 9;
+        for (let k = 1; k <= steps; k++) {
+          const ta = visibleMoonPhase - k * 0.1 * moonTrail;
+          ctx.fillStyle = `rgba(221, 214, 254, ${(1 - k / (steps + 1)) * 0.45 * moonTrail})`;
+          ctx.beginPath();
+          ctx.arc(
+            cx + Math.cos(ta) * ringRadius,
+            cy + Math.sin(ta) * ringRadius,
+            Math.max(0.55, size * 0.036 * (1 - k / (steps + 2))),
+            0,
+            Math.PI * 2
+          );
+          ctx.fill();
+        }
+      }
+
       const moonX = cx + Math.cos(visibleMoonPhase) * ringRadius;
       const moonY = cy + Math.sin(visibleMoonPhase) * ringRadius;
       ctx.fillStyle = "rgba(255, 255, 255, 0.2)";
@@ -344,9 +414,21 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       ctx.beginPath();
       ctx.arc(moonX, moonY, Math.max(0.95, size * 0.043), 0, Math.PI * 2);
       ctx.fill();
+    };
 
+    const render = () => {
+      if (isOrbPaused()) {
+        rafId = 0;
+        return;
+      }
+      drawFrame(true);
       rafId = requestAnimationFrame(render);
     };
+
+    // Synchronously paint Frame 0 BEFORE browser paint so:
+    // 1. Switching size (96 -> 24) at intro completion never flashes a blank or unscaled canvas.
+    // 2. Paused orbs (e.g. expanded topbar 28px orb) are pre-rendered in GPU memory before first hover!
+    drawFrame(false);
 
     const wake = () => {
       if (!rafId && !isOrbPaused()) {
@@ -368,7 +450,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       window.removeEventListener("resize", onResize);
       unlistenPointer?.();
     };
-  }, [mode, size]);
+  }, [mode, renderScale, size]);
 
   if (mode === "hud") {
     const palette = state === "alert" ? AURA_COLORS.amber : AURA_COLORS[aura] ?? AURA_COLORS.cyan;

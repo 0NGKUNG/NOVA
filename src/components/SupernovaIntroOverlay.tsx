@@ -8,6 +8,16 @@ interface SupernovaIntroOverlayProps {
   getPillMetrics: () => { x: number; y: number; w: number; h: number };
   isBottomDock: boolean;
   idleLabel: string;
+  onIntroFrame?: (frame: {
+    elapsed: number;
+    centerX: number;
+    heroY: number;
+    pillX: number;
+    pillY: number;
+    pillW: number;
+    pillH: number;
+    bottom: boolean;
+  }) => void;
   onDockUnfurlProgress?: (capsuleAlpha: number) => void;
   onComplete: () => void;
 }
@@ -64,24 +74,6 @@ function drawSoftCloud(
   ctx.restore();
 }
 
-function drawRoundedRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number
-) {
-  const cr = Math.max(0, Math.min(r, w * 0.5, h * 0.5));
-  ctx.beginPath();
-  ctx.moveTo(x + cr, y);
-  ctx.arcTo(x + w, y, x + w, y + h, cr);
-  ctx.arcTo(x + w, y + h, x, y + h, cr);
-  ctx.arcTo(x, y + h, x, y, cr);
-  ctx.arcTo(x, y, x + w, y, cr);
-  ctx.closePath();
-}
-
 function drawFourPointStar(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -109,189 +101,6 @@ function drawFourPointStar(
   ctx.restore();
 }
 
-function drawNovaMascot(
-  ctx: CanvasRenderingContext2D,
-  opts: {
-    cx: number;
-    cy: number;
-    size: number;
-    alpha?: number;
-    yaw?: number;
-    pitch?: number;
-    eyeOpen?: number;
-    happySmile?: number;
-    ringScale?: number;
-    moonAngle?: number;
-    moonTrail?: number;
-    glowBoost?: number;
-  }
-) {
-  const {
-    cx,
-    cy,
-    size,
-    alpha = 1,
-    yaw = 0,
-    pitch = 0,
-    eyeOpen = 1,
-    happySmile = 0,
-    ringScale = 1,
-    moonAngle = 0.58,
-    moonTrail = 0,
-    glowBoost = 0,
-  } = opts;
-  if (size <= 1 || alpha <= 0.005) return;
-
-  ctx.save();
-  ctx.globalAlpha = clamp(alpha, 0, 1);
-
-  const baseR = size * 0.34;
-  const coreR = baseR * 0.94;
-  const ringR = baseR * 1.17 * ringScale;
-
-  const haloR = size * (0.5 + glowBoost * 0.26);
-  drawSoftCloud(ctx, cx, cy, haloR, haloR, 0, 167, 139, 250, (0.28 + glowBoost * 0.34) * alpha);
-
-  ctx.strokeStyle = "rgba(167, 139, 250, 0.68)";
-  ctx.lineWidth = Math.max(1.1, size * 0.035);
-  ctx.beginPath();
-  ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.fillStyle = "#a78bfa";
-  ctx.beginPath();
-  ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
-  ctx.clip();
-
-  const eyeW = Math.max(1.5, size * 0.078);
-  const eyeH = Math.max(3.1, size * 0.168);
-  ctx.fillStyle = "rgba(3, 5, 12, 0.94)";
-  ctx.strokeStyle = "rgba(3, 5, 12, 0.94)";
-
-  for (const sd of [-1, 1]) {
-    const eyeYaw = sd * 0.34 + yaw;
-    const eyePitch = 0.06 + pitch;
-    const cp = Math.cos(eyePitch);
-    const ex = cx + Math.sin(eyeYaw) * cp * (coreR * 0.86);
-    const ey = cy - Math.sin(eyePitch) * (coreR * 0.84);
-    const fx = Math.max(0.24, Math.cos(eyeYaw));
-    const fy = Math.max(0.28, cp);
-
-    ctx.save();
-    ctx.translate(ex, ey);
-    ctx.scale(fx, fy);
-    if (happySmile > 0.5) {
-      ctx.lineWidth = Math.max(1.6, eyeW * 0.82);
-      ctx.lineCap = "round";
-      ctx.beginPath();
-      ctx.arc(0, eyeH * 0.18, eyeW * 0.88, Math.PI * 1.15, Math.PI * 1.85);
-      ctx.stroke();
-    } else {
-      const hh = Math.max(eyeH * clamp(eyeOpen, 0.08, 1.15), eyeW * 0.34);
-      drawRoundedRect(ctx, -eyeW * 0.5, -hh * 0.5, eyeW, hh, eyeW * 0.5);
-      ctx.fill();
-    }
-    ctx.restore();
-  }
-  ctx.restore();
-
-  if (moonTrail > 0.02) {
-    const steps = 9;
-    for (let k = 1; k <= steps; k++) {
-      const ta = moonAngle - k * 0.1 * moonTrail;
-      ctx.fillStyle = `rgba(221, 214, 254, ${(1 - k / (steps + 1)) * 0.45 * moonTrail})`;
-      ctx.beginPath();
-      ctx.arc(
-        cx + Math.cos(ta) * ringR,
-        cy + Math.sin(ta) * ringR,
-        Math.max(0.9, size * 0.036 * (1 - k / (steps + 2))),
-        0,
-        Math.PI * 2
-      );
-      ctx.fill();
-    }
-  }
-
-  const mx = cx + Math.cos(moonAngle) * ringR;
-  const my = cy + Math.sin(moonAngle) * ringR;
-  const mr = Math.max(2.4, size * 0.115);
-  const mGlow = ctx.createRadialGradient(mx, my, 0, mx, my, mr);
-  mGlow.addColorStop(0, "rgba(255, 255, 255, 0.85)");
-  mGlow.addColorStop(0.5, "rgba(167, 139, 250, 0.36)");
-  mGlow.addColorStop(1, "rgba(167, 139, 250, 0)");
-  ctx.fillStyle = mGlow;
-  ctx.beginPath();
-  ctx.arc(mx, my, mr, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = "#ffffff";
-  ctx.beginPath();
-  ctx.arc(mx, my, Math.max(1.0, size * 0.044), 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-}
-
-function drawDockingCapsule(
-  ctx: CanvasRenderingContext2D,
-  cx: number,
-  topY: number,
-  curW: number,
-  pillH: number,
-  alpha: number,
-  rimGlow: number,
-  labelAlpha: number,
-  idleLabel: string
-) {
-  if (alpha <= 0.005) return;
-  ctx.save();
-  ctx.globalAlpha = clamp(alpha, 0, 1);
-
-  const x = cx - curW * 0.5;
-  const r = pillH * 0.5;
-
-  ctx.shadowColor = "rgba(0, 0, 0, 0.58)";
-  ctx.shadowBlur = 18;
-  ctx.shadowOffsetY = 6;
-
-  ctx.fillStyle = "#0e0e11";
-  drawRoundedRect(ctx, x, topY, curW, pillH, r);
-  ctx.fill();
-  ctx.shadowColor = "transparent";
-
-  if (labelAlpha > 0.01 && curW > pillH + 24) {
-    ctx.save();
-    drawRoundedRect(ctx, x, topY, curW, pillH, r);
-    ctx.clip();
-    ctx.globalAlpha = alpha * clamp(labelAlpha, 0, 1);
-
-    // Live violet status dot + resting status label matching .nova-pill-measure
-    const dotX = x + 44 + (1 - labelAlpha) * -5;
-    const dotY = topY + pillH * 0.5;
-    ctx.fillStyle = "#a78bfa";
-    ctx.beginPath();
-    ctx.arc(dotX, dotY, 3.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.font = '500 12px "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif';
-    ctx.fillStyle = "#e2e8f0";
-    ctx.textBaseline = "middle";
-    ctx.fillText(idleLabel, dotX + 10, dotY + 0.5);
-    ctx.restore();
-  }
-
-  ctx.strokeStyle =
-    rimGlow > 0.01 ? `rgba(167, 139, 250, ${0.2 + rimGlow * 0.68})` : "rgba(255, 255, 255, 0.13)";
-  ctx.lineWidth = 1 + rimGlow * 0.5;
-  drawRoundedRect(ctx, x, topY, curW, pillH, r);
-  ctx.stroke();
-  ctx.restore();
-}
-
 export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
   active,
   runKey,
@@ -299,6 +108,7 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
   getPillMetrics,
   isBottomDock,
   idleLabel,
+  onIntroFrame,
   onDockUnfurlProgress,
   onComplete,
 }) => {
@@ -306,8 +116,8 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
   const geomRef = useRef({ getPillMetrics, isBottomDock, idleLabel, soundEnabled });
   geomRef.current = { getPillMetrics, isBottomDock, idleLabel, soundEnabled };
 
-  const callbacksRef = useRef({ onDockUnfurlProgress, onComplete });
-  callbacksRef.current = { onDockUnfurlProgress, onComplete };
+  const callbacksRef = useRef({ onIntroFrame, onDockUnfurlProgress, onComplete });
+  callbacksRef.current = { onIntroFrame, onDockUnfurlProgress, onComplete };
 
   useEffect(() => {
     if (!active) return;
@@ -320,11 +130,17 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
     let warmupFrames = 0;
     let startMs = 0;
     let audioStarted = false;
-    let handedOff = false;
     let finishedNaturally = false;
 
     const TOTAL_DURATION = 3.75;
-    const HANDOFF_START = 3.55;
+    const initRect = canvas.getBoundingClientRect();
+    let stageW = initRect.width || window.innerWidth || 900;
+    let stageH = initRect.height || window.innerHeight || 690;
+    const onWinResize = () => {
+      stageW = window.innerWidth || 900;
+      stageH = window.innerHeight || 690;
+    };
+    window.addEventListener("resize", onWinResize);
 
     const step = (now: number) => {
       // Wait 2 rAF frames so WebView2 swapchain & DWM composition are 100% live before t=0!
@@ -339,13 +155,15 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
         playSupernovaBootAudio(geomRef.current.soundEnabled);
       }
 
-      const dpr = window.devicePixelRatio || 1;
-      const W = window.innerWidth || 900;
-      const H = window.innerHeight || 690;
+      const dpr = Math.max(2, window.devicePixelRatio || 1);
+      const W = stageW;
+      const H = stageH;
       if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
         canvas.width = Math.round(W * dpr);
         canvas.height = Math.round(H * dpr);
       }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, W, H);
 
@@ -358,22 +176,21 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
 
       const cx = pX + pW * 0.5;
       const heroY = bottom ? Math.max(120, pY - 120) : Math.min(H - 120, pY + pH * 0.5 + 118);
-      const ORB_REST_SIZE = 24;
 
       const elapsed = (now - startMs) / 1000;
+      callbacksRef.current.onIntroFrame?.({
+        elapsed,
+        centerX: cx,
+        heroY,
+        pillX: pX,
+        pillY: pY,
+        pillW: pW,
+        pillH: pH,
+        bottom,
+      });
 
-      // Cross-dissolve over final 200ms onto the real DOM Dynamic Island capsule at the exact same pixels
-      const overlayAlpha =
-        elapsed >= HANDOFF_START
-          ? 1 - easeInOutCubic(clamp((elapsed - HANDOFF_START) / (TOTAL_DURATION - HANDOFF_START), 0, 1))
-          : 1;
-      if (elapsed >= HANDOFF_START && !handedOff) {
-        handedOff = true;
-        callbacksRef.current.onDockUnfurlProgress?.(1);
-      } else if (elapsed < HANDOFF_START) {
-        const realReveal = clamp((elapsed - 3.45) / 0.18, 0, 1);
-        callbacksRef.current.onDockUnfurlProgress?.(realReveal);
-      }
+      // This canvas only paints the surrounding ignition light and particles.
+      const overlayAlpha = 1;
 
       ctx.save();
       ctx.globalAlpha = overlayAlpha;
@@ -389,9 +206,10 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
           : 1 - easeInOutCubic(clamp((elapsed - 1.95) / 0.95, 0, 1));
 
       if (nebEnv > 0.004) {
-        drawSoftCloud(ctx, cx - 38 + Math.sin(elapsed * 1.1) * 12, heroY - 12, 142, 110, 0.2, 139, 92, 246, 0.32 * nebEnv);
-        drawSoftCloud(ctx, cx + 42 - Math.cos(elapsed * 0.95) * 12, heroY + 14, 136, 102, -0.25, 96, 165, 250, 0.25 * nebEnv);
-        drawSoftCloud(ctx, cx, heroY - 4, 110, 95, 0, 129, 140, 248, 0.23 * nebEnv);
+        // Rich, tight cosmic glow (avoids milky wide-radius haze over desktop text)
+        drawSoftCloud(ctx, cx - 32 + Math.sin(elapsed * 1.1) * 10, heroY - 10, 118, 92, 0.2, 124, 58, 237, 0.26 * nebEnv);
+        drawSoftCloud(ctx, cx + 34 - Math.cos(elapsed * 0.95) * 10, heroY + 12, 112, 86, -0.25, 59, 130, 246, 0.22 * nebEnv);
+        drawSoftCloud(ctx, cx, heroY - 2, 88, 76, 0, 139, 92, 246, 0.22 * nebEnv);
       }
 
       // Act I (0.00s – 0.86s): Singularity Implosion + Cinema Cross-Flare
@@ -471,63 +289,11 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
           ctx.globalAlpha = overlayAlpha;
         }
 
-        const popScale = easeOutBack(clamp(p / 0.34, 0, 1), 1.55);
-        const wakeOpen = p < 0.16 ? 0.08 : clamp((p - 0.16) / 0.14, 0.08, 1);
-        const yaw = p > 0.28 && p < 0.55 ? Math.sin(((p - 0.28) / 0.27) * Math.PI * 2) * 0.36 : 0;
-        const smile = p > 0.56 && p < 0.92 ? 1 : 0;
-        const bobY = heroY + Math.sin(p * Math.PI * 2) * 3.5;
-
-        drawNovaMascot(ctx, {
-          cx,
-          cy: bobY,
-          size: 94 * popScale,
-          yaw,
-          pitch: smile ? 0.08 : 0.02,
-          eyeOpen: wakeOpen,
-          happySmile: smile,
-          ringScale: 0.86 + 0.14 * easeOutCubic(clamp(p / 0.42, 0, 1)),
-          moonAngle: -1.9 + easeOutCubic(p) * 2.48,
-          moonTrail: Math.sin(clamp(p / 0.7, 0, 1) * Math.PI) * 0.85,
-          glowBoost: (1 - p) * 0.7,
-        });
+        // The live Island orb is the hero throughout this act.
       }
       // Act III (2.42s – 3.75s): Ascent + Dead-Center Circle Dock + Clean Resting Pill Handoff
       else {
-        const dockP = clamp((elapsed - 2.42) / 0.68, 0, 1);
-        const unfurlP = clamp((elapsed - 3.0) / 0.56, 0, 1);
-        const eDock = easeInOutCubic(dockP);
-        const eUnfurl = easeOutCubic(unfurlP);
-
-        const pillAlpha = clamp((dockP - 0.36) / 0.44, 0, 1);
-        const curPillW = lerp(pH, pW, eUnfurl);
-        const rimGlow = dockP > 0.45 ? Math.sin(clamp((elapsed - 2.8) / 0.78, 0, 1) * Math.PI) : 0;
-
-        drawDockingCapsule(
-          ctx,
-          cx,
-          pY,
-          curPillW,
-          pH,
-          pillAlpha,
-          rimGlow,
-          clamp((eUnfurl - 0.2) / 0.8, 0, 1),
-          label
-        );
-
-        // 100% dead-center inside pH x pH circle when eUnfurl == 0, gliding to exact .nova-pill-measure orb slot (left + 20px)!
-        const curLeft = cx - curPillW * 0.5;
-        const targetDockX = lerp(cx, curLeft + 20, eUnfurl);
-        const orbX = lerp(cx, targetDockX, eDock);
-        const orbY = lerp(heroY, pY + pH * 0.5, eDock);
-        const orbSize = lerp(94, ORB_REST_SIZE, eDock);
-
-        drawNovaMascot(ctx, {
-          cx: orbX,
-          cy: orbY,
-          size: orbSize,
-          moonAngle: 0.58 + (elapsed - 2.42) * 0.55,
-          glowBoost: (1 - eDock) * 0.25,
-        });
+        // The live shell is docked and unfurling beneath the particle field.
       }
 
       ctx.restore();
@@ -544,6 +310,7 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
     rafId = window.requestAnimationFrame(step);
     return () => {
       if (rafId) window.cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", onWinResize);
       // Only cut the soundtrack if the intro was interrupted (hover/replay).
       // When it finishes naturally, the echo tail rings out past the visuals.
       if (!finishedNaturally) stopSupernovaBootAudio();
@@ -562,7 +329,7 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
         width: "100%",
         height: "100%",
         pointerEvents: "none",
-        zIndex: 12,
+        zIndex: 1,
       }}
     />
   );

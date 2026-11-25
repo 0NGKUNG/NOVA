@@ -49,7 +49,7 @@ import {
   revealCurve,
   TrackedValue,
 } from "../lib/islandSpring";
-import { NovaOrb, OrbState } from "../components/NovaOrb";
+import { NovaOrb, NovaOrbIntroPose, OrbState } from "../components/NovaOrb";
 import { SupernovaIntroOverlay } from "../components/SupernovaIntroOverlay";
 import { ApprovalCard } from "../components/ApprovalCard";
 import { DiffViewer } from "../components/DiffViewer";
@@ -95,7 +95,12 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const { settings, sessions, pendingApprovals, focus } = snapshot;
   const lang: Lang = settings.language;
 
-  const [activeTab, setActiveTab] = useState<"mission" | "chat" | "voice" | "devtools">("mission");
+  const [activeTab, setActiveTabState] = useState<"mission" | "chat" | "voice" | "devtools">("mission");
+  const [tabAnimated, setTabAnimated] = useState(false);
+  const setActiveTab = useCallback((next: "mission" | "chat" | "voice" | "devtools") => {
+    setTabAnimated(expandedRef.current);
+    setActiveTabState(next);
+  }, []);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showNewRunDrawer, setShowNewRunDrawer] = useState(false);
 
@@ -117,6 +122,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   });
   const supernovaActiveRef = useRef<boolean>(false);
   const supernovaRevealAlphaRef = useRef<number>(1);
+  const introOrbPoseRef = useRef<NovaOrbIntroPose | null>(null);
 
   // DOM measurement & animation refs (zero React re-renders and zero DOM layout reads during expand/collapse)
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -266,12 +272,21 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       const expandedLayer = expandedLayerRef.current;
       if (!shell || !pillLayer || !expandedLayer) return;
 
+      const targetExpW = getMaxExpandedWidth();
+      if (lastAppliedExpWRef.current !== targetExpW) {
+        lastAppliedExpWRef.current = targetExpW;
+        expandedLayer.style.width = `${targetExpW}px`;
+      }
+
+      // Never allow background effects, pointer proximity, or resize listeners to overwrite
+      // shell/pill transforms while SupernovaIntroOverlay is actively driving the intro!
+      if (supernovaActiveRef.current) return;
+
       const w = widthTrackRef.current.value;
       const h = heightTrackRef.current.value;
       const r = radiusTrackRef.current.value;
 
       const basePillW = pillWidthRef.current;
-      const targetExpW = getMaxExpandedWidth();
       const targetExpH = expandedHeightRef.current;
       const spanW = Math.max(1, targetExpW - basePillW);
       const spanH = Math.max(1, targetExpH - PILL_HEIGHT);
@@ -298,11 +313,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       shell.style.width = `${w.toFixed(2)}px`;
       shell.style.height = `${h.toFixed(2)}px`;
       shell.style.borderRadius = `${r.toFixed(2)}px`;
-      if (supernovaActiveRef.current) {
-        const rev = supernovaRevealAlphaRef.current;
-        shell.style.opacity = rev.toFixed(3);
-        shell.style.pointerEvents = rev > 0.9 ? "auto" : "none";
-      } else if (startupIntroActiveRef.current) {
+      if (startupIntroActiveRef.current) {
         shell.style.opacity = clamp(startupElapsed / 95, 0, 1).toFixed(3);
         shell.style.pointerEvents = "";
       } else {
@@ -336,21 +347,21 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         const sy = (h + 36) / SHADOW_BASE_H;
         const shX = shellX - 18;
         const shY = frameShellY - 8;
-        const shAlpha = (0.56 + 0.44 * p) * (supernovaActiveRef.current ? supernovaRevealAlphaRef.current : 1);
+        const shAlpha = 0.56 + 0.44 * p;
         shadowRef.current.style.opacity = shAlpha.toFixed(3);
         shadowRef.current.style.transform = `translate3d(${shX.toFixed(2)}px, ${shY.toFixed(
           2
         )}px, 0) scale3d(${sx.toFixed(4)}, ${sy.toFixed(4)}, 1)`;
       }
 
-      // Layer A: Constant-box Compact Pill (pure GPU translate3d + scale3d + opacity, zero flex reflow)
+      // Layer A: Constant-box Compact Pill (keep visibility:visible so GPU tile stays warm in VRAM!)
       const pillFadeWindow = isOpening ? 0.24 : 0.38;
       const rawPillAlpha = clamp(1 - p / pillFadeWindow, 0, 1);
       const pillAlpha = rawPillAlpha * rawPillAlpha * (3 - 2 * rawPillAlpha);
       if (pillAlpha <= 0.002) {
         if (isOpening) pillOrbActiveRef.current = false;
         pillLayer.style.opacity = "0";
-        pillLayer.style.visibility = "hidden";
+        pillLayer.style.visibility = "visible";
         pillLayer.style.pointerEvents = "none";
       } else {
         const pillScale = isOpening ? 1 + (1 - pillAlpha) * 0.025 : 0.97 + pillAlpha * 0.03;
@@ -371,12 +382,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         )}px, 0) scale3d(${pillScale.toFixed(4)}, ${pillScale.toFixed(4)}, 1)`;
       }
 
-      // Layer B: Unified GPU-cached Expanded Surface (dissolves cleanly before shell walls clip content)
-      if (lastAppliedExpWRef.current !== targetExpW) {
-        lastAppliedExpWRef.current = targetExpW;
-        expandedLayer.style.width = `${targetExpW}px`;
-      }
-
+      // Layer B: Unified GPU-cached Expanded Surface (keep visibility:visible + permanent composited layers
+      // so neither first expand nor first collapse ever stalls to rasterize or de-promote GPU tiles!)
       const rawExpAlpha = isOpening
         ? clamp((p - 0.14) / 0.78, 0, 1)
         : clamp((p - 0.48) / 0.52, 0, 1);
@@ -396,16 +403,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           islandBodyRef.current.style.transform = `translate3d(0, ${((1 - contentProgress) * 5).toFixed(2)}px, 0)`;
         }
       } else {
-        for (const el of [topbarRef.current, islandBodyRef.current]) {
-          if (!el) continue;
-          el.style.opacity = "";
-          el.style.transform = "";
+        if (topbarRef.current && topbarRef.current.style.opacity !== "1") {
+          topbarRef.current.style.opacity = "1";
+          topbarRef.current.style.transform = "translate3d(0, 0, 0)";
+        }
+        if (islandBodyRef.current && islandBodyRef.current.style.opacity !== "1") {
+          islandBodyRef.current.style.opacity = "1";
+          islandBodyRef.current.style.transform = "translate3d(0, 0, 0)";
         }
       }
 
       if (expAlpha <= 0.002) {
+        expandedLayer.style.visibility = "visible";
         expandedLayer.style.opacity = "0";
-        expandedLayer.style.visibility = "hidden";
         expandedLayer.style.pointerEvents = "none";
       } else {
         const expScale = isOpening ? 0.968 + 0.032 * expAlpha : 0.945 + 0.055 * expAlpha;
@@ -527,6 +537,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       if (supernovaActiveRef.current) {
         supernovaActiveRef.current = false;
         supernovaRevealAlphaRef.current = 1;
+        introOrbPoseRef.current = null;
         setSupernovaIntro((prev) => (prev.active ? { ...prev, active: false } : prev));
       }
       if (startupIntroActiveRef.current) {
@@ -668,6 +679,70 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     warmNovaAudio(settings.soundEnabled);
   }, [embeddedPreview, settings.soundEnabled]);
 
+  const enterSupernovaSingularity = useCallback(() => {
+    supernovaActiveRef.current = true;
+    supernovaRevealAlphaRef.current = 1;
+    pushHitRectIfNeeded(0, 0, 0, 0, true);
+    if (shellRef.current) {
+      shellRef.current.style.width = `${PILL_HEIGHT}px`;
+      shellRef.current.style.height = `${PILL_HEIGHT}px`;
+      shellRef.current.style.borderRadius = `${PILL_RADIUS}px`;
+      shellRef.current.style.backgroundColor = "rgba(14, 14, 17, 0)";
+      shellRef.current.style.borderColor = "rgba(255, 255, 255, 0)";
+      shellRef.current.style.overflow = "visible";
+      shellRef.current.style.pointerEvents = "none";
+    }
+    if (shadowRef.current) shadowRef.current.style.opacity = "0";
+    if (pillLayerRef.current) {
+      pillLayerRef.current.style.opacity = "0";
+      pillLayerRef.current.style.visibility = "hidden";
+    }
+    if (expandedLayerRef.current) {
+      expandedLayerRef.current.style.visibility = "visible";
+      expandedLayerRef.current.style.opacity = "0";
+      expandedLayerRef.current.style.pointerEvents = "none";
+    }
+  }, [pushHitRectIfNeeded]);
+
+  // Atomic pre-paint handoff whenever SupernovaIntroOverlay finishes (`active: true -> false`):
+  // Runs AFTER child <NovaOrb size={24}>'s useLayoutEffect has already resized & painted the 24px
+  // canvas and BEFORE Blink paints a single frame — completely impossible to flash a 96px orb!
+  const prevSupernovaActiveStateRef = useRef(false);
+  useLayoutEffect(() => {
+    const wasActive = prevSupernovaActiveStateRef.current;
+    prevSupernovaActiveStateRef.current = supernovaIntro.active;
+    if (!wasActive || supernovaIntro.active) return;
+
+    supernovaActiveRef.current = false;
+    supernovaRevealAlphaRef.current = 1;
+    introOrbPoseRef.current = null;
+    if (shellRef.current) {
+      shellRef.current.style.backgroundColor = "";
+      shellRef.current.style.borderColor = "";
+      shellRef.current.style.overflow = "";
+    }
+    if (closedStatusRef.current) {
+      closedStatusRef.current.style.opacity = "";
+      closedStatusRef.current.style.transform = "";
+    }
+    const finishedOrb = pillMeasureRef.current?.querySelector(
+      ".nova-pill-orb-slot > canvas, .nova-pill-orb-slot > .nova-hud-glyph"
+    ) as HTMLElement | null;
+    if (finishedOrb) {
+      finishedOrb.style.transform = "";
+      finishedOrb.style.transformOrigin = "";
+    }
+    if (!expandedRef.current) {
+      widthTrackRef.current.jump(pillWidthRef.current);
+      heightTrackRef.current.jump(PILL_HEIGHT);
+      radiusTrackRef.current.jump(PILL_RADIUS);
+      pillOrbActiveRef.current = true;
+      pillOrbWakeRef.current?.();
+    }
+    syncDomShellFlags();
+    applyFrameStyles(false);
+  }, [applyFrameStyles, supernovaIntro.active, syncDomShellFlags]);
+
   // Listen for "Replay Intro" trigger from Settings Hub
   useEffect(() => {
     if (embeddedPreview) return;
@@ -680,9 +755,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         widthTrackRef.current.jump(pillWidthRef.current);
         heightTrackRef.current.jump(PILL_HEIGHT);
         radiusTrackRef.current.jump(PILL_RADIUS);
-        supernovaActiveRef.current = true;
-        supernovaRevealAlphaRef.current = 0;
-        applyFrameStyles(false);
+        enterSupernovaSingularity();
         setSupernovaIntro((prev) => ({ active: true, key: prev.key + 1 }));
       })
       .then((fn) => {
@@ -691,7 +764,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     return () => {
       unlisten?.();
     };
-  }, [applyFrameStyles, closeIsland, embeddedPreview]);
+  }, [closeIsland, embeddedPreview, enterSupernovaSingularity]);
 
   // Measure natural pill width & expanded content height continuously via ResizeObserver
   useLayoutEffect(() => {
@@ -708,7 +781,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       if (Math.abs(measured - pillWidthRef.current) >= 1) {
         const firstMeasure = pillWidthRef.current === 168 && !widthTrackRef.current.animating;
         pillWidthRef.current = measured;
-        if (!expandedRef.current && !startupIntroActiveRef.current) {
+        if (!expandedRef.current && !startupIntroActiveRef.current && !supernovaActiveRef.current) {
           retargetGeometry({ immediate: firstMeasure });
         }
       }
@@ -739,23 +812,56 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     if (!startupIntroPlayedRef.current && !embeddedPreview) {
       startupIntroPlayedRef.current = true;
       const introMode = settings.startupIntro ?? "cinematic";
-      if (isTauriRuntime() && !prefersReducedMotion() && introMode !== "off") {
-        if (introMode === "cinematic") {
-          supernovaActiveRef.current = true;
-          supernovaRevealAlphaRef.current = 0;
-          applyFrameStyles(false);
-          setSupernovaIntro((prev) => ({ active: true, key: prev.key + 1 }));
-        } else {
-          startupIntroActiveRef.current = true;
-          startupUnfurlStartedRef.current = false;
-          startupIntroStartedAtRef.current = performance.now();
-          widthTrackRef.current.jump(PILL_HEIGHT);
-          heightTrackRef.current.jump(PILL_HEIGHT);
-          radiusTrackRef.current.jump(PILL_RADIUS);
-          shellRef.current?.classList.add("is-launching");
-          applyFrameStyles(true);
-          ensurePhysicsLoop();
+      const tauriMode = isTauriRuntime();
+
+      if (tauriMode) {
+        // Pre-warm ALL expanded GPU raster tiles, Skia rounded-rect shaders, glyph atlases, and
+        // Lucide SVG layers during 1 hidden frame BEFORE the Win32 stage window is revealed —
+        // making the very first hover expand & collapse 100% as smooth as the 10th hover!
+        const shell = shellRef.current;
+        const expLayer = expandedLayerRef.current;
+        const warmW = getMaxExpandedWidth();
+        const warmH = expandedHeightRef.current;
+        if (shell && expLayer) {
+          shell.style.width = `${warmW}px`;
+          shell.style.height = `${warmH}px`;
+          shell.style.borderRadius = `${EXPANDED_RADIUS}px`;
+          expLayer.style.width = `${warmW}px`;
+          expLayer.style.visibility = "visible";
+          expLayer.style.opacity = "0.02";
+          if (topbarRef.current) topbarRef.current.style.opacity = "1";
+          if (islandBodyRef.current) islandBodyRef.current.style.opacity = "1";
         }
+        if (!prefersReducedMotion() && introMode === "cinematic") {
+          supernovaActiveRef.current = true;
+        }
+
+        window.requestAnimationFrame(() => {
+          if (!prefersReducedMotion() && introMode !== "off") {
+            if (introMode === "cinematic") {
+              enterSupernovaSingularity();
+              setSupernovaIntro((prev) => ({ active: true, key: prev.key + 1 }));
+            } else {
+              supernovaActiveRef.current = false;
+              startupIntroActiveRef.current = true;
+              startupUnfurlStartedRef.current = false;
+              startupIntroStartedAtRef.current = performance.now();
+              widthTrackRef.current.jump(PILL_HEIGHT);
+              heightTrackRef.current.jump(PILL_HEIGHT);
+              radiusTrackRef.current.jump(PILL_RADIUS);
+              shellRef.current?.classList.add("is-launching");
+              applyFrameStyles(true);
+              ensurePhysicsLoop();
+            }
+          } else {
+            supernovaActiveRef.current = false;
+            applyFrameStyles(false);
+          }
+
+          window.requestAnimationFrame(() => {
+            void novaApi.revealIslandWindow();
+          });
+        });
       }
     }
 
@@ -784,6 +890,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     applyFrameStyles,
     computeZoneRect,
     embeddedPreview,
+    enterSupernovaSingularity,
     ensurePhysicsLoop,
     getMaxExpandedWidth,
     pushHitRectIfNeeded,
@@ -845,6 +952,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           !expandedRef.current &&
           !isMorphingRef.current &&
           !startupIntroActiveRef.current &&
+          !supernovaActiveRef.current &&
           !(suppressFullscreenRef.current && pendingCountRef.current === 0)
         ) {
           const nextProx = clamp(proximity, 0, 1);
@@ -1017,22 +1125,180 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           }}
           isBottomDock={effectiveZone === "bottom-dock"}
           idleLabel={t(lang, "idleReady")}
-          onDockUnfurlProgress={(alpha) => {
-            supernovaRevealAlphaRef.current = alpha;
-            applyFrameStyles(false);
+          onIntroFrame={({ elapsed, centerX, heroY, pillX, pillY, pillW, pillH }) => {
+            const shell = shellRef.current;
+            const shadow = shadowRef.current;
+            const pillLayer = pillLayerRef.current;
+            const pillMeasure = pillMeasureRef.current;
+            if (!shell || !pillLayer || !pillMeasure) return;
+
+            const easeOut3 = (v: number) => 1 - Math.pow(1 - clamp(v, 0, 1), 3);
+            const easeInOut3 = (v: number) => {
+              const x = clamp(v, 0, 1);
+              return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+            };
+            const easeOutBackHero = (v: number, overshoot = 1.55) => {
+              const x = clamp(v, 0, 1);
+              const c3 = overshoot + 1;
+              return 1 + c3 * Math.pow(x - 1, 3) + overshoot * Math.pow(x - 1, 2);
+            };
+
+            const dockP = clamp((elapsed - 2.42) / 0.66, 0, 1);
+            const unfurlP = clamp((elapsed - 3.08) / 0.6, 0, 1);
+            const eDock = easeInOut3(dockP);
+            const eUnfurl = easeOut3(unfurlP);
+
+            // 1. Real .nova-island-shell: invisible during Acts I & II, materializes at 2.66s as a
+            //    dead-center 38x38 circle with violet rim glow, then unfurls to resting pillW!
+            const curShellW = pillH + (pillW - pillH) * eUnfurl;
+            const curShellX = centerX - curShellW * 0.5;
+            const shellReveal = clamp((dockP - 0.36) / 0.44, 0, 1);
+            const rimGlow =
+              dockP > 0.45 ? Math.sin(clamp((elapsed - 2.8) / 0.85, 0, 1) * Math.PI) : 0;
+
+            shell.style.width = `${curShellW.toFixed(2)}px`;
+            shell.style.height = `${pillH}px`;
+            shell.style.borderRadius = `${(pillH * 0.5).toFixed(2)}px`;
+            shell.style.transform = `translate3d(${curShellX.toFixed(2)}px, ${pillY.toFixed(2)}px, 0)`;
+            shell.style.opacity = "1";
+            shell.style.pointerEvents = "none";
+            // Keep overflow visible while Hero NOVA is larger than 38px; clip right as docking completes
+            // BEFORE unfurlP (>3.08s) begins so status text never peeks outside the capsule circle!
+            shell.style.overflow = dockP >= 0.94 ? "hidden" : "visible";
+
+            if (shellReveal <= 0.004) {
+              shell.style.backgroundColor = "rgba(14, 14, 17, 0)";
+              shell.style.borderColor = "rgba(255, 255, 255, 0)";
+            } else {
+              const baseBg =
+                settings.theme === "tactical"
+                  ? `rgba(6, 11, 9, ${shellReveal.toFixed(3)})`
+                  : settings.theme === "acrylic"
+                  ? `rgba(14, 17, 26, ${shellReveal.toFixed(3)})`
+                  : `rgba(14, 14, 17, ${shellReveal.toFixed(3)})`;
+              shell.style.backgroundColor = baseBg;
+              shell.style.borderColor =
+                rimGlow > 0.01
+                  ? `rgba(167, 139, 250, ${((0.2 + rimGlow * 0.68) * shellReveal).toFixed(3)})`
+                  : `rgba(255, 255, 255, ${(0.13 * shellReveal).toFixed(3)})`;
+            }
+
+            if (shadow) {
+              const sx = (curShellW + 36) / SHADOW_BASE_W;
+              const sy = (pillH + 36) / SHADOW_BASE_H;
+              shadow.style.opacity = (0.56 * shellReveal).toFixed(3);
+              shadow.style.transform = `translate3d(${(curShellX - 18).toFixed(2)}px, ${(pillY - 8).toFixed(2)}px, 0) scale3d(${sx.toFixed(4)}, ${sy.toFixed(4)}, 1)`;
+            }
+
+            // 2. Real <NovaOrb> rendered at native 96x96 CSS px (zero 4x compositor upscale blur!):
+            //    hidden during Singularity (<0.86s), pops out of the 0.86s Supernova flash
+            //    with sleepy wake -> left/right scan -> happy (^^) smile -> dead-center dock -> left slot glide!
+            const orb = pillMeasure.querySelector(
+              ".nova-pill-orb-slot > canvas, .nova-pill-orb-slot > .nova-hud-glyph"
+            ) as HTMLElement | null;
+            if (elapsed < 0.86) {
+              pillLayer.style.opacity = "0";
+              pillLayer.style.visibility = "hidden";
+              introOrbPoseRef.current = {
+                active: true,
+                yaw: 0,
+                pitch: 0.02,
+                eyeOpen: 0.08,
+                happySmile: 0,
+                ringScale: 0.86,
+                moonAngle: -1.9,
+                moonTrail: 0,
+                glowBoost: 0.7,
+                blendToLive: 0,
+              };
+            } else {
+              const act2P = clamp((elapsed - 0.86) / 1.56, 0, 1);
+              const popScale = elapsed < 2.42 ? easeOutBackHero(clamp(act2P / 0.34, 0, 1), 1.55) : 1;
+              const bobY = elapsed < 2.42 ? Math.sin(act2P * Math.PI * 2) * 3.5 * (1 - eDock) : 0;
+
+              let wakeOpen = act2P < 0.16 ? 0.08 : clamp((act2P - 0.16) / 0.14, 0.08, 1);
+              // Gentle 60ms blink-in / blink-out around the happy (^^) smile so eyes never snap harshly
+              if (elapsed < 2.42) {
+                const dIn = Math.abs(act2P - 0.56);
+                const dOut = Math.abs(act2P - 0.92);
+                const blinkDip = Math.min(dIn, dOut) < 0.038 ? Math.min(dIn, dOut) / 0.038 : 1;
+                wakeOpen = Math.min(wakeOpen, 0.12 + 0.88 * blinkDip);
+              }
+              const yaw =
+                elapsed < 2.42 && act2P > 0.28 && act2P < 0.55
+                  ? Math.sin(((act2P - 0.28) / 0.27) * Math.PI * 2) * 0.36
+                  : 0;
+              const smile = elapsed < 2.42 && act2P > 0.56 && act2P < 0.92 ? 1 : 0;
+              const moonAngle =
+                elapsed < 2.42
+                  ? -1.9 + easeOut3(act2P) * 2.48
+                  : 0.58 + (elapsed - 2.42) * 0.55;
+              const moonTrail =
+                elapsed < 2.42 ? Math.sin(clamp(act2P / 0.7, 0, 1) * Math.PI) * 0.85 : 0;
+
+              introOrbPoseRef.current = {
+                active: true,
+                yaw,
+                pitch: smile ? 0.08 : 0.02,
+                eyeOpen: wakeOpen,
+                happySmile: smile,
+                ringScale: 0.86 + 0.14 * easeOut3(clamp(act2P / 0.42, 0, 1)),
+                moonAngle,
+                moonTrail,
+                glowBoost: elapsed < 2.42 ? (1 - act2P) * 0.7 : (1 - eDock) * 0.25,
+                blendToLive: easeInOut3(clamp((elapsed - 3.12) / 0.55, 0, 1)),
+              };
+              pillOrbActiveRef.current = true;
+              pillOrbWakeRef.current?.();
+
+              const heroSize = 94 * popScale;
+              const curOrbSize = heroSize + (24 - heroSize) * eDock;
+              // Scale DOWN from native 96px canvas (0.98x -> 0.25x) so Blink never upscales a 24px GPU tile!
+              const orbScale = Math.max(0.05, curOrbSize / 96);
+
+              // Dead-center inside 38x38 circle at eUnfurl=0, gliding to natural resting slot (pillX + 20, pillY + 20) at eUnfurl=1!
+              const targetDockX = centerX + (curShellX + 20 - centerX) * eUnfurl;
+              const targetDockY = pillY + pillH * 0.5 + (pillY + 20 - (pillY + pillH * 0.5)) * eUnfurl;
+              const orbCenterX = centerX + (targetDockX - centerX) * eDock;
+              const orbCenterY = heroY + bobY + (targetDockY - (heroY + bobY)) * eDock;
+
+              const tx = orbCenterX - (curShellX + 20);
+              const ty = orbCenterY - (pillY + 20);
+
+              pillLayer.style.visibility = "visible";
+              pillLayer.style.opacity = "1";
+              pillLayer.style.pointerEvents = "none";
+              pillLayer.style.transform = `translate3d(${tx.toFixed(2)}px, ${ty.toFixed(2)}px, 0)`;
+
+              if (orb) {
+                orb.style.transformOrigin = "50% 50%";
+                orb.style.transform = `scale(${orbScale.toFixed(4)})`;
+              }
+            }
+
+            if (closedStatusRef.current) {
+              const labelReveal = clamp((eUnfurl - 0.16) / 0.84, 0, 1);
+              closedStatusRef.current.style.opacity = labelReveal.toFixed(3);
+              closedStatusRef.current.style.transform = `translate3d(${((1 - labelReveal) * -6).toFixed(2)}px, 0, 0)`;
+            }
           }}
+          onDockUnfurlProgress={() => {}}
           onComplete={() => {
-            supernovaActiveRef.current = false;
-            supernovaRevealAlphaRef.current = 1;
-            applyFrameStyles(false);
+            // Keep orb at scale(0.25) until React commits size={24} and useLayoutEffect runs pre-paint!
             setSupernovaIntro((prev) => ({ ...prev, active: false }));
           }}
         />
       )}
       <div
         ref={shellRef}
-        className={`nova-island-shell theme-${settings.theme} aura-${settings.aura} state-${orbState} ${
-          embeddedPreview ? "is-expanded is-embedded" : "is-folded"
+        className={`nova-island-shell ${supernovaIntro.active ? "is-supernova-intro" : ""} theme-${settings.theme} aura-${settings.aura} state-${orbState} ${
+          embeddedPreview
+            ? "is-expanded is-embedded"
+            : expandedRef.current
+            ? "is-expanded"
+            : "is-folded"
+        }${isMorphingRef.current ? " is-morphing" : ""}${
+          !expandedRef.current && pillHoveredRef.current ? " is-prewake" : ""
         }`}
         onMouseEnter={handleShellPointerEnter}
         onMouseLeave={handleShellPointerLeave}
@@ -1046,16 +1312,20 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         {/* LAYER A: COMPACT FOLDED PILL */}
         <div ref={pillLayerRef} className="nova-pill-layer" aria-hidden={embeddedPreview}>
           <div ref={pillMeasureRef} className="nova-pill-measure">
-            <NovaOrb
-              mode={settings.avatarMode}
-              aura={settings.aura}
-              state={orbState}
-              size={24}
-              activeCount={activeAgentCount}
-              activeRef={pillOrbActiveRef}
-              wakeRef={pillOrbWakeRef}
-              morphingRef={isMorphingRef}
-            />
+            <div className="nova-pill-orb-slot">
+              <NovaOrb
+                mode={settings.avatarMode}
+                aura={settings.aura}
+                state={orbState}
+                size={supernovaIntro.active ? 96 : 24}
+                renderScale={2}
+                activeCount={activeAgentCount}
+                activeRef={pillOrbActiveRef}
+                wakeRef={pillOrbWakeRef}
+                morphingRef={isMorphingRef}
+                introPoseRef={introOrbPoseRef}
+              />
+            </div>
             <div ref={closedStatusRef} className="nova-closed-status">
               <span className={`live-pulse-dot state-${orbState}`} />
               {pendingApprovals.length > 0 ? (
@@ -1184,7 +1454,11 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             </div>
 
             {/* BODY CONTENT */}
-            <div ref={islandBodyRef} key={activeTab} className="nova-island-body nova-tab-stage">
+            <div
+              ref={islandBodyRef}
+              key={activeTab}
+              className={`nova-island-body ${tabAnimated ? "nova-tab-stage" : ""}`}
+            >
               {/* TAB 1: MISSION CONTROL */}
               {activeTab === "mission" && (
                 <div className="nova-mission-layout">

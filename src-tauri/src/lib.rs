@@ -52,6 +52,7 @@ pub struct IslandPointerEvent {
 
 pub struct IslandStageState {
     pub is_expanded: AtomicBool,
+    pub is_revealed: AtomicBool,
     pub rect: Mutex<IslandHitRect>,
     pub win_origin: Mutex<CachedWindowOrigin>,
     pub ignoring: AtomicBool,
@@ -92,6 +93,7 @@ impl IslandStageState {
 
         Self {
             is_expanded: AtomicBool::new(false),
+            is_revealed: AtomicBool::new(false),
             rect: Mutex::new(init_rect),
             win_origin: Mutex::new(CachedWindowOrigin {
                 px: 0.0,
@@ -105,7 +107,7 @@ impl IslandStageState {
     }
 }
 
-fn atomic_set_window_bounds(win: &WebviewWindow, px: i32, py: i32, pw: i32, ph: i32) {
+fn atomic_set_window_bounds(win: &WebviewWindow, px: i32, py: i32, pw: i32, ph: i32, show: bool) {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HWND;
@@ -114,6 +116,11 @@ fn atomic_set_window_bounds(win: &WebviewWindow, px: i32, py: i32, pw: i32, ph: 
         };
         if let Ok(raw_hwnd) = win.hwnd() {
             let hwnd = HWND(raw_hwnd.0 as *mut core::ffi::c_void);
+            let flags = if show {
+                SWP_NOACTIVATE | SWP_SHOWWINDOW
+            } else {
+                SWP_NOACTIVATE
+            };
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
@@ -122,7 +129,7 @@ fn atomic_set_window_bounds(win: &WebviewWindow, px: i32, py: i32, pw: i32, ph: 
                     py,
                     pw.max(1),
                     ph.max(1),
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    flags,
                 );
             }
             return;
@@ -131,7 +138,45 @@ fn atomic_set_window_bounds(win: &WebviewWindow, px: i32, py: i32, pw: i32, ph: 
 
     let _ = win.set_size(PhysicalSize::new(pw.max(1) as u32, ph.max(1) as u32));
     let _ = win.set_position(PhysicalPosition::new(px, py));
+    if show {
+        let _ = win.show();
+    }
+}
+
+fn show_island_no_activate(app: &AppHandle, stage: &Arc<IslandStageState>) {
+    stage.is_revealed.store(true, Ordering::SeqCst);
+    let Some(win) = app.get_webview_window("island") else {
+        return;
+    };
+    // MUST call `win.show()` so `tao::WindowState` sets `WindowFlags::VISIBLE = true` and `wry`
+    // sets `ICoreWebView2Controller::SetIsVisible(true)`. Showing only via raw `SetWindowPos`
+    // leaves `WindowFlags::VISIBLE == false`, causing `tao` to execute `ShowWindow(hwnd, SW_HIDE)`
+    // the moment `set_ignore_cursor_events(false)` runs on hover!
     let _ = win.show();
+    #[cfg(windows)]
+    {
+        let win_for_top = win.clone();
+        let _ = app.run_on_main_thread(move || {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            };
+            if let Ok(raw_hwnd) = win_for_top.hwnd() {
+                let hwnd = HWND(raw_hwnd.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        });
+    }
 }
 
 #[cfg(windows)]
@@ -349,6 +394,7 @@ fn place_stage_window(
     stage: &Arc<IslandStageState>,
     zone: &str,
     monitor_index: usize,
+    show: bool,
 ) -> Result<(), String> {
     let Some(win) = app.get_webview_window("island") else {
         return Ok(());
@@ -359,7 +405,11 @@ fn place_stage_window(
         let pw = (((STAGE_W * scale).round() as i32) + 1) & !1;
         let ph = (STAGE_H * scale).round() as i32;
         if let Ok(pos) = win.outer_position() {
-            atomic_set_window_bounds(&win, pos.x, pos.y, pw, ph);
+            atomic_set_window_bounds(&win, pos.x, pos.y, pw, ph, show);
+            if show {
+                stage.is_revealed.store(true, Ordering::SeqCst);
+                let _ = win.show();
+            }
             *stage.win_origin.lock().unwrap() = CachedWindowOrigin {
                 px: pos.x as f64,
                 py: pos.y as f64,
@@ -367,7 +417,10 @@ fn place_stage_window(
             };
         } else {
             let _ = win.set_size(LogicalSize::new(STAGE_W, STAGE_H));
-            let _ = win.show();
+            if show {
+                stage.is_revealed.store(true, Ordering::SeqCst);
+                let _ = win.show();
+            }
         }
         return Ok(());
     }
@@ -423,8 +476,11 @@ fn place_stage_window(
         scale,
     };
 
-    atomic_set_window_bounds(&win, px, py, pw, ph);
-    let _ = win.show();
+    atomic_set_window_bounds(&win, px, py, pw, ph, show);
+    if show {
+        stage.is_revealed.store(true, Ordering::SeqCst);
+        let _ = win.show();
+    }
     Ok(())
 }
 
@@ -466,7 +522,12 @@ async fn apply_snap_zone(
 
     // Only call SetWindowPos when the monitor or snapZone actually changes — NEVER on expand/collapse!
     if zone_or_mon_changed || expanded.is_none() {
-        place_stage_window(&app, &stage, &resolved_zone, resolved_mon)?;
+        let already_visible = stage.is_revealed.load(Ordering::SeqCst)
+            || app
+                .get_webview_window("island")
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false);
+        place_stage_window(&app, &stage, &resolved_zone, resolved_mon, already_visible)?;
     }
 
     Ok(())
@@ -680,11 +741,23 @@ async fn show_hub_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn replay_island_intro(app: AppHandle) -> Result<(), String> {
+fn replay_island_intro(
+    app: AppHandle,
+    stage: State<'_, Arc<IslandStageState>>,
+) -> Result<(), String> {
+    show_island_no_activate(&app, &stage);
     if let Some(win) = app.get_webview_window("island") {
-        let _ = win.show();
         let _ = win.emit("nova-replay-intro", ());
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn reveal_island_window(
+    app: AppHandle,
+    stage: State<'_, Arc<IslandStageState>>,
+) -> Result<(), String> {
+    show_island_no_activate(&app, &stage);
     Ok(())
 }
 
@@ -875,6 +948,7 @@ pub fn run() {
             focus_island_window,
             show_hub_window,
             replay_island_intro,
+            reveal_island_window,
         ])
         .setup(move |app| {
             let ping_handle = app.handle().clone();
@@ -895,10 +969,8 @@ pub fn run() {
                     if ev.get("type").and_then(|v| v.as_str()) == Some("window_wake") {
                         let zone = wake_stage.last_zone.lock().unwrap().clone();
                         let mon = wake_stage.last_monitor.load(Ordering::Relaxed);
-                        let _ = place_stage_window(&wake_handle, &wake_stage, &zone, mon);
-                        if let Some(w) = wake_handle.get_webview_window("island") {
-                            let _ = w.show();
-                        }
+                        let _ = place_stage_window(&wake_handle, &wake_stage, &zone, mon, true);
+                        show_island_no_activate(&wake_handle, &wake_stage);
                     }
                 }
             });
@@ -913,7 +985,17 @@ pub fn run() {
             if let Some(win) = handle.get_webview_window("island") {
                 let _ = win.set_ignore_cursor_events(true);
             }
-            let _ = place_stage_window(&handle, &stage_state, &boot_zone, boot_mon);
+            // Position stage while STILL HIDDEN so uninitialized WebView2 never flashes a 900x690 black box!
+            // IslandSurface calls `reveal_island_window` right after painting its first transparent frame.
+            let _ = place_stage_window(&handle, &stage_state, &boot_zone, boot_mon, false);
+            let fallback_reveal = handle.clone();
+            let fallback_stage = stage_state.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+                if !fallback_stage.is_revealed.load(Ordering::SeqCst) {
+                    show_island_no_activate(&fallback_reveal, &fallback_stage);
+                }
+            });
             spawn_island_hit_tester(handle.clone(), stage_state.clone());
 
             if boot_orb {
@@ -951,9 +1033,7 @@ pub fn run() {
                             spawn_show_hub_window(app.clone());
                         }
                         "toggle_island" => {
-                            if let Some(w) = app.get_webview_window("island") {
-                                let _ = w.show();
-                            }
+                            show_island_no_activate(app, &app.state::<Arc<IslandStageState>>());
                         }
                         "detach_orb" => {
                             let vis = app
