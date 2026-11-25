@@ -18,6 +18,12 @@ export const App: React.FC = () => {
   const [ports, setPorts] = useState<PortProcessInfo[]>([]);
   const [media, setMedia] = useState<MediaStatus | null>(null);
   const [github, setGithub] = useState<GitHubOverview | null>(null);
+  const [bootTimedOut, setBootTimedOut] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setBootTimedOut(true), 2500);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const surface = (() => {
     const params = new URLSearchParams(window.location.search);
@@ -39,27 +45,55 @@ export const App: React.FC = () => {
         novaApi.fetchPorts(),
         novaApi.fetchMedia(),
       ]);
-      setTelemetry(hw);
-      setPorts(pt);
-      setMedia(md);
+      if (hw && typeof hw.cpuPercent === "number") setTelemetry(hw);
+      if (Array.isArray(pt)) setPorts(pt);
+      if (md && typeof md.active === "boolean") setMedia(md);
     } catch {
       // ignore transient error during boot
     }
   }, []);
 
   useEffect(() => {
-    novaApi.fetchSnapshot().then(setSnapshot).catch(() => {});
+    let mounted = true;
+    let bootRetryTimer: number | undefined;
+
+    const loadInitialSnapshot = async () => {
+      try {
+        const snap = await novaApi.fetchSnapshot();
+        if (mounted && snap && snap.settings && Array.isArray(snap.sessions)) {
+          setSnapshot(snap);
+          return;
+        }
+      } catch {
+        // Core HTTP server may still be binding during initial boot; retry shortly
+      }
+      if (mounted) {
+        bootRetryTimer = window.setTimeout(loadInitialSnapshot, 600);
+      }
+    };
+
+    void loadInitialSnapshot();
     refreshSystem();
     novaApi.fetchGitHub().then(setGithub).catch(() => {});
 
     const disconnect = connectNovaRealtime({
-      onSnapshot: (snap) => setSnapshot(snap),
+      onSnapshot: (snap) => {
+        if (snap && snap.settings && Array.isArray(snap.sessions)) {
+          if (bootRetryTimer) {
+            window.clearTimeout(bootRetryTimer);
+            bootRetryTimer = undefined;
+          }
+          setSnapshot(snap);
+        }
+      },
       onFocusTick: (focus) =>
         setSnapshot((prev) => (prev ? { ...prev, focus } : prev)),
     });
 
     const sysInterval = window.setInterval(refreshSystem, 5000);
     return () => {
+      mounted = false;
+      if (bootRetryTimer) window.clearTimeout(bootRetryTimer);
       disconnect();
       window.clearInterval(sysInterval);
     };
@@ -70,6 +104,53 @@ export const App: React.FC = () => {
       <div className="nova-boot-screen">
         <div className="boot-pulse" />
         <span>Connecting to NOVA Core Engine...</span>
+        {bootTimedOut && (
+          <div style={{ marginTop: 12, textAlign: "center", maxWidth: 360 }}>
+            <p style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>
+              If opening in a browser, enter your IPC Token (found in <code>%LOCALAPPDATA%\NOVA\ipc.token</code>) or click Connect:
+            </p>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                type="text"
+                placeholder="Paste IPC token..."
+                id="manual-token-input"
+                style={{
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.15)",
+                  color: "#fff",
+                  padding: "4px 8px",
+                  borderRadius: 6,
+                  fontSize: 11,
+                  flex: 1,
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const val = (document.getElementById("manual-token-input") as HTMLInputElement)?.value.trim();
+                  if (val) {
+                    try {
+                      localStorage.setItem("nova_token", val);
+                    } catch {}
+                    window.location.search = `?surface=${surface}&token=${encodeURIComponent(val)}`;
+                  }
+                }}
+                style={{
+                  background: "#38bdf8",
+                  color: "#0b0f19",
+                  border: "none",
+                  padding: "4px 10px",
+                  borderRadius: 6,
+                  fontWeight: 600,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                Connect
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

@@ -20,7 +20,7 @@
         "title": "NOVA Island",
         "url": "index.html?surface=island",
         "width": 900,
-        "height": 620,
+        "height": 690,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -29,7 +29,8 @@
         "skipTaskbar": true,
         "focus": false,
         "visible": true,
-        "center": false
+        "center": false,
+        "dragDropEnabled": false
       }
     ]
   },

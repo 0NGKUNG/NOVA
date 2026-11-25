@@ -21,8 +21,10 @@ use tauri::{
 /// Constant transparent stage size so NOVA never resizes its Win32/WebView2 swapchain
 /// during expand or collapse — completely eliminating start/end DWM resize shutter!
 pub const STAGE_W: f64 = 900.0;
-pub const STAGE_H: f64 = 620.0;
+pub const STAGE_H: f64 = 690.0;
 const NEAR_ZONE_PX: f64 = 240.0;
+/// Distance (logical px) at which the folded pill starts magnetically swelling toward the cursor.
+const MAGNET_ZONE_PX: f64 = 72.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IslandHitRect {
@@ -44,6 +46,8 @@ pub struct IslandPointerEvent {
     pub inside: bool,
     pub x: f64,
     pub y: f64,
+    /// 0.0 (far) → 1.0 (touching the island silhouette) within `MAGNET_ZONE_PX`.
+    pub proximity: f64,
 }
 
 pub struct IslandStageState {
@@ -156,6 +160,7 @@ fn cursor_physical() -> Option<(f64, f64)> {
 fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
     std::thread::spawn(move || {
         let mut was_inside: Option<bool> = None;
+        let mut was_magnet = false;
         let mut ticks: u32 = 0;
         let mut sleep_ms: u64 = 32;
         let mut last_folded_hover_sync = Instant::now();
@@ -208,6 +213,30 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
                 && ly >= r.y - NEAR_ZONE_PX
                 && ly <= r.y + r.h + NEAR_ZONE_PX;
 
+            // Euclidean distance from cursor to the silhouette rect → 0..1 magnetic proximity
+            let dx = if lx < r.x {
+                r.x - lx
+            } else if lx > r.x + r.w {
+                lx - (r.x + r.w)
+            } else {
+                0.0
+            };
+            let dy = if ly < r.y {
+                r.y - ly
+            } else if ly > r.y + r.h {
+                ly - (r.y + r.h)
+            } else {
+                0.0
+            };
+            let proximity = if r.w > 0.0 {
+                (1.0 - (dx * dx + dy * dy).sqrt() / MAGNET_ZONE_PX).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let in_magnet = proximity > 0.0;
+            let magnet_transition = in_magnet != was_magnet;
+            was_magnet = in_magnet;
+
             let active_motion = last_cursor_move.elapsed() < Duration::from_millis(320);
             sleep_ms = if on_island || near_island || active_motion {
                 14
@@ -232,11 +261,14 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
                 last_folded_hover_sync = Instant::now();
             }
 
-            // Stream ~60 Hz cursor coordinates across the entire screen whenever the
-            // pointer moves (zero events when stationary!) so NOVA's eyes track the
-            // cursor everywhere just like Coucou, even while click-through is active.
-            let pointer_tracking =
-                cursor_moved && last_pointer_emit.elapsed() >= Duration::from_millis(15);
+            // Stream cursor coordinates across the screen whenever the pointer moves
+            // (60 Hz near the island for responsive glint/proximity, 30 Hz far away).
+            let emit_interval = if on_island || near_island {
+                Duration::from_millis(16)
+            } else {
+                Duration::from_millis(33)
+            };
+            let pointer_tracking = cursor_moved && last_pointer_emit.elapsed() >= emit_interval;
             if pointer_tracking {
                 last_pointer_emit = Instant::now();
             }
@@ -245,18 +277,15 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
             if pointer_transition {
                 was_inside = Some(on_island);
             }
-            if pointer_transition || folded_hover_sync || pointer_tracking {
+            if pointer_transition || folded_hover_sync || pointer_tracking || magnet_transition {
                 if let Some(win) = app.get_webview_window("island") {
-                    if pointer_transition && on_island {
-                        // Reassert the configured topmost level when the user approaches NOVA.
-                        let _ = win.set_always_on_top(true);
-                    }
                     let _ = win.emit(
                         "nova-island-pointer",
                         IslandPointerEvent {
                             inside: on_island,
                             x: lx,
                             y: ly,
+                            proximity,
                         },
                     );
                 }
@@ -275,6 +304,7 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
                                         inside: false,
                                         x: ox,
                                         y: oy,
+                                        proximity: 0.0,
                                     },
                                 );
                             }
@@ -301,7 +331,7 @@ fn set_island_passthrough(
 }
 
 #[tauri::command]
-fn set_island_rect(
+async fn set_island_rect(
     stage: State<'_, Arc<IslandStageState>>,
     x: f64,
     y: f64,
@@ -399,7 +429,7 @@ fn place_stage_window(
 }
 
 #[tauri::command]
-fn apply_snap_zone(
+async fn apply_snap_zone(
     app: AppHandle,
     stage: State<'_, Arc<IslandStageState>>,
     zone: Option<String>,
@@ -442,8 +472,65 @@ fn apply_snap_zone(
     Ok(())
 }
 
-#[tauri::command]
-fn toggle_detached_orb(app: AppHandle, visible: bool) -> Result<(), String> {
+static IS_QUITTING: AtomicBool = AtomicBool::new(false);
+static HUB_CREATING: AtomicBool = AtomicBool::new(false);
+static ORB_CREATING: AtomicBool = AtomicBool::new(false);
+
+struct FlagResetGuard<'a>(&'a AtomicBool);
+impl Drop for FlagResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn bring_window_to_front(win: &WebviewWindow) {
+    let _ = win.show();
+    let _ = win.unminimize();
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
+            HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+            SW_SHOW,
+        };
+        if let Ok(raw_hwnd) = win.hwnd() {
+            let hwnd = HWND(raw_hwnd.0 as *mut core::ffi::c_void);
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                }
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+    let _ = win.set_focus();
+}
+
+/// Builds or toggles the Detached Orb window OFF the Win32 main thread so WebView2
+/// `CreateCoreWebView2Controller` never deadlocks the Windows event loop.
+async fn set_or_create_detached_orb(app: AppHandle, visible: bool) -> Result<(), String> {
     if let Some(orb_win) = app.get_webview_window("orb") {
         if visible {
             let _ = orb_win.show();
@@ -454,9 +541,19 @@ fn toggle_detached_orb(app: AppHandle, visible: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    if visible {
-        let orb = WebviewWindowBuilder::new(
-            &app,
+    if !visible {
+        return Ok(());
+    }
+
+    if ORB_CREATING.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let _guard = FlagResetGuard(&ORB_CREATING);
+
+    let app_for_build = app.clone();
+    let orb = tokio::task::spawn_blocking(move || {
+        WebviewWindowBuilder::new(
+            &app_for_build,
             "orb",
             WebviewUrl::App("index.html?surface=orb".into()),
         )
@@ -469,17 +566,30 @@ fn toggle_detached_orb(app: AppHandle, visible: bool) -> Result<(), String> {
         .skip_taskbar(true)
         .visible(true)
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
-        if let Ok(Some(primary)) = orb.primary_monitor() {
-            let scale = primary.scale_factor();
-            let size = primary.size();
-            let mw = (size.width as f64) / scale;
-            let mh = (size.height as f64) / scale;
-            let _ = orb.set_position(LogicalPosition::new(mw - 268.0, mh - 176.0));
-        }
+    if let Ok(Some(primary)) = orb.primary_monitor() {
+        let scale = primary.scale_factor();
+        let size = primary.size();
+        let mw = (size.width as f64) / scale;
+        let mh = (size.height as f64) / scale;
+        let _ = orb.set_position(LogicalPosition::new(mw - 268.0, mh - 176.0));
     }
     Ok(())
+}
+
+fn spawn_toggle_detached_orb(app: AppHandle, visible: bool) {
+    tauri::async_runtime::spawn(async move {
+        let _ = set_or_create_detached_orb(app, visible).await;
+    });
+}
+
+#[tauri::command]
+async fn toggle_detached_orb(app: AppHandle, visible: bool) -> Result<(), String> {
+    set_or_create_detached_orb(app, visible).await
 }
 
 #[tauri::command]
@@ -508,34 +618,65 @@ fn focus_island_window(app: AppHandle, stage: State<'_, Arc<IslandStageState>>) 
     Ok(())
 }
 
-#[tauri::command]
-fn show_hub_window(app: AppHandle) -> Result<(), String> {
+/// Creates or focuses the NOVA Command Hub window OFF the Win32 main thread.
+/// Calling `WebviewWindowBuilder::build()` on the main thread deadlocks WebView2 on Windows.
+async fn show_or_create_hub_window(app: AppHandle) -> Result<(), String> {
     if let Some(hub) = app.get_webview_window("hub") {
-        let _ = hub.show();
-        let _ = hub.unminimize();
-        let _ = hub.set_focus();
+        bring_window_to_front(&hub);
         return Ok(());
     }
 
-    let hub = WebviewWindowBuilder::new(
-        &app,
-        "hub",
-        WebviewUrl::App("index.html?surface=hub".into()),
-    )
-    .title("NOVA — Mission Control & Hub")
-    .inner_size(1220.0, 820.0)
-    .min_inner_size(960.0, 660.0)
-    .resizable(true)
-    .decorations(true)
-    .transparent(false)
-    .center()
-    .visible(true)
-    .focused(true)
-    .build()
-    .map_err(|e| e.to_string())?;
+    if HUB_CREATING.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let _guard = FlagResetGuard(&HUB_CREATING);
 
-    let _ = hub.set_focus();
+    let app_for_build = app.clone();
+    let hub = tokio::task::spawn_blocking(move || {
+        WebviewWindowBuilder::new(
+            &app_for_build,
+            "hub",
+            WebviewUrl::App("index.html?surface=hub".into()),
+        )
+        .title("NOVA — Settings")
+        .inner_size(1220.0, 820.0)
+        .min_inner_size(960.0, 660.0)
+        .resizable(true)
+        .decorations(true)
+        .transparent(false)
+        .disable_drag_drop_handler()
+        .center()
+        .visible(true)
+        .focused(true)
+        .build()
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let hub_for_close = hub.clone();
+    hub.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if !IS_QUITTING.load(Ordering::SeqCst) {
+                api.prevent_close();
+                let _ = hub_for_close.hide();
+            }
+        }
+    });
+
+    bring_window_to_front(&hub);
     Ok(())
+}
+
+fn spawn_show_hub_window(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let _ = show_or_create_hub_window(app).await;
+    });
+}
+
+#[tauri::command]
+async fn show_hub_window(app: AppHandle) -> Result<(), String> {
+    show_or_create_hub_window(app).await
 }
 
 pub fn run_headless() {
@@ -552,37 +693,117 @@ pub fn run_headless() {
     });
 }
 
-/// If NOVA is already running on localhost:47920, wake the existing Island and exit 0 cleanly
-/// instead of crashing WebView2 with HRESULT 0x800700AA ("The requested resource is in use").
-fn try_wake_existing_instance() {
+#[cfg(windows)]
+pub fn has_interactive_shell_desktop() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    const SHELL_TRAY: &[u16] = &[
+        b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'_' as u16,
+        b'T' as u16, b'r' as u16, b'a' as u16, b'y' as u16, b'W' as u16, b'n' as u16,
+        b'd' as u16, 0,
+    ];
+    unsafe {
+        FindWindowW(PCWSTR(SHELL_TRAY.as_ptr()), PCWSTR::null())
+            .map(|h| !h.0.is_null())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn has_interactive_shell_desktop() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WakeOutcome {
+    NotRunning,
+    WokeExisting,
+    ExistingUnresponsive,
+}
+
+/// If NOVA is already running on localhost:47920, grant Win32 foreground permission, wake the
+/// existing Island + Hub, and verify the UI event loop responded cleanly on an interactive desktop.
+fn try_wake_existing_instance() -> WakeOutcome {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
 
     let addr = SocketAddr::from(([127, 0, 0, 1], state::CORE_PORT));
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(220)) else {
-        return;
+        return WakeOutcome::NotRunning;
     };
+
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
 
     let token_path = agy_hooks::nova_data_dir().join("ipc.token");
     let token = std::fs::read_to_string(token_path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
     let req = format!(
-        "POST /api/window/wake HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nX-Nova-Token: {token}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+        "POST /api/window/wake HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://tauri.localhost\r\nContent-Type: application/json\r\nX-Nova-Token: {token}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
         state::CORE_PORT
     );
-    let _ = stream.write_all(req.as_bytes());
-    let mut buf = [0u8; 128];
-    let _ = stream.read(&mut buf);
+    if stream.write_all(req.as_bytes()).is_err() {
+        return WakeOutcome::ExistingUnresponsive;
+    }
+    let mut buf = [0u8; 512];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            if resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200") {
+                if has_interactive_shell_desktop()
+                    && resp.contains("\"interactiveDesktop\":false")
+                {
+                    return WakeOutcome::ExistingUnresponsive;
+                }
+                WakeOutcome::WokeExisting
+            } else {
+                WakeOutcome::ExistingUnresponsive
+            }
+        }
+        _ => WakeOutcome::ExistingUnresponsive,
+    }
+}
+
+fn terminate_unresponsive_nova_instances() {
+    let my_pid = std::process::id();
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut killed_any = false;
+    for (pid, proc_info) in sys.processes() {
+        let p = pid.as_u32();
+        if p == my_pid || p <= 4 {
+            continue;
+        }
+        let name = proc_info.name().to_string_lossy();
+        if name.eq_ignore_ascii_case("nova.exe") || name.eq_ignore_ascii_case("nova") {
+            let _ = proc_info.kill();
+            killed_any = true;
+        }
+    }
+    if killed_any {
+        std::thread::sleep(Duration::from_millis(350));
+    }
 }
 
 pub fn run() {
     if std::env::args().any(|a| a == "--headless") {
         run_headless();
         return;
+    }
+
+    // Fast single-instance wake BEFORE initializing AppCore (avoids state.json clobbering
+    // and avoids Windows 127.0.0.1 vs 0.0.0.0 dual-bind collisions).
+    match try_wake_existing_instance() {
+        WakeOutcome::WokeExisting => return,
+        WakeOutcome::ExistingUnresponsive => terminate_unresponsive_nova_instances(),
+        WakeOutcome::NotRunning => {}
     }
 
     let core = AppCore::new();
@@ -594,12 +815,22 @@ pub fn run() {
     };
 
     // Kernel-atomic single-instance lock BEFORE initializing WebView2
-    let Ok(prebound_listener) = std::net::TcpListener::bind(bind_addr) else {
-        try_wake_existing_instance();
-        return;
+    let prebound_listener = match std::net::TcpListener::bind(bind_addr) {
+        Ok(l) => l,
+        Err(_) => {
+            if try_wake_existing_instance() == WakeOutcome::WokeExisting {
+                return;
+            }
+            terminate_unresponsive_nova_instances();
+            match std::net::TcpListener::bind(bind_addr) {
+                Ok(l) => l,
+                Err(_) => return,
+            }
+        }
     };
     let prebound_slot = Arc::new(Mutex::new(Some(prebound_listener)));
     let _ = agy_hooks::sync_hook_binary();
+    std::thread::spawn(agy_hooks::sync_start_menu_shortcut);
 
     let boot_zone = core.inner.lock().unwrap().settings.snap_zone.clone();
     let boot_mon = core.inner.lock().unwrap().settings.monitor_index;
@@ -624,6 +855,15 @@ pub fn run() {
             show_hub_window,
         ])
         .setup(move |app| {
+            let ping_handle = app.handle().clone();
+            *core.ui_liveness.lock().unwrap() = Some(Arc::new(move || {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = ping_handle.run_on_main_thread(move || {
+                    let _ = tx.send(());
+                });
+                rx
+            }));
+
             let server_core = core.clone();
             let wake_handle = app.handle().clone();
             let wake_stage = stage_state.clone();
@@ -655,12 +895,16 @@ pub fn run() {
             spawn_island_hit_tester(handle.clone(), stage_state.clone());
 
             if boot_orb {
-                let _ = toggle_detached_orb(handle.clone(), true);
+                spawn_toggle_detached_orb(handle.clone(), true);
+            }
+
+            if std::env::args().any(|a| a == "--hub" || a == "--settings") {
+                spawn_show_hub_window(handle.clone());
             }
 
             // Build Windows System Tray Menu
             let open_hub =
-                MenuItem::with_id(app, "open_hub", "Open NOVA Command Hub", true, None::<&str>)?;
+                MenuItem::with_id(app, "open_hub", "Open NOVA Settings", true, None::<&str>)?;
             let toggle_island =
                 MenuItem::with_id(app, "toggle_island", "Show Dynamic Island", true, None::<&str>)?;
             let detach_orb = MenuItem::with_id(
@@ -682,7 +926,7 @@ pub fn run() {
                     .menu(&menu)
                     .on_menu_event(|app, ev| match ev.id().as_ref() {
                         "open_hub" => {
-                            let _ = show_hub_window(app.clone());
+                            spawn_show_hub_window(app.clone());
                         }
                         "toggle_island" => {
                             if let Some(w) = app.get_webview_window("island") {
@@ -694,9 +938,11 @@ pub fn run() {
                                 .get_webview_window("orb")
                                 .and_then(|w| w.is_visible().ok())
                                 .unwrap_or(false);
-                            let _ = toggle_detached_orb(app.clone(), !vis);
+                            spawn_toggle_detached_orb(app.clone(), !vis);
                         }
                         "quit" => {
+                            IS_QUITTING.store(true, Ordering::SeqCst);
+                            app.state::<AppCore>().shutdown_warm_workers();
                             app.exit(0);
                         }
                         _ => {}
@@ -708,7 +954,7 @@ pub fn run() {
                             ..
                         } = event
                         {
-                            let _ = show_hub_window(tray.app_handle().clone());
+                            spawn_show_hub_window(tray.app_handle().clone());
                         }
                     })
                     .build(app)?;
@@ -716,6 +962,11 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running NOVA Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building NOVA Tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                app.state::<AppCore>().shutdown_warm_workers();
+            }
+        });
 }

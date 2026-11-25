@@ -51,6 +51,62 @@ pub fn sync_hook_binary() -> PathBuf {
     dest
 }
 
+/// Ensures `%APPDATA%\Microsoft\Windows\Start Menu\Programs\NOVA.lnk` exists and points to `nova.exe`
+/// so NOVA appears natively under Apps in Windows Search (`Win` -> `nova`) even before running an installer.
+pub fn sync_start_menu_shortcut() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let Ok(exe) = env::current_exe() else {
+            return;
+        };
+        let is_nova_bin = exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("nova.exe"));
+        if !is_nova_bin || !exe.is_file() {
+            return;
+        }
+        let Some(appdata) = env::var_os("APPDATA").map(PathBuf::from) else {
+            return;
+        };
+        let programs_dir = appdata
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs");
+        let _ = fs::create_dir_all(&programs_dir);
+        let lnk_path = programs_dir.join("NOVA.lnk");
+
+        let exe_str = exe.to_string_lossy().replace('\'', "''");
+        let wd_str = exe
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_string_lossy()
+            .replace('\'', "''");
+        let lnk_str = lnk_path.to_string_lossy().replace('\'', "''");
+
+        let ps = format!(
+            "$ws = New-Object -ComObject WScript.Shell; \
+             $s = $ws.CreateShortcut('{lnk_str}'); \
+             if ($s.TargetPath -ne '{exe_str}') {{ \
+                 $s.TargetPath = '{exe_str}'; \
+                 $s.WorkingDirectory = '{wd_str}'; \
+                 $s.IconLocation = '{exe_str},0'; \
+                 $s.Description = 'NOVA — Personal AI Agent Mission Control & Dynamic Island'; \
+                 $s.Save(); \
+             }}"
+        );
+
+        let _ = std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command", &ps])
+            .output();
+    }
+}
+
 pub fn antigravity_hooks_json_path() -> PathBuf {
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
