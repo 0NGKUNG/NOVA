@@ -482,51 +482,53 @@ export function playSupernovaBootAudio(enabled: boolean) {
       disposableNodes.push(src, bp, g);
     };
 
-    // Act I (0.00–0.86s): Deep horizon pipe-fifth inhale
-    spaceWind(0.02, 0.74, 0.84, 0.095, 110, 1250, 2.2, 0.55);
-    synthVoice({ freq: 65.41, endFreq: 130.81, start: 0.02, attack: 0.58, dur: 0.84, peak: 0.085, type: "sine", wet: 0.25 });
-    synthVoice({ freq: 98.0, endFreq: 196.0, start: 0.08, attack: 0.52, dur: 0.78, peak: 0.05, type: "triangle", fStart: 250, fEnd: 900, wet: 0.45 });
+    // Act I (0.00–0.86s): Deep dark-matter velvet inhale (low-passed < 950Hz — zero bright hiss)
+    spaceWind(0.03, 0.72, 0.83, 0.085, 110, 880, 2.2, 0.45);
+    synthVoice({ freq: 51.91, endFreq: 103.83, start: 0.04, attack: 0.56, dur: 0.82, peak: 0.082, type: "sine", wet: 0.15 });
+    synthVoice({ freq: 233.08, endFreq: 293.66, start: 0.24, attack: 0.48, dur: 0.62, peak: 0.026, type: "sine", wet: 0.75 });
 
-    // Act II (0.86s): 36.71 Hz Tectonic Sub-Drop + Interstellar Pipe-Organ Drawbar Chord
-    spaceWind(0.86, 0.02, 1.15, 0.12, 1600, 180, 1.2, 0.7);
-    synthVoice({ freq: 138.0, endFreq: 36.71, start: 0.86, attack: 0.008, dur: 1.4, peak: 0.145, type: "sine", wet: 0 });
+    // Act II (0.86s): Buttery 38.89 Hz Sub Cushion + Warm Ab-Lydian Silk Pad (Ab2, Eb3, Bb3, D4, F4)
+    spaceWind(0.86, 0.025, 1.0, 0.095, 1150, 175, 1.4, 0.55);
+    synthVoice({ freq: 116.54, endFreq: 38.89, start: 0.86, attack: 0.01, dur: 1.25, peak: 0.135, type: "sine", wet: 0 });
 
-    const organStops: Array<{ f: number; p: number; pan: number; det: number; type: OscillatorType }> = [
-      { f: 65.41, p: 0.065, pan: 0, det: 0, type: "sine" },
-      { f: 130.81, p: 0.052, pan: -0.3, det: -4, type: "triangle" },
-      { f: 196.0, p: 0.048, pan: 0.3, det: 4, type: "sine" },
-      { f: 293.66, p: 0.042, pan: -0.38, det: -6, type: "sine" },
-      { f: 329.63, p: 0.036, pan: 0.18, det: 3, type: "sine" },
-      { f: 369.99, p: 0.04, pan: 0.38, det: 6, type: "triangle" },
-      { f: 587.33, p: 0.028, pan: -0.2, det: -4, type: "sine" },
-      { f: 739.99, p: 0.02, pan: 0.2, det: 5, type: "sine" },
+    const velvetPad: Array<{ f: number; p: number; pan: number; det: number; type: OscillatorType }> = [
+      { f: 103.83, p: 0.052, pan: -0.34, det: -7, type: "sawtooth" },
+      { f: 155.56, p: 0.048, pan: 0.34, det: 7, type: "sawtooth" },
+      { f: 233.08, p: 0.044, pan: -0.22, det: -5, type: "triangle" },
+      { f: 293.66, p: 0.04, pan: 0.22, det: 5, type: "sine" },
+      { f: 349.23, p: 0.03, pan: 0, det: 0, type: "sine" },
     ];
-    organStops.forEach((s) =>
+    velvetPad.forEach((v) =>
       synthVoice({
-        freq: s.f,
+        freq: v.f,
         start: 0.86,
-        attack: 0.11,
-        dur: 1.75,
-        peak: s.p,
-        type: s.type,
-        detune: s.det,
-        pan: s.pan,
-        fStart: 600,
-        fEnd: 2600,
-        wet: 0.9,
+        attack: 0.085,
+        dur: 1.62,
+        peak: v.p,
+        type: v.type,
+        detune: v.det,
+        pan: v.pan,
+        fStart: 280,
+        fEnd: 1350,
+        q: 1.5,
+        wet: 0.78,
       })
     );
 
-    // 1.76s (^^ Smile): Celestial Cathedral Bell (E5 -> B5)
-    synthVoice({ freq: 659.25, start: 1.76, attack: 0.008, dur: 0.38, peak: 0.04, type: "sine", pan: -0.25, fmRatio: 3, fmDepth: 22, wet: 0.92 });
-    synthVoice({ freq: 987.77, start: 1.91, attack: 0.008, dur: 0.56, peak: 0.044, type: "sine", pan: 0.25, fmRatio: 3, fmDepth: 18, wet: 0.95 });
+    // 1.76s (^^ Smile): Intimate Warm Frosted-Glass Harmonic (Bb4 -> F5)
+    synthVoice({ freq: 466.16, start: 1.76, attack: 0.008, dur: 0.34, peak: 0.042, type: "sine", pan: -0.2, fmRatio: 2, fmDepth: 16, wet: 0.82 });
+    synthVoice({ freq: 698.46, start: 1.9, attack: 0.008, dur: 0.48, peak: 0.045, type: "sine", pan: 0.2, fmRatio: 2, fmDepth: 14, wet: 0.88 });
 
-    // 2.90s (Capsule Dock): Deep Gravitational Airlock Seal
-    synthVoice({ freq: 110, endFreq: 41.2, start: 2.9, attack: 0.005, dur: 0.14, peak: 0.075, type: "sine", wet: 0 });
-    synthVoice({ freq: 493.88, endFreq: 587.33, start: 2.91, attack: 0.008, dur: 0.3, peak: 0.034, type: "sine", wet: 0.65 });
+    // 2.90s (Capsule Dock): Cushioned Magnetic Settle (Eb4 -> Bb4)
+    synthVoice({ freq: 103.83, endFreq: 46.25, start: 2.9, attack: 0.005, dur: 0.12, peak: 0.06, type: "sine", wet: 0 });
+    synthVoice({ freq: 311.13, endFreq: 466.16, start: 2.91, attack: 0.008, dur: 0.26, peak: 0.035, type: "sine", wet: 0.5 });
 
-    const cleanup = () => {
-      window.clearTimeout(timerId);
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      window.clearTimeout(fadeTimerId);
+      window.clearTimeout(disposeTimerId);
       if (activeBootCleanup === cleanup) activeBootCleanup = null;
       stoppableSources.forEach((s) => {
         try {
@@ -543,7 +545,34 @@ export function playSupernovaBootAudio(enabled: boolean) {
         }
       });
     };
-    const timerId = window.setTimeout(cleanup, 4800);
+    // Graceful 120ms fade-out (no click) used for interruptions
+    const cleanup = () => {
+      if (disposed) return;
+      window.clearTimeout(fadeTimerId);
+      window.clearTimeout(disposeTimerId);
+      try {
+        const now = ac.currentTime;
+        master.gain.cancelScheduledValues(now);
+        master.gain.setValueAtTime(master.gain.value, now);
+        master.gain.linearRampToValueAtTime(0.0001, now + 0.12);
+      } catch {
+        // ignore
+      }
+      window.setTimeout(dispose, 150);
+    };
+    // The final dock chime ends ~3.2s; echo/reverb feedback rings out until ~5.2s.
+    // Fade the master gently from 5.6s and release the whole graph at 6.4s.
+    const fadeTimerId = window.setTimeout(() => {
+      try {
+        const now = ac.currentTime;
+        master.gain.cancelScheduledValues(now);
+        master.gain.setValueAtTime(master.gain.value, now);
+        master.gain.linearRampToValueAtTime(0.0001, now + 0.7);
+      } catch {
+        // ignore
+      }
+    }, 5600);
+    const disposeTimerId = window.setTimeout(dispose, 6400);
     activeBootCleanup = cleanup;
   };
 

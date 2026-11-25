@@ -321,6 +321,7 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
     let startMs = 0;
     let audioStarted = false;
     let handedOff = false;
+    let finishedNaturally = false;
 
     const TOTAL_DURATION = 3.75;
     const HANDOFF_START = 3.55;
@@ -534,6 +535,7 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
       if (elapsed < TOTAL_DURATION) {
         rafId = window.requestAnimationFrame(step);
       } else {
+        finishedNaturally = true;
         callbacksRef.current.onDockUnfurlProgress?.(1);
         callbacksRef.current.onComplete();
       }
@@ -542,7 +544,9 @@ export const SupernovaIntroOverlay: React.FC<SupernovaIntroOverlayProps> = ({
     rafId = window.requestAnimationFrame(step);
     return () => {
       if (rafId) window.cancelAnimationFrame(rafId);
-      stopSupernovaBootAudio();
+      // Only cut the soundtrack if the intro was interrupted (hover/replay).
+      // When it finishes naturally, the echo tail rings out past the visuals.
+      if (!finishedNaturally) stopSupernovaBootAudio();
     };
   }, [active, runKey]);
 
