@@ -137,10 +137,13 @@ pub async fn run_ai_chat(
                     if active_account == "second" { "Second" } else { "Main" }
                 )
             })?;
-            let chosen_model = if model.is_empty() {
-                "gemini-3.8-flash-high"
-            } else {
-                model
+            // These older NOVA model IDs were UI labels, not Google API model IDs.
+            // Normalize them so existing saved settings continue to work.
+            let chosen_model = match model {
+                "" | "gemini-3.8-flash-high" | "gemini-3.8-flash-med" | "gemini-4-neon" => {
+                    "gemini-3.8-flash"
+                }
+                other => other,
             };
             let url = format!(
                 "https://generativelanguage.googleapis.com/v1beta/models/{chosen_model}:generateContent?key={api_key}"

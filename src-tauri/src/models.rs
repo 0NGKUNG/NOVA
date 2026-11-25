@@ -151,7 +151,7 @@ impl Default for NovaSettings {
             stt_provider: "groq".to_string(),
             bilingual_cleanup: true,
             default_chat_provider: "gemini".to_string(),
-            default_chat_model: "gemini-3.8-flash-high".to_string(),
+            default_chat_model: "gemini-3.8-flash".to_string(),
             active_account: "main".to_string(),
             main_account_name: "Main Account".to_string(),
             second_account_name: "Second Account".to_string(),

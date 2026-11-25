@@ -420,11 +420,8 @@ export interface AiModelOption {
 }
 
 export const AVAILABLE_MODELS: AiModelOption[] = [
-  { id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High Thinking)", provider: "gemini", badge: "3.8 Flash", thinking: true },
-  { id: "gemini-3.8-flash-med", name: "Gemini 3.8 Flash (Med Thinking)", provider: "gemini", badge: "3.8 Med", thinking: true },
-  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "gemini", badge: "2.5 Flash" },
-  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "gemini", badge: "2.5 Pro" },
-  { id: "gemini-4-neon", name: "Gemini 4 Neon", provider: "gemini", badge: "4 Neon" },
+  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", provider: "gemini", badge: "3.8 Flash" },
+  { id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash-Lite", provider: "gemini", badge: "3.5 Lite" },
   { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", provider: "anthropic", badge: "Claude 3.7", thinking: true },
   { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", provider: "anthropic", badge: "Claude 3.5" },
   { id: "gpt-4o", name: "GPT-4o", provider: "openai", badge: "GPT-4o" },
