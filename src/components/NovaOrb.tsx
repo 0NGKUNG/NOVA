@@ -10,6 +10,9 @@ interface NovaOrbProps {
   state: OrbState;
   size?: number;
   activeCount?: number;
+  paused?: boolean;
+  activeRef?: React.MutableRefObject<boolean>;
+  wakeRef?: React.MutableRefObject<(() => void) | null>;
 }
 
 const AURA_COLORS: Record<OrbAura, { primary: string; secondary: string; rgb: [number, number, number] }> = {
@@ -46,12 +49,26 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
   state,
   size = 34,
   activeCount = 0,
+  paused = false,
+  activeRef,
+  wakeRef,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<OrbState>(state);
   const auraRef = useRef<OrbAura>(aura);
+  const pausedRef = useRef<boolean>(paused);
+  const resumeRenderRef = useRef<(() => void) | null>(null);
   stateRef.current = state;
   auraRef.current = aura;
+  pausedRef.current = paused;
+
+  const isOrbPaused = () => pausedRef.current || (activeRef ? !activeRef.current : false);
+
+  useEffect(() => {
+    if (!paused && (!activeRef || activeRef.current) && resumeRenderRef.current) {
+      resumeRenderRef.current();
+    }
+  }, [paused, activeRef]);
 
   // Persistent gaze & blink physics across state/aura changes so eyes never reset mid-look
   const gazeRef = useRef({
@@ -101,6 +118,9 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     let cachedCenterY = 0;
     let hasCachedCenter = false;
 
+    let cachedGradientKey = "";
+    let cachedHalo: CanvasGradient | null = null;
+
     const syncCanvasCenter = (nowMs: number) => {
       const rect = canvas.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
@@ -120,8 +140,9 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     }
 
     const updateGaze = (clientX: number, clientY: number) => {
+      if (isOrbPaused()) return;
       const nowMs = performance.now();
-      if (!hasCachedCenter || nowMs - lastRectSync > 90) {
+      if (!hasCachedCenter || nowMs - lastRectSync > 1800) {
         syncCanvasCenter(nowMs);
       }
       if (!hasCachedCenter) return;
@@ -178,6 +199,10 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     };
 
     const render = () => {
+      if (isOrbPaused()) {
+        rafId = 0;
+        return;
+      }
       const curState = stateRef.current;
       const curAura = auraRef.current;
       const palette =
@@ -188,10 +213,6 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       const dtMs = Math.min(40, Math.max(1, nowMs - lastFrame));
       const dtSec = dtMs / 1000;
       lastFrame = nowMs;
-
-      if (nowMs - lastRectSync > 180) {
-        syncCanvasCenter(nowMs);
-      }
 
       const motionRate =
         curState === "alert"
@@ -238,12 +259,17 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       const cy = size / 2;
       const baseR = size * 0.34;
 
-      // Ambient aura halo
-      const halo = ctx.createRadialGradient(cx, cy, baseR * 0.15, cx, cy, size * 0.49);
-      halo.addColorStop(0, `rgba(${r}, ${green}, ${b}, 0.3)`);
-      halo.addColorStop(0.7, `rgba(${r}, ${green}, ${b}, 0.08)`);
-      halo.addColorStop(1, `rgba(${r}, ${green}, ${b}, 0)`);
-      ctx.fillStyle = halo;
+      // Ambient aura halo (cached per aura/size to avoid per-frame gradient allocation)
+      const gradKey = `${r},${green},${b},${size}`;
+      if (!cachedHalo || cachedGradientKey !== gradKey) {
+        const halo = ctx.createRadialGradient(cx, cy, baseR * 0.15, cx, cy, size * 0.49);
+        halo.addColorStop(0, `rgba(${r}, ${green}, ${b}, 0.3)`);
+        halo.addColorStop(0.7, `rgba(${r}, ${green}, ${b}, 0.08)`);
+        halo.addColorStop(1, `rgba(${r}, ${green}, ${b}, 0)`);
+        cachedHalo = halo;
+        cachedGradientKey = gradKey;
+      }
+      ctx.fillStyle = cachedHalo;
       ctx.beginPath();
       ctx.arc(cx, cy, size * 0.49, 0, Math.PI * 2);
       ctx.fill();
@@ -317,9 +343,22 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
       rafId = requestAnimationFrame(render);
     };
 
-    rafId = requestAnimationFrame(render);
+    const wake = () => {
+      if (!rafId && !isOrbPaused()) {
+        lastFrame = performance.now();
+        rafId = requestAnimationFrame(render);
+      }
+    };
+    resumeRenderRef.current = wake;
+    if (wakeRef) wakeRef.current = wake;
+
+    if (!isOrbPaused()) {
+      rafId = requestAnimationFrame(render);
+    }
     return () => {
-      cancelAnimationFrame(rafId);
+      resumeRenderRef.current = null;
+      if (wakeRef) wakeRef.current = null;
+      if (rafId) cancelAnimationFrame(rafId);
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("resize", onResize);
       unlistenPointer?.();

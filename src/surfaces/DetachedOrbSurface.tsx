@@ -29,7 +29,7 @@ export const DetachedOrbSurface: React.FC<DetachedOrbSurfaceProps> = ({ snapshot
 
   return (
     <div
-      className={`nova-detached-orb theme-${settings.theme} aura-${settings.aura}`}
+      className={`nova-detached-orb theme-${settings.theme} aura-${settings.aura} state-${orbState}`}
       onMouseDown={startDrag}
     >
       <NovaOrb

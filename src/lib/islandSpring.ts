@@ -35,15 +35,15 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
   };
 }
 
-/** Coucou signature 340ms zero-overshoot retraction curve */
-export const closeCurve: EaseFn = cubicBezier(0.45, 0, 0.2, 1);
+/** Fluid Dynamic Island zero-overshoot retraction curve (instant response, cushioned landing) */
+export const closeCurve: EaseFn = cubicBezier(0.32, 0.72, 0, 1);
 
 /** Smooth content reveal curve */
 export const revealCurve: EaseFn = cubicBezier(0.22, 1, 0.36, 1);
 
-export const ISLAND_CLOSE_MS = 340;
-export const ISLAND_OPEN_RESPONSE = 0.46;
-export const ISLAND_OPEN_DAMPING = 0.74;
+export const ISLAND_CLOSE_MS = 280;
+export const ISLAND_OPEN_RESPONSE = 0.32;
+export const ISLAND_OPEN_DAMPING = 0.78;
 
 /**
  * SwiftUI-equivalent damped harmonic oscillator integrated at 1/240s sub-steps
@@ -79,7 +79,7 @@ export class Spring {
   }
 
   get settled(): boolean {
-    return Math.abs(this.target - this.value) < 0.012 && Math.abs(this.velocity) < 0.06;
+    return Math.abs(this.target - this.value) < 0.08 && Math.abs(this.velocity) < 0.4;
   }
 
   step(dtSeconds: number): void {
@@ -164,7 +164,6 @@ export class TrackedValue {
     this.curveStartMs = nowMs;
     this.curveDurMs = Math.max(16, durationMs);
     this.spring.target = v;
-    this.spring.velocity = 0;
     this.mode = "curve";
   }
 
@@ -203,8 +202,12 @@ export class TrackedValue {
         this.mode = "idle";
       }
     } else if (this.mode === "curve") {
+      const prev = this.spring.value;
       const p = clamp((nowMs - this.curveStartMs) / this.curveDurMs, 0, 1);
-      this.spring.value = p >= 1 ? this.curveTo : lerp(this.curveFrom, this.curveTo, closeCurve(p));
+      const next = p >= 1 ? this.curveTo : lerp(this.curveFrom, this.curveTo, closeCurve(p));
+      this.spring.value = next;
+      // Track real instantaneous velocity so mid-collapse reversals hand smooth momentum to the spring
+      this.spring.velocity = dtSeconds > 0.0005 ? (next - prev) / dtSeconds : 0;
       if (p >= 1) {
         this.spring.set(this.curveTo);
         this.mode = "idle";
