@@ -40,10 +40,10 @@ test("Frontend types and UI components implement direct account switch, quota ga
   assert.ok(clientTs.includes("refreshQuota:"), "Missing refreshQuota in novaClient");
 
   const islandTsx = fs.readFileSync(path.resolve("src/surfaces/IslandSurface.tsx"), "utf8");
-  assert.ok(islandTsx.includes("nova-account-pill"), "Missing nova-account-pill in IslandSurface");
-  assert.ok(islandTsx.includes("nova-quota-pill"), "Missing nova-quota-pill in IslandSurface");
-  assert.ok(islandTsx.includes("nova-model-picker-wrap"), "Missing nova-model-picker-wrap in IslandSurface");
-  assert.ok(islandTsx.includes("nova-quota-popover"), "Missing nova-quota-popover in IslandSurface");
+  assert.ok(islandTsx.includes("nova-account-pill-mini"), "Missing Quick Chat account pill in IslandSurface");
+  assert.ok(islandTsx.includes("nova-quota-pill-mini"), "Missing Quick Chat quota pill in IslandSurface");
+  assert.ok(islandTsx.includes("nova-model-select"), "Missing Quick Chat model selector in IslandSurface");
+  assert.equal(islandTsx.includes("nova-cmd-bar-wrap"), false, "Island topbar must remain clean without bloated command bar");
 
   const hubTsx = fs.readFileSync(path.resolve("src/surfaces/HubSurface.tsx"), "utf8");
   assert.ok(hubTsx.includes("Dual Account & Real-Time Quota Manager"), "Missing Quota Manager in HubSurface");

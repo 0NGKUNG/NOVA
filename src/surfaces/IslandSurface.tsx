@@ -1,11 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle,
   Camera,
-  Check,
   CheckSquare,
-  ChevronDown,
-  ChevronRight,
   Clipboard,
   Cpu,
   ExternalLink,
@@ -15,7 +11,6 @@ import {
   Github,
   Globe,
   ImagePlus,
-  Languages,
   Layers,
   MessageSquare,
   Mic,
@@ -23,18 +18,13 @@ import {
   Pause,
   Play,
   Plus,
-  RefreshCw,
   RotateCcw,
-  Search,
   Send,
   Settings,
   SkipForward,
-  Sparkles,
   Terminal,
   Trash2,
   User,
-  Volume2,
-  VolumeX,
   X,
   Zap,
 } from "lucide-react";
@@ -48,10 +38,11 @@ import {
 } from "../types";
 import { Lang, t } from "../i18n";
 import { isTauriRuntime, novaApi } from "../lib/novaClient";
-import { playNovaCue } from "../lib/soundEngine";
+import { playNovaCue, warmNovaAudio } from "../lib/soundEngine";
 import {
   clamp,
-  ISLAND_CLOSE_MS,
+  ISLAND_CLOSE_DAMPING,
+  ISLAND_CLOSE_RESPONSE,
   ISLAND_OPEN_DAMPING,
   ISLAND_OPEN_RESPONSE,
   prefersReducedMotion,
@@ -59,6 +50,7 @@ import {
   TrackedValue,
 } from "../lib/islandSpring";
 import { NovaOrb, OrbState } from "../components/NovaOrb";
+import { SupernovaIntroOverlay } from "../components/SupernovaIntroOverlay";
 import { ApprovalCard } from "../components/ApprovalCard";
 import { DiffViewer } from "../components/DiffViewer";
 import { getPhaseLabel, SessionTelemetryView } from "../components/SessionTelemetryView";
@@ -66,7 +58,6 @@ import {
   fileToDataUrl,
   isSupportedImageFile,
   NewRunBar,
-  PermissionPill,
   SessionCockpit,
 } from "../components/SessionCockpit";
 import { VoiceRecorderPanel } from "../components/VoiceRecorderPanel";
@@ -89,6 +80,8 @@ const MIN_PILL_WIDTH = 148;
 const MAX_EXPANDED_HEIGHT = 626;
 const SHADOW_BASE_W = 880;
 const SHADOW_BASE_H = 520;
+const STARTUP_DROP_MS = 160;
+const STARTUP_UNFURL_DELAY_MS = 100;
 
 export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   snapshot,
@@ -103,7 +96,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const lang: Lang = settings.language;
 
   const [activeTab, setActiveTab] = useState<"mission" | "chat" | "voice" | "devtools">("mission");
-  const [cmdQuery, setCmdQuery] = useState("");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showNewRunDrawer, setShowNewRunDrawer] = useState(false);
 
@@ -119,29 +111,31 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     "ports"
   );
   const [newTodoText, setNewTodoText] = useState("");
-
-  // Real-time Quota, Account Switcher & Model Selector state
-  const [showQuotaPopover, setShowQuotaPopover] = useState(false);
-  const [showModelDropdown, setShowModelDropdown] = useState(false);
-  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
-  const quotaPopoverRef = useRef<HTMLDivElement | null>(null);
-  const modelDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [supernovaIntro, setSupernovaIntro] = useState<{ active: boolean; key: number }>({
+    active: false,
+    key: 0,
+  });
+  const supernovaActiveRef = useRef<boolean>(false);
+  const supernovaRevealAlphaRef = useRef<number>(1);
 
   // DOM measurement & animation refs (zero React re-renders and zero DOM layout reads during expand/collapse)
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const shadowRef = useRef<HTMLDivElement | null>(null);
   const shellRef = useRef<HTMLDivElement | null>(null);
+  const topbarRef = useRef<HTMLDivElement | null>(null);
+  const islandBodyRef = useRef<HTMLDivElement | null>(null);
   const pillLayerRef = useRef<HTMLDivElement | null>(null);
   const pillMeasureRef = useRef<HTMLDivElement | null>(null);
+  const closedStatusRef = useRef<HTMLDivElement | null>(null);
   const expandedLayerRef = useRef<HTMLDivElement | null>(null);
   const expandedMeasureRef = useRef<HTMLDivElement | null>(null);
-  const cmdInputRef = useRef<HTMLInputElement | null>(null);
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const pillOrbActiveRef = useRef<boolean>(!embeddedPreview);
   const pillOrbWakeRef = useRef<(() => void) | null>(null);
   const expOrbActiveRef = useRef<boolean>(embeddedPreview);
   const expOrbWakeRef = useRef<(() => void) | null>(null);
+  const isMorphingRef = useRef<boolean>(false);
 
   const vpSizeRef = useRef<{ w: number; h: number }>({
     w: typeof window !== "undefined" ? window.innerWidth || 900 : 900,
@@ -156,6 +150,10 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const pillWidthRef = useRef<number>(168);
   const expandedHeightRef = useRef<number>(280);
   const expandedRef = useRef<boolean>(embeddedPreview);
+  const startupIntroPlayedRef = useRef(false);
+  const startupIntroActiveRef = useRef(false);
+  const startupIntroStartedAtRef = useRef(0);
+  const startupUnfurlStartedRef = useRef(false);
   const pillHoveredRef = useRef<boolean>(false);
   const proximityRef = useRef<number>(0);
   const pointerInsideRef = useRef<boolean>(false);
@@ -274,17 +272,62 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
       const basePillW = pillWidthRef.current;
       const targetExpW = getMaxExpandedWidth();
+      const targetExpH = expandedHeightRef.current;
       const spanW = Math.max(1, targetExpW - basePillW);
-      const p = clamp((w - basePillW) / spanW, 0, 1);
+      const spanH = Math.max(1, targetExpH - PILL_HEIGHT);
+      const pw = clamp((w - basePillW) / spanW, 0, 1);
+      const ph = clamp((h - PILL_HEIGHT) / spanH, 0, 1);
       const isOpening = expandedRef.current;
+      const p = isOpening ? pw : Math.min(pw, ph);
       const isBottom = snapZoneRef.current === "bottom-dock" && !embeddedPreview;
       const { rx: shellX, ry: shellY, zone } = computeZoneRect(w, h);
+      const startupElapsed = startupIntroActiveRef.current
+        ? performance.now() - startupIntroStartedAtRef.current
+        : 0;
+      const startupDropProgress = clamp(startupElapsed / STARTUP_DROP_MS, 0, 1);
+      const startupDropOffset = startupIntroActiveRef.current
+        ? -12 * (1 - revealCurve(startupDropProgress))
+        : 0;
+      const frameShellY = shellY + startupDropOffset;
+      const wakeProx =
+        !embeddedPreview && !isOpening && !startupIntroActiveRef.current && p < 0.01
+          ? proximityRef.current
+          : 0;
+      const wakeScale = 1 + wakeProx * 0.026;
 
       shell.style.width = `${w.toFixed(2)}px`;
       shell.style.height = `${h.toFixed(2)}px`;
       shell.style.borderRadius = `${r.toFixed(2)}px`;
+      if (supernovaActiveRef.current) {
+        const rev = supernovaRevealAlphaRef.current;
+        shell.style.opacity = rev.toFixed(3);
+        shell.style.pointerEvents = rev > 0.9 ? "auto" : "none";
+      } else if (startupIntroActiveRef.current) {
+        shell.style.opacity = clamp(startupElapsed / 95, 0, 1).toFixed(3);
+        shell.style.pointerEvents = "";
+      } else {
+        if (shell.style.opacity) shell.style.opacity = "";
+        if (shell.style.pointerEvents) shell.style.pointerEvents = "";
+      }
       if (!embeddedPreview) {
-        shell.style.transform = `translate3d(${shellX.toFixed(2)}px, ${shellY.toFixed(2)}px, 0)`;
+        shell.style.transform =
+          wakeScale > 1.0005
+            ? `translate3d(${shellX.toFixed(2)}px, ${frameShellY.toFixed(2)}px, 0) scale3d(${wakeScale.toFixed(4)}, ${wakeScale.toFixed(4)}, 1)`
+            : `translate3d(${shellX.toFixed(2)}px, ${frameShellY.toFixed(2)}px, 0)`;
+      }
+
+      if (closedStatusRef.current) {
+        if (startupIntroActiveRef.current) {
+          const unfurlSpan = Math.max(24, basePillW - PILL_HEIGHT);
+          const statusProg = revealCurve(
+            clamp(((w - PILL_HEIGHT) / unfurlSpan - 0.32) / 0.68, 0, 1)
+          );
+          closedStatusRef.current.style.opacity = statusProg.toFixed(4);
+          closedStatusRef.current.style.transform = `translate3d(${((1 - statusProg) * -6).toFixed(2)}px, 0, 0)`;
+        } else if (closedStatusRef.current.style.opacity || closedStatusRef.current.style.transform) {
+          closedStatusRef.current.style.opacity = "";
+          closedStatusRef.current.style.transform = "";
+        }
       }
 
       // GPU-scaled ambient shadow quad (never crosses Blink 2x raster boundary, 0ms paint cost)
@@ -292,8 +335,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         const sx = (w + 36) / SHADOW_BASE_W;
         const sy = (h + 36) / SHADOW_BASE_H;
         const shX = shellX - 18;
-        const shY = shellY - 8;
-        const shAlpha = 0.56 + 0.44 * p;
+        const shY = frameShellY - 8;
+        const shAlpha = (0.56 + 0.44 * p) * (supernovaActiveRef.current ? supernovaRevealAlphaRef.current : 1);
         shadowRef.current.style.opacity = shAlpha.toFixed(3);
         shadowRef.current.style.transform = `translate3d(${shX.toFixed(2)}px, ${shY.toFixed(
           2
@@ -301,18 +344,25 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       }
 
       // Layer A: Constant-box Compact Pill (pure GPU translate3d + scale3d + opacity, zero flex reflow)
-      const pillFadeWindow = isOpening ? 0.26 : 0.48;
-      const pillAlpha = clamp(1 - p / pillFadeWindow, 0, 1);
+      const pillFadeWindow = isOpening ? 0.24 : 0.38;
+      const rawPillAlpha = clamp(1 - p / pillFadeWindow, 0, 1);
+      const pillAlpha = rawPillAlpha * rawPillAlpha * (3 - 2 * rawPillAlpha);
       if (pillAlpha <= 0.002) {
+        if (isOpening) pillOrbActiveRef.current = false;
         pillLayer.style.opacity = "0";
         pillLayer.style.visibility = "hidden";
         pillLayer.style.pointerEvents = "none";
       } else {
-        const pillScale = isOpening ? 1 + (1 - pillAlpha) * 0.05 : 0.945 + pillAlpha * 0.055;
-        const pillX =
-          zone === "top-left" ? 0 : zone === "top-right" ? w - basePillW : (w - basePillW) * 0.5;
-        const pillInsetY = Math.min(10, Math.max(0, (h - PILL_HEIGHT) * 0.5));
-        const pillY = isBottom ? h - PILL_HEIGHT - pillInsetY : pillInsetY;
+        const pillScale = isOpening ? 1 + (1 - pillAlpha) * 0.025 : 0.97 + pillAlpha * 0.03;
+        const pillX = startupIntroActiveRef.current
+          ? 0
+          : zone === "top-left"
+            ? 0
+            : zone === "top-right"
+              ? w - basePillW
+              : (w - basePillW) * 0.5;
+        const pillSlideY = (1 - pillAlpha) * (isBottom ? -2.5 : 2.5);
+        const pillY = (isBottom ? h - PILL_HEIGHT : 0) + pillSlideY;
         pillLayer.style.visibility = "visible";
         pillLayer.style.opacity = pillAlpha.toFixed(4);
         pillLayer.style.pointerEvents = !isOpening && p < 0.22 ? "auto" : "none";
@@ -321,27 +371,48 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         )}px, 0) scale3d(${pillScale.toFixed(4)}, ${pillScale.toFixed(4)}, 1)`;
       }
 
-      // Layer B: Unified GPU-cached Expanded Surface (single composited texture, zero nested RenderSurfaces)
+      // Layer B: Unified GPU-cached Expanded Surface (dissolves cleanly before shell walls clip content)
       if (lastAppliedExpWRef.current !== targetExpW) {
         lastAppliedExpWRef.current = targetExpW;
         expandedLayer.style.width = `${targetExpW}px`;
       }
 
       const rawExpAlpha = isOpening
-        ? clamp((p - 0.07) / 0.72, 0, 1)
-        : clamp((p - 0.28) / 0.64, 0, 1);
-      const expAlpha = isOpening ? revealCurve(rawExpAlpha) : rawExpAlpha;
+        ? clamp((p - 0.14) / 0.78, 0, 1)
+        : clamp((p - 0.48) / 0.52, 0, 1);
+      const expAlpha = isOpening
+        ? revealCurve(rawExpAlpha)
+        : rawExpAlpha * rawExpAlpha * (3 - 2 * rawExpAlpha);
+
+      if (isOpening) {
+        const headerProgress = revealCurve(clamp((p - 0.04) / 0.42, 0, 1));
+        const contentProgress = revealCurve(clamp((p - 0.24) / 0.62, 0, 1));
+        if (topbarRef.current) {
+          topbarRef.current.style.opacity = headerProgress.toFixed(4);
+          topbarRef.current.style.transform = `translate3d(0, ${((1 - headerProgress) * -4).toFixed(2)}px, 0)`;
+        }
+        if (islandBodyRef.current) {
+          islandBodyRef.current.style.opacity = contentProgress.toFixed(4);
+          islandBodyRef.current.style.transform = `translate3d(0, ${((1 - contentProgress) * 5).toFixed(2)}px, 0)`;
+        }
+      } else {
+        for (const el of [topbarRef.current, islandBodyRef.current]) {
+          if (!el) continue;
+          el.style.opacity = "";
+          el.style.transform = "";
+        }
+      }
 
       if (expAlpha <= 0.002) {
         expandedLayer.style.opacity = "0";
         expandedLayer.style.visibility = "hidden";
         expandedLayer.style.pointerEvents = "none";
       } else {
-        const expScale = isOpening ? 0.962 + 0.038 * expAlpha : 0.968 + 0.032 * expAlpha;
+        const expScale = isOpening ? 0.968 + 0.032 * expAlpha : 0.945 + 0.055 * expAlpha;
         const expShiftY = (1 - expAlpha) * (isBottom ? 6 : -6);
         const expX =
           zone === "top-left" ? 0 : zone === "top-right" ? w - targetExpW : (w - targetExpW) * 0.5;
-        const expY = (isBottom ? h - expandedHeightRef.current : 0) + expShiftY;
+        const expY = (isBottom ? h - targetExpH : 0) + expShiftY;
 
         expandedLayer.style.visibility = "visible";
         expandedLayer.style.opacity = expAlpha.toFixed(4);
@@ -351,21 +422,12 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         )}px, 0) scale3d(${expScale.toFixed(4)}, ${expScale.toFixed(4)}, 1)`;
       }
 
-      // Sync Tauri hit-rect without per-frame IPC spam:
-      // - When opening, target expanded hit-rect is already pushed once on openIsland/resize.
-      // - When collapsing, throttle updates to ~20Hz and snap cleanly to resting pill at settle.
-      if (!embeddedPreview) {
-        if (isOpening) {
-          if (!stillMoving) {
-            const { rx: tRx, ry: tRy } = computeZoneRect(targetExpW, expandedHeightRef.current);
-            pushHitRectIfNeeded(tRx, tRy, targetExpW, expandedHeightRef.current, true);
-          }
-        } else {
-          const hitW = p < 0.08 ? basePillW : w;
-          const hitH = p < 0.08 ? PILL_HEIGHT : h;
-          const { rx: hRx, ry: hRy } = computeZoneRect(hitW, hitH);
-          pushHitRectIfNeeded(hRx, hRy, hitW, hitH, !stillMoving);
-        }
+      // Sync Tauri hit-rect ONLY at transition boundaries (zero mid-animation WebView2 COM IPC stalls)
+      if (!embeddedPreview && !stillMoving) {
+        const settleW = isOpening ? targetExpW : basePillW;
+        const settleH = isOpening ? targetExpH : PILL_HEIGHT;
+        const { rx: sRx, ry: sRy } = computeZoneRect(settleW, settleH);
+        pushHitRectIfNeeded(sRx, sRy, settleW, settleH, true);
       }
     },
     [computeZoneRect, embeddedPreview, getMaxExpandedWidth, pushHitRectIfNeeded]
@@ -374,20 +436,34 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const ensurePhysicsLoop = useCallback(() => {
     if (rafIdRef.current) return;
     lastFrameMsRef.current = performance.now();
+    isMorphingRef.current = true;
     shellRef.current?.classList.add("is-morphing");
 
     const stepFrame = (now: number) => {
       const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameMsRef.current) / 1000));
       lastFrameMsRef.current = now;
 
+      if (
+        startupIntroActiveRef.current &&
+        !startupUnfurlStartedRef.current &&
+        now - startupIntroStartedAtRef.current >= STARTUP_DROP_MS + STARTUP_UNFURL_DELAY_MS
+      ) {
+        startupUnfurlStartedRef.current = true;
+        widthTrackRef.current.springTo(pillWidthRef.current, ISLAND_OPEN_RESPONSE, ISLAND_OPEN_DAMPING);
+      }
+
       widthTrackRef.current.step(dt, now);
       heightTrackRef.current.step(dt, now);
       radiusTrackRef.current.step(dt, now);
 
+      const startupStillMoving =
+        startupIntroActiveRef.current &&
+        (!startupUnfurlStartedRef.current || now - startupIntroStartedAtRef.current < STARTUP_DROP_MS);
       const stillMoving =
         widthTrackRef.current.animating ||
         heightTrackRef.current.animating ||
-        radiusTrackRef.current.animating;
+        radiusTrackRef.current.animating ||
+        startupStillMoving;
 
       applyFrameStyles(stillMoving);
 
@@ -395,7 +471,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         rafIdRef.current = window.requestAnimationFrame(stepFrame);
       } else {
         rafIdRef.current = 0;
-        shellRef.current?.classList.remove("is-morphing");
+        isMorphingRef.current = false;
+        startupIntroActiveRef.current = false;
+        shellRef.current?.classList.remove("is-morphing", "is-launching");
         // Pause the hidden NovaOrb canvas once morph settles so only 1 orb renders at rest
         pillOrbActiveRef.current = !expandedRef.current;
         expOrbActiveRef.current = expandedRef.current;
@@ -409,44 +487,29 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     (opts?: { immediate?: boolean }) => {
       const reduced = opts?.immediate || prefersReducedMotion();
       const isExp = expandedRef.current;
-      const prox = !isExp && pillHoveredRef.current ? clamp(proximityRef.current, 0.2, 1) : 0;
-      const hoverBoost = prox > 0 ? Math.round(12 * prox * 10) / 10 : 0;
-      const hoverHeightBoost = prox > 0 ? Math.round(2.5 * prox * 10) / 10 : 0;
 
-      const targetW = isExp ? getMaxExpandedWidth() : pillWidthRef.current + hoverBoost;
-      const targetH = isExp ? expandedHeightRef.current : PILL_HEIGHT + hoverHeightBoost;
-      const targetR = isExp ? EXPANDED_RADIUS : (PILL_HEIGHT + hoverHeightBoost) * 0.5;
+      // Keep resting capsule rock-steady (zero pre-hover edge bounce) and morph all 3 axes
+      // with coupled critically damped springs (ζ = 1.0) so neither expand nor collapse bounces.
+      const targetW = isExp ? getMaxExpandedWidth() : pillWidthRef.current;
+      const targetH = isExp ? expandedHeightRef.current : PILL_HEIGHT;
+      const targetR = isExp ? EXPANDED_RADIUS : PILL_RADIUS;
 
       if (reduced) {
         widthTrackRef.current.jump(targetW);
         heightTrackRef.current.jump(targetH);
         radiusTrackRef.current.jump(targetR);
-        applyFrameStyles();
+        applyFrameStyles(false);
         return;
       }
 
-      const now = performance.now();
-      if (isExp) {
-        widthTrackRef.current.springTo(targetW, ISLAND_OPEN_RESPONSE, ISLAND_OPEN_DAMPING);
-        heightTrackRef.current.morphTo(targetH, {
-          response: ISLAND_OPEN_RESPONSE,
-          damping: Math.min(0.92, ISLAND_OPEN_DAMPING + 0.05),
-          durationMs: ISLAND_CLOSE_MS,
-          nowMs: now,
-        });
-        radiusTrackRef.current.springTo(targetR, ISLAND_OPEN_RESPONSE * 0.9, 0.86);
-      } else if (
-        pillHoveredRef.current &&
-        widthTrackRef.current.value <= pillWidthRef.current + 18
-      ) {
-        widthTrackRef.current.springTo(targetW, 0.22, 0.80);
-        heightTrackRef.current.springTo(targetH, 0.22, 0.84);
-        radiusTrackRef.current.springTo(targetR, 0.22, 0.86);
-      } else {
-        widthTrackRef.current.curveTowards(targetW, ISLAND_CLOSE_MS, now);
-        heightTrackRef.current.curveTowards(targetH, ISLAND_CLOSE_MS, now);
-        radiusTrackRef.current.curveTowards(targetR, ISLAND_CLOSE_MS, now);
-      }
+      const wResponse = isExp ? 0.24 : ISLAND_CLOSE_RESPONSE;
+      const hResponse = isExp ? ISLAND_OPEN_RESPONSE : ISLAND_CLOSE_RESPONSE;
+      const rResponse = isExp ? 0.27 : ISLAND_CLOSE_RESPONSE;
+      const damping = isExp ? ISLAND_OPEN_DAMPING : ISLAND_CLOSE_DAMPING;
+
+      widthTrackRef.current.springTo(targetW, wResponse, damping);
+      heightTrackRef.current.springTo(targetH, hResponse, damping);
+      radiusTrackRef.current.springTo(targetR, rResponse, damping);
 
       ensurePhysicsLoop();
     },
@@ -454,13 +517,23 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   );
 
   const openIsland = useCallback(
-    (opts?: { focusCmd?: boolean; silent?: boolean }) => {
+    (opts?: { silent?: boolean }) => {
       if (foldTimerRef.current) {
         window.clearTimeout(foldTimerRef.current);
         foldTimerRef.current = null;
       }
 
       const alreadyOpen = expandedRef.current;
+      if (supernovaActiveRef.current) {
+        supernovaActiveRef.current = false;
+        supernovaRevealAlphaRef.current = 1;
+        setSupernovaIntro((prev) => (prev.active ? { ...prev, active: false } : prev));
+      }
+      if (startupIntroActiveRef.current) {
+        startupIntroActiveRef.current = false;
+        startupUnfurlStartedRef.current = true;
+        shellRef.current?.classList.remove("is-launching");
+      }
       expandedRef.current = true;
       pillHoveredRef.current = false;
       proximityRef.current = 1;
@@ -478,22 +551,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         }
       }
 
+      if (!alreadyOpen && !opts?.silent) {
+        playNovaCue("island_open", soundEnabledRef.current);
+      }
+
       retargetGeometry();
 
       if (!alreadyOpen) {
-        if (!opts?.silent) {
-          window.setTimeout(() => playNovaCue("island_open", soundEnabledRef.current), 0);
-        }
         // Defer background telemetry/port refresh until AFTER the spring settles so Frame 0 stays 100% stutter-free
         if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = window.setTimeout(() => {
           refreshTimerRef.current = null;
           if (expandedRef.current) onRefreshSystem();
         }, 460);
-      }
-
-      if (opts?.focusCmd) {
-        window.setTimeout(() => cmdInputRef.current?.focus(), 60);
       }
     },
     [
@@ -525,24 +595,32 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       expandedRef.current = false;
       pillHoveredRef.current = false;
       proximityRef.current = 0;
+      // Freeze the outgoing expanded orb canvas immediately so expandedLayer stays a 100% static GPU texture during collapse
+      expOrbActiveRef.current = false;
       pillOrbActiveRef.current = true;
       pillOrbWakeRef.current?.();
       syncDomShellFlags();
 
-      retargetGeometry();
-
-      if (!embeddedPreview && wasOpen) {
-        void novaApi.setIslandExpanded(false, snapZoneRef.current, monitorIndexRef.current);
+      if (!embeddedPreview) {
+        const pillW = pillWidthRef.current;
+        const { rx, ry } = computeZoneRect(pillW, PILL_HEIGHT);
+        pushHitRectIfNeeded(rx, ry, pillW, PILL_HEIGHT, true);
+        if (wasOpen) {
+          void novaApi.setIslandExpanded(false, snapZoneRef.current, monitorIndexRef.current);
+        }
       }
 
       if (wasOpen && !opts?.silent) {
-        window.setTimeout(() => playNovaCue("island_close", soundEnabledRef.current), 0);
+        playNovaCue("island_close", soundEnabledRef.current);
       }
+
+      retargetGeometry();
     },
-    [embeddedPreview, retargetGeometry, syncDomShellFlags]
+    [computeZoneRect, embeddedPreview, pushHitRectIfNeeded, retargetGeometry, syncDomShellFlags]
   );
 
   const enterHover = useCallback(() => {
+    if (supernovaActiveRef.current) return;
     pointerInsideRef.current = true;
 
     if (foldTimerRef.current) {
@@ -572,7 +650,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         pillHoveredRef.current = false;
         proximityRef.current = 0;
         syncDomShellFlags();
-        retargetGeometry();
       }
       return;
     }
@@ -582,8 +659,39 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     foldTimerRef.current = window.setTimeout(() => {
       foldTimerRef.current = null;
       closeIsland();
-    }, 135);
+    }, 95);
   }, [closeIsland, retargetGeometry, syncDomShellFlags]);
+
+  // Pre-warm interactive WebAudio + WASAPI keep-alive so hover cues fire with zero cold-start delay
+  useEffect(() => {
+    if (embeddedPreview) return;
+    warmNovaAudio(settings.soundEnabled);
+  }, [embeddedPreview, settings.soundEnabled]);
+
+  // Listen for "Replay Intro" trigger from Settings Hub
+  useEffect(() => {
+    if (embeddedPreview) return;
+    let unlisten: (() => void) | undefined;
+    void novaApi
+      .onReplayIntro(() => {
+        if (expandedRef.current) {
+          closeIsland({ force: true, silent: true });
+        }
+        widthTrackRef.current.jump(pillWidthRef.current);
+        heightTrackRef.current.jump(PILL_HEIGHT);
+        radiusTrackRef.current.jump(PILL_RADIUS);
+        supernovaActiveRef.current = true;
+        supernovaRevealAlphaRef.current = 0;
+        applyFrameStyles(false);
+        setSupernovaIntro((prev) => ({ active: true, key: prev.key + 1 }));
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => {
+      unlisten?.();
+    };
+  }, [applyFrameStyles, closeIsland, embeddedPreview]);
 
   // Measure natural pill width & expanded content height continuously via ResizeObserver
   useLayoutEffect(() => {
@@ -600,7 +708,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       if (Math.abs(measured - pillWidthRef.current) >= 1) {
         const firstMeasure = pillWidthRef.current === 168 && !widthTrackRef.current.animating;
         pillWidthRef.current = measured;
-        if (!expandedRef.current) {
+        if (!expandedRef.current && !startupIntroActiveRef.current) {
           retargetGeometry({ immediate: firstMeasure });
         }
       }
@@ -609,8 +717,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     const syncExpandedHeight = () => {
       if (!expEl) return;
       const rawH = Math.ceil(expEl.offsetHeight);
-      const minH = cmdQuery.trim().length > 0 ? 310 : 180;
-      const clampedH = clamp(rawH, minH, MAX_EXPANDED_HEIGHT);
+      const clampedH = clamp(rawH, 160, MAX_EXPANDED_HEIGHT);
       if (Math.abs(clampedH - expandedHeightRef.current) >= 1) {
         expandedHeightRef.current = clampedH;
         if (expandedRef.current) {
@@ -628,6 +735,29 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     syncPillWidth();
     syncExpandedHeight();
     applyFrameStyles(false);
+
+    if (!startupIntroPlayedRef.current && !embeddedPreview) {
+      startupIntroPlayedRef.current = true;
+      const introMode = settings.startupIntro ?? "cinematic";
+      if (isTauriRuntime() && !prefersReducedMotion() && introMode !== "off") {
+        if (introMode === "cinematic") {
+          supernovaActiveRef.current = true;
+          supernovaRevealAlphaRef.current = 0;
+          applyFrameStyles(false);
+          setSupernovaIntro((prev) => ({ active: true, key: prev.key + 1 }));
+        } else {
+          startupIntroActiveRef.current = true;
+          startupUnfurlStartedRef.current = false;
+          startupIntroStartedAtRef.current = performance.now();
+          widthTrackRef.current.jump(PILL_HEIGHT);
+          heightTrackRef.current.jump(PILL_HEIGHT);
+          radiusTrackRef.current.jump(PILL_RADIUS);
+          shellRef.current?.classList.add("is-launching");
+          applyFrameStyles(true);
+          ensurePhysicsLoop();
+        }
+      }
+    }
 
     const ro = new ResizeObserver(() => {
       syncPillWidth();
@@ -652,9 +782,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     };
   }, [
     applyFrameStyles,
-    cmdQuery,
     computeZoneRect,
     embeddedPreview,
+    ensurePhysicsLoop,
     getMaxExpandedWidth,
     pushHitRectIfNeeded,
     retargetGeometry,
@@ -709,19 +839,25 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           leaveHover();
         }
 
-        // Magnetic pre-wake swell while approaching the folded capsule (`MAGNET_ZONE_PX`)
-        if (!expandedRef.current && !(suppressFullscreenRef.current && pendingCountRef.current === 0)) {
+        // Subtle GPU pre-wake scale + border highlight ONLY when resting folded (zero layout
+        // resize, zero IPC feedback loop, and never allowed to interrupt an active collapse)
+        if (
+          !expandedRef.current &&
+          !isMorphingRef.current &&
+          !startupIntroActiveRef.current &&
+          !(suppressFullscreenRef.current && pendingCountRef.current === 0)
+        ) {
           const nextProx = clamp(proximity, 0, 1);
-          const nextNear = nextProx > 0.04;
-          const prevNear = pillHoveredRef.current;
-          const delta = Math.abs(nextProx - proximityRef.current);
-          if (nextNear !== prevNear || (nextNear && delta >= 0.08)) {
-            proximityRef.current = nextNear ? nextProx : 0;
+          const nextNear = nextProx > 0.12;
+          const gatedProx = nextNear ? nextProx : 0;
+          if (Math.abs(gatedProx - proximityRef.current) > 0.012 || (gatedProx === 0 && proximityRef.current !== 0)) {
+            proximityRef.current = gatedProx;
+            applyFrameStyles(false);
+          }
+          if (nextNear !== pillHoveredRef.current) {
+            if (nextNear) warmNovaAudio(soundEnabledRef.current);
             pillHoveredRef.current = nextNear;
             syncDomShellFlags();
-            retargetGeometry();
-          } else if (nextNear) {
-            proximityRef.current = nextProx;
           }
         }
       })
@@ -732,16 +868,12 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     return () => {
       unlisten?.();
     };
-  }, [embeddedPreview, enterHover, leaveHover, retargetGeometry, syncDomShellFlags]);
+  }, [applyFrameStyles, embeddedPreview, enterHover, leaveHover, retargetGeometry, syncDomShellFlags]);
 
   // Global keyboard shortcut inside window (`Ctrl+Alt+Space` / `Ctrl+K` / `Escape`)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && expandedRef.current) {
-        if (cmdQuery) {
-          setCmdQuery("");
-          return;
-        }
         closeIsland({ force: pendingApprovals.length === 0 });
       }
       if (
@@ -749,14 +881,14 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         (e.ctrlKey && e.key.toLowerCase() === "k")
       ) {
         e.preventDefault();
-        openIsland({ focusCmd: true });
+        openIsland();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("keydown", onKey);
     };
-  }, [closeIsland, cmdQuery, openIsland, pendingApprovals.length]);
+  }, [closeIsland, openIsland, pendingApprovals.length]);
 
   const useNativePointerPoll = !embeddedPreview && isTauriRuntime();
 
@@ -775,75 +907,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     sessions.find((s) => s.conversationId === selectedSessionId) || sessions[0] || null;
 
   const activeThread = snapshot.threads[0] || null;
-
-  // Unified Command Palette fuzzy results
-  const commandMatches = useMemo(() => {
-    const q = cmdQuery.trim().toLowerCase();
-    if (!q) return [];
-    const results: Array<{ id: string; badge: string; label: string; run: () => void }> = [];
-
-    for (const s of sessions) {
-      if (
-        s.workspaceName.toLowerCase().includes(q) ||
-        (s.gitBranch ?? "").toLowerCase().includes(q)
-      ) {
-        results.push({
-          id: `sess-${s.conversationId}`,
-          badge: "WORKSPACE",
-          label: `${s.workspaceName} (${s.gitBranch || "main"}) — Focus Window`,
-          run: () => {
-            novaApi.focusSessionWindow(s.conversationId);
-            setCmdQuery("");
-          },
-        });
-      }
-    }
-
-    for (const p of ports) {
-      if (
-        String(p.port).includes(q) ||
-        p.processName.toLowerCase().includes(q) ||
-        (p.frameworkHint ?? "").toLowerCase().includes(q)
-      ) {
-        results.push({
-          id: `port-${p.port}`,
-          badge: `PORT :${p.port}`,
-          label: `Open http://localhost:${p.port} (${p.processName})`,
-          run: () => {
-            novaApi.openExternalUrl(`http://localhost:${p.port}`);
-            setCmdQuery("");
-          },
-        });
-      }
-    }
-
-    for (const cb of snapshot.clipboardHistory) {
-      if (cb.content.toLowerCase().includes(q)) {
-        results.push({
-          id: `cb-${cb.id}`,
-          badge: "CLIPBOARD",
-          label: `Copy: ${cb.preview}`,
-          run: () => {
-            novaApi.copyToClipboard(cb.content);
-            setCmdQuery("");
-          },
-        });
-      }
-    }
-
-    results.push({
-      id: "ask-ai-direct",
-      badge: "ASK NOVA AI",
-      label: `Send "${cmdQuery}" to NOVA Quick Chat`,
-      run: () => {
-        setActiveTab("chat");
-        setChatInput(cmdQuery);
-        setCmdQuery("");
-      },
-    });
-
-    return results.slice(0, 6);
-  }, [cmdQuery, sessions, ports, snapshot.clipboardHistory]);
 
   const handleSendChat = async () => {
     if (!chatInput.trim() && !snipPreview) return;
@@ -878,25 +941,15 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     return `${m}:${s}`;
   };
 
-  // Account, Quota & Model logic
+  // Account, Quota & Model logic (used in Quick Chat tab)
   const activeAccount = settings.activeAccount === "second" ? "second" : "main";
   const mainName = settings.mainAccountName || "Main Account";
   const secondName = settings.secondAccountName || "Second Account";
   const activeAccountName = activeAccount === "second" ? secondName : mainName;
 
   const quota = snapshot.quota;
-  const mainQuota = quota?.main;
-  const secondQuota = quota?.second;
-  const activeQuota = activeAccount === "second" ? secondQuota : mainQuota;
+  const activeQuota = activeAccount === "second" ? quota?.second : quota?.main;
   const quotaStatus = activeQuota?.status || "healthy";
-
-  const currentModelId = settings.defaultChatModel || "gemini-3.8-flash-high";
-  const currentModel = AVAILABLE_MODELS.find((m) => m.id === currentModelId) || {
-    id: currentModelId,
-    name: currentModelId,
-    provider: settings.defaultChatProvider || "gemini",
-    badge: currentModelId.replace("gemini-", "").replace("claude-", ""),
-  };
 
   const handleToggleAccount = async (targetAccount?: "main" | "second") => {
     const next = targetAccount ?? (activeAccount === "main" ? "second" : "main");
@@ -905,13 +958,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   };
 
   const handleRefreshQuota = async () => {
-    setQuotaRefreshing(true);
-    try {
-      await novaApi.refreshQuota();
-      playNovaCue("ready", settings.soundEnabled);
-    } finally {
-      setQuotaRefreshing(false);
-    }
+    await novaApi.refreshQuota();
+    playNovaCue("ready", settings.soundEnabled);
   };
 
   const handleSelectModel = async (modelId: string) => {
@@ -922,31 +970,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       defaultChatModel: modelId,
       defaultChatProvider: newProvider,
     });
-    setShowModelDropdown(false);
     playNovaCue("step", settings.soundEnabled);
   };
-
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (
-        quotaPopoverRef.current &&
-        !quotaPopoverRef.current.contains(target as Node) &&
-        !target?.closest(".nova-quota-trigger")
-      ) {
-        setShowQuotaPopover(false);
-      }
-      if (
-        modelDropdownRef.current &&
-        !modelDropdownRef.current.contains(target as Node) &&
-        !target?.closest(".nova-model-trigger")
-      ) {
-        setShowModelDropdown(false);
-      }
-    };
-    window.addEventListener("mousedown", handleClickOutside);
-    return () => window.removeEventListener("mousedown", handleClickOutside);
-  }, []);
 
   const effectiveZone = embeddedPreview ? "top-center" : settings.snapZone;
 
@@ -980,6 +1005,30 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       {!embeddedPreview && (
         <div ref={shadowRef} className="nova-island-shadow" aria-hidden="true" />
       )}
+      {!embeddedPreview && supernovaIntro.active && (
+        <SupernovaIntroOverlay
+          active={supernovaIntro.active}
+          runKey={supernovaIntro.key}
+          soundEnabled={settings.soundEnabled}
+          getPillMetrics={() => {
+            const w = pillWidthRef.current;
+            const { rx, ry } = computeZoneRect(w, PILL_HEIGHT);
+            return { x: rx, y: ry, w, h: PILL_HEIGHT };
+          }}
+          isBottomDock={effectiveZone === "bottom-dock"}
+          idleLabel={t(lang, "idleReady")}
+          onDockUnfurlProgress={(alpha) => {
+            supernovaRevealAlphaRef.current = alpha;
+            applyFrameStyles(false);
+          }}
+          onComplete={() => {
+            supernovaActiveRef.current = false;
+            supernovaRevealAlphaRef.current = 1;
+            applyFrameStyles(false);
+            setSupernovaIntro((prev) => ({ ...prev, active: false }));
+          }}
+        />
+      )}
       <div
         ref={shellRef}
         className={`nova-island-shell theme-${settings.theme} aura-${settings.aura} state-${orbState} ${
@@ -1005,8 +1054,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
               activeCount={activeAgentCount}
               activeRef={pillOrbActiveRef}
               wakeRef={pillOrbWakeRef}
+              morphingRef={isMorphingRef}
             />
-            <div className="nova-closed-status">
+            <div ref={closedStatusRef} className="nova-closed-status">
               <span className={`live-pulse-dot state-${orbState}`} />
               {pendingApprovals.length > 0 ? (
                 <span className="closed-alert-text">
@@ -1043,17 +1093,18 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           aria-hidden={!embeddedPreview}
         >
           <div ref={expandedMeasureRef} className="nova-expanded-inner">
-            {/* TOP HEADER + UNIFIED RAYCAST-STYLE COMMAND BAR */}
-            <div className="nova-island-topbar">
+            {/* SINGLE MERGED HEADER BAR: [Orb + NOVA] + [Tabs] on left, [Hub + Close] on right */}
+            <div ref={topbarRef} className="nova-island-topbar">
               <div className="nova-brand-cluster">
                 <NovaOrb
                   mode={settings.avatarMode}
                   aura={settings.aura}
                   state={orbState}
-                  size={32}
+                  size={28}
                   activeCount={activeAgentCount}
                   activeRef={expOrbActiveRef}
                   wakeRef={expOrbWakeRef}
+                  morphingRef={isMorphingRef}
                 />
                 <div className="nova-brand-titles">
                   <span className="nova-logo-text">NOVA</span>
@@ -1065,253 +1116,50 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                 </div>
               </div>
 
-              <div className="nova-cmd-bar-wrap">
-                <Search size={14} className="cmd-search-icon" />
-                <input
-                  ref={cmdInputRef}
-                  className="nova-cmd-input"
-                  value={cmdQuery}
-                  onChange={(e) => setCmdQuery(e.target.value)}
-                  placeholder={t(lang, "commandPlaceholder")}
-                />
-                <kbd className="nova-kbd">Ctrl+Alt+Space</kbd>
+              <div className="nova-island-nav">
+                <button
+                  className={`nova-nav-pill ${activeTab === "mission" ? "active" : ""}`}
+                  onClick={() => setActiveTab("mission")}
+                >
+                  <Layers size={13} />
+                  <span>{t(lang, "missionControl")}</span>
+                  {(pendingApprovals.length > 0 || sessions.length > 0) && (
+                    <span className={`pill-counter ${pendingApprovals.length > 0 ? "urgent" : ""}`}>
+                      {pendingApprovals.length > 0 ? `!${pendingApprovals.length}` : sessions.length}
+                    </span>
+                  )}
+                </button>
 
-                {commandMatches.length > 0 && (
-                  <div className="nova-cmd-dropdown">
-                    {commandMatches.map((item) => (
-                      <button key={item.id} className="nova-cmd-item" onClick={item.run}>
-                        <span className="cmd-item-badge">{item.badge}</span>
-                        <span className="cmd-item-label">{item.label}</span>
-                        <ChevronRight size={13} />
-                      </button>
-                    ))}
-                  </div>
-                )}
+                <button
+                  className={`nova-nav-pill ${activeTab === "chat" ? "active" : ""}`}
+                  onClick={() => setActiveTab("chat")}
+                >
+                  <MessageSquare size={13} />
+                  <span>{t(lang, "quickChat")}</span>
+                </button>
+
+                <button
+                  className={`nova-nav-pill ${activeTab === "voice" ? "active" : ""}`}
+                  onClick={() => setActiveTab("voice")}
+                >
+                  <Mic size={13} />
+                  <span>{t(lang, "voiceSuite")}</span>
+                </button>
+
+                <button
+                  className={`nova-nav-pill ${activeTab === "devtools" ? "active" : ""}`}
+                  onClick={() => {
+                    setActiveTab("devtools");
+                    onRefreshSystem();
+                  }}
+                >
+                  <Zap size={13} />
+                  <span>{t(lang, "devTools")}</span>
+                  {ports.length > 0 && <span className="pill-counter">{ports.length}</span>}
+                </button>
               </div>
 
               <div className="nova-header-controls">
-                {/* MODEL SELECTOR DROPDOWN */}
-                <div className="nova-model-picker-wrap">
-                  <button
-                    type="button"
-                    className="nova-model-btn nova-model-trigger"
-                    onClick={() => setShowModelDropdown((v) => !v)}
-                    title={lang === "th" ? `เลือกโมเดล (ปัจจุบัน: ${currentModel.name})` : `Select Model (Active: ${currentModel.name})`}
-                  >
-                    <Sparkles size={12} className="model-sparkle" />
-                    <span className="model-badge-text">{currentModel.badge}</span>
-                    <ChevronDown size={11} className={`model-caret ${showModelDropdown ? "open" : ""}`} />
-                  </button>
-
-                  {showModelDropdown && (
-                    <div ref={modelDropdownRef} className="nova-model-dropdown">
-                      <div className="model-dropdown-header">
-                        <span>{lang === "th" ? "เลือกโมเดล AI" : "Select Active Model"}</span>
-                      </div>
-                      <div className="model-dropdown-list">
-                        {AVAILABLE_MODELS.map((m) => {
-                          const isSelected = m.id === currentModelId;
-                          return (
-                            <button
-                              key={m.id}
-                              type="button"
-                              className={`nova-model-option ${isSelected ? "selected" : ""}`}
-                              onClick={() => handleSelectModel(m.id)}
-                            >
-                              <div className="model-opt-info">
-                                <span className="model-opt-name">{m.name}</span>
-                                <span className="model-opt-provider">{m.provider.toUpperCase()}</span>
-                              </div>
-                              {isSelected && <Check size={14} className="model-check-icon" />}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* DIRECT ACCOUNT SWITCHER */}
-                <div className="nova-account-switcher-wrap">
-                  <button
-                    type="button"
-                    className={`nova-account-pill ${activeAccount === "second" ? "is-second" : "is-main"}`}
-                    onClick={() => handleToggleAccount()}
-                    title={lang === "th" ? `สลับบัญชี (ปัจจุบัน: ${activeAccountName})` : `Switch Account (Active: ${activeAccountName})`}
-                  >
-                    <User size={12} className="account-icon" />
-                    <span className="account-label">{activeAccount === "second" ? "2nd" : "Main"}</span>
-                  </button>
-                </div>
-
-                {/* REAL-TIME QUOTA METER & POPOVER */}
-                <div className="nova-quota-wrap">
-                  <button
-                    type="button"
-                    className={`nova-quota-pill nova-quota-trigger status-${quotaStatus}`}
-                    onClick={() => setShowQuotaPopover((v) => !v)}
-                    title={lang === "th" ? "คลิกดูโควตาเรียลไทม์ & อัตราใช้งาน" : "Click to view real-time API quota & rate limits"}
-                  >
-                    <Gauge size={12} className="quota-icon" />
-                    <span className="quota-rpm-text">{activeQuota ? `${activeQuota.rpmUsed}/${activeQuota.rpmLimit} RPM` : "Quota"}</span>
-                    <span className={`quota-status-dot status-${quotaStatus}`} />
-                  </button>
-
-                  {showQuotaPopover && (
-                    <div ref={quotaPopoverRef} className="nova-quota-popover">
-                      <div className="quota-popover-header">
-                        <div className="quota-header-left">
-                          <span className="quota-popover-title">
-                            {lang === "th" ? "โควตาเรียลไทม์ & บัญชี" : "Real-Time Quota & Accounts"}
-                          </span>
-                          <span className="quota-active-badge">
-                            {activeAccount === "second" ? secondName : mainName} ({activeAccount.toUpperCase()})
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          className={`nova-btn-icon-refresh ${quotaRefreshing ? "spinning" : ""}`}
-                          onClick={handleRefreshQuota}
-                          title="Probe & Refresh Quota"
-                        >
-                          <RefreshCw size={12} />
-                        </button>
-                      </div>
-
-                      {/* Rate Limit Warning / Switch Advice */}
-                      {(quotaStatus === "warning" || quotaStatus === "exceeded") && (
-                        <div className="quota-alert-banner">
-                          <AlertTriangle size={14} className="quota-alert-icon" />
-                          <div className="quota-alert-content">
-                            <strong>{quotaStatus === "exceeded" ? "Rate Limit Hit (429)" : "High Quota Usage"}</strong>
-                            <p>
-                              {lang === "th"
-                                ? "สลับไปยังบัญชีสำรองทันทีเพื่อทำงานต่ออย่างราบรื่น"
-                                : "Switch to your backup account for immediate, unblocked capacity."}
-                            </p>
-                            <button
-                              type="button"
-                              className="nova-btn-switch-now"
-                              onClick={() => {
-                                handleToggleAccount();
-                                setShowQuotaPopover(false);
-                              }}
-                            >
-                              ⚡ {lang === "th" ? "สลับบัญชีเดี๋ยวนี้" : "Switch Account Now"}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Active Account Meter Details */}
-                      <div className="quota-metrics-card">
-                        <div className="quota-metric-row">
-                          <span>RPM (Requests/Min):</span>
-                          <strong>{activeQuota?.rpmUsed ?? 0} / {activeQuota?.rpmLimit ?? 15}</strong>
-                        </div>
-                        <div className="quota-progress-track">
-                          <div
-                            className={`quota-progress-fill status-${quotaStatus}`}
-                            style={{ width: `${Math.min(100, activeQuota?.percentageUsed ?? 0)}%` }}
-                          />
-                        </div>
-
-                        <div className="quota-metric-row" style={{ marginTop: 8 }}>
-                          <span>RPD (Requests/Day):</span>
-                          <strong>{activeQuota?.rpdUsed ?? 0} / {activeQuota?.rpdLimit ?? 1500}</strong>
-                        </div>
-                        <div className="quota-progress-track">
-                          <div
-                            className="quota-progress-fill daily"
-                            style={{ width: `${Math.min(100, ((activeQuota?.rpdUsed ?? 0) / (activeQuota?.rpdLimit || 1500)) * 100)}%` }}
-                          />
-                        </div>
-
-                        <div className="quota-sub-stats">
-                          <span>Tokens: {(activeQuota?.totalTokensToday ?? 0).toLocaleString()}</span>
-                          <span>
-                            {activeQuota?.resetInSeconds && activeQuota.resetInSeconds > 0
-                              ? `Reset in ${activeQuota.resetInSeconds}s`
-                              : "Healthy"}
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Account Comparison & Quick Toggle */}
-                      <div className="quota-accounts-compare">
-                        <div className="compare-header">
-                          <span>{lang === "th" ? "เปรียบเทียบบัญชี" : "Accounts Status"}</span>
-                        </div>
-                        <div className="compare-grid">
-                          <div
-                            className={`compare-card ${activeAccount === "main" ? "active" : ""}`}
-                            onClick={() => activeAccount !== "main" && handleToggleAccount("main")}
-                          >
-                            <div className="compare-card-top">
-                              <span className="compare-name">{mainName}</span>
-                              {activeAccount === "main" && <span className="active-tag">Active</span>}
-                            </div>
-                            <div className="compare-stat">
-                              {mainQuota ? `${mainQuota.rpmUsed}/${mainQuota.rpmLimit} RPM (${mainQuota.status})` : "Ready"}
-                            </div>
-                          </div>
-
-                          <div
-                            className={`compare-card ${activeAccount === "second" ? "active" : ""}`}
-                            onClick={() => activeAccount !== "second" && handleToggleAccount("second")}
-                          >
-                            <div className="compare-card-top">
-                              <span className="compare-name">{secondName}</span>
-                              {activeAccount === "second" && <span className="active-tag">Active</span>}
-                            </div>
-                            <div className="compare-stat">
-                              {secondQuota ? `${secondQuota.rpmUsed}/${secondQuota.rpmLimit} RPM (${secondQuota.status})` : (snapshot.secrets.geminiSecond ? "Ready" : "No Key")}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="quota-popover-footer">
-                        <button
-                          type="button"
-                          className="nova-link-btn"
-                          onClick={() => {
-                            setShowQuotaPopover(false);
-                            novaApi.openHubWindow();
-                          }}
-                        >
-                          ⚙️ {lang === "th" ? "ตั้งค่าคีย์ & ชื่อบัญชี" : "Configure Keys & Names in Settings"}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <PermissionPill snapshot={snapshot} session={null} />
-                <button
-                  className="nova-icon-btn"
-                  title="Switch Language (EN / ไทย)"
-                  onClick={() =>
-                    novaApi.saveSettings({
-                      ...settings,
-                      language: settings.language === "en" ? "th" : "en",
-                    })
-                  }
-                >
-                  <Languages size={14} />
-                  <span className="tiny-lang">{settings.language.toUpperCase()}</span>
-                </button>
-
-                <button
-                  className="nova-icon-btn"
-                  title={settings.soundEnabled ? "Mute Sounds" : "Unmute Sounds"}
-                  onClick={() =>
-                    novaApi.saveSettings({ ...settings, soundEnabled: !settings.soundEnabled })
-                  }
-                >
-                  {settings.soundEnabled ? <Volume2 size={14} /> : <VolumeX size={14} />}
-                </button>
-
                 {!embeddedPreview && (
                   <button
                     className="nova-icon-btn"
@@ -1335,52 +1183,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
               </div>
             </div>
 
-            {/* NAVIGATION PILLS */}
-            <div className="nova-island-nav">
-              <button
-                className={`nova-nav-pill ${activeTab === "mission" ? "active" : ""}`}
-                onClick={() => setActiveTab("mission")}
-              >
-                <Layers size={14} />
-                <span>{t(lang, "missionControl")}</span>
-                {(pendingApprovals.length > 0 || sessions.length > 0) && (
-                  <span className={`pill-counter ${pendingApprovals.length > 0 ? "urgent" : ""}`}>
-                    {pendingApprovals.length > 0 ? `!${pendingApprovals.length}` : sessions.length}
-                  </span>
-                )}
-              </button>
-
-              <button
-                className={`nova-nav-pill ${activeTab === "chat" ? "active" : ""}`}
-                onClick={() => setActiveTab("chat")}
-              >
-                <MessageSquare size={14} />
-                <span>{t(lang, "quickChat")}</span>
-              </button>
-
-              <button
-                className={`nova-nav-pill ${activeTab === "voice" ? "active" : ""}`}
-                onClick={() => setActiveTab("voice")}
-              >
-                <Mic size={14} />
-                <span>{t(lang, "voiceSuite")}</span>
-              </button>
-
-              <button
-                className={`nova-nav-pill ${activeTab === "devtools" ? "active" : ""}`}
-                onClick={() => {
-                  setActiveTab("devtools");
-                  onRefreshSystem();
-                }}
-              >
-                <Zap size={14} />
-                <span>{t(lang, "devTools")}</span>
-                <span className="pill-counter">{ports.length}</span>
-              </button>
-            </div>
-
             {/* BODY CONTENT */}
-            <div key={activeTab} className="nova-island-body nova-tab-stage">
+            <div ref={islandBodyRef} key={activeTab} className="nova-island-body nova-tab-stage">
               {/* TAB 1: MISSION CONTROL */}
               {activeTab === "mission" && (
                 <div className="nova-mission-layout">
@@ -1558,8 +1362,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                       <button
                         type="button"
                         className={`nova-quota-pill-mini status-${quotaStatus}`}
-                        onClick={() => setShowQuotaPopover((v) => !v)}
-                        title={`Quota: ${activeQuota ? `${activeQuota.rpmUsed}/${activeQuota.rpmLimit} RPM` : "Ready"}`}
+                        onClick={() => void handleRefreshQuota()}
+                        title={`Quota: ${activeQuota ? `${activeQuota.rpmUsed}/${activeQuota.rpmLimit} RPM` : "Ready"} (Click to refresh)`}
                       >
                         <Gauge size={11} />
                         <span>{activeQuota ? `${activeQuota.rpmUsed}/${activeQuota.rpmLimit}` : "Quota"}</span>

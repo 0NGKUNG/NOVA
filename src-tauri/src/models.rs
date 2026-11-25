@@ -71,6 +71,10 @@ fn default_second_account_name() -> String {
     "Second Account".to_string()
 }
 
+fn default_startup_intro() -> String {
+    "cinematic".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShortcutBinding {
@@ -87,6 +91,8 @@ pub struct NovaSettings {
     pub theme: String,        // "obsidian" | "acrylic" | "tactical"
     pub aura: String,         // "cyan" | "amber" | "violet" | "emerald"
     pub avatar_mode: String,  // "orb" | "hud"
+    #[serde(default = "default_startup_intro")]
+    pub startup_intro: String, // "cinematic" | "minimal" | "off"
     pub snap_zone: String,    // "top-center" | "top-left" | "top-right" | "bottom-dock" | "free"
     pub monitor_index: usize,
     pub follow_active_monitor: bool,
@@ -127,8 +133,9 @@ impl Default for NovaSettings {
             .unwrap_or_else(|_| "sounds".to_string());
         Self {
             theme: "obsidian".to_string(),
-            aura: "cyan".to_string(),
+            aura: "violet".to_string(),
             avatar_mode: "orb".to_string(),
+            startup_intro: default_startup_intro(),
             snap_zone: "top-center".to_string(),
             monitor_index: 0,
             follow_active_monitor: false,

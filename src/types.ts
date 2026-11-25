@@ -17,6 +17,7 @@ export interface NovaSettings {
   theme: "obsidian" | "acrylic" | "tactical";
   aura: "cyan" | "amber" | "violet" | "emerald";
   avatarMode: "orb" | "hud";
+  startupIntro?: "cinematic" | "minimal" | "off";
   snapZone: "top-center" | "top-left" | "top-right" | "bottom-dock" | "free";
   monitorIndex: number;
   followActiveMonitor: boolean;

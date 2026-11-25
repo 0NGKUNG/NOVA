@@ -13,6 +13,7 @@ interface NovaOrbProps {
   paused?: boolean;
   activeRef?: React.MutableRefObject<boolean>;
   wakeRef?: React.MutableRefObject<(() => void) | null>;
+  morphingRef?: React.MutableRefObject<boolean>;
 }
 
 const AURA_COLORS: Record<OrbAura, { primary: string; secondary: string; rgb: [number, number, number] }> = {
@@ -52,6 +53,7 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
   paused = false,
   activeRef,
   wakeRef,
+  morphingRef,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<OrbState>(state);
@@ -142,13 +144,16 @@ export const NovaOrb: React.FC<NovaOrbProps> = ({
     const updateGaze = (clientX: number, clientY: number) => {
       if (isOrbPaused()) return;
       const nowMs = performance.now();
-      if (!hasCachedCenter || nowMs - lastRectSync > 1800) {
+      // Never call getBoundingClientRect() while the island shell is actively morphing,
+      // as reading layout after style.width/height writes forces a synchronous Blink reflow.
+      if ((!hasCachedCenter || nowMs - lastRectSync > 1800) && !morphingRef?.current) {
         syncCanvasCenter(nowMs);
       }
-      if (!hasCachedCenter) return;
+      const centerX = hasCachedCenter ? cachedCenterX : (window.innerWidth || 900) * 0.5;
+      const centerY = hasCachedCenter ? cachedCenterY : 28;
 
-      const dx = clientX - cachedCenterX;
-      const dy = clientY - cachedCenterY;
+      const dx = clientX - centerX;
+      const dy = clientY - centerY;
 
       // Coucou's exact `Math.tanh` distance curve (`lookX` right +, `lookY` up +)
       g.lookX = Math.tanh(dx / 240);

@@ -1369,11 +1369,41 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
                           })
                         }
                       >
+                        <option value="violet">Singularity Violet (NOVA Signature)</option>
                         <option value="cyan">Obsidian Cyan</option>
                         <option value="amber">Supernova Amber</option>
-                        <option value="violet">Singularity Violet</option>
                         <option value="emerald">Matrix Emerald</option>
                       </select>
+                    </div>
+
+                    <div>
+                      <label className="muted-note">Startup Launch Intro</label>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <select
+                          className="nova-select"
+                          style={{ flex: 1 }}
+                          value={settings.startupIntro ?? "cinematic"}
+                          onChange={(e) =>
+                            novaApi.saveSettings({
+                              ...settings,
+                              startupIntro: e.target.value as "cinematic" | "minimal" | "off",
+                            })
+                          }
+                        >
+                          <option value="cinematic">Supernova Ignition (Default)</option>
+                          <option value="minimal">Minimal Capsule Unfurl</option>
+                          <option value="off">Off (Instant Ready)</option>
+                        </select>
+                        <button
+                          type="button"
+                          className="nova-btn nova-btn-ghost"
+                          style={{ whiteSpace: "nowrap" }}
+                          title="Replay the Supernova launch sequence on the Dynamic Island"
+                          onClick={() => void novaApi.replayLaunchIntro()}
+                        >
+                          ↻ Replay Intro
+                        </button>
+                      </div>
                     </div>
 
                     <div>

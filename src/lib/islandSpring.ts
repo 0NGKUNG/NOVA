@@ -1,11 +1,11 @@
 /**
  * NOVA Island Physics Engine
  *
- * Mirrors Coucou / SwiftUI Dynamic Island motion architecture:
- * - Expanding / growing uses a sub-stepped harmonic spring (`ω₀ = 2π / response`, `ζ = damping`)
- *   for organic elasticity, micro-overshoot, and 100% mid-flight interruptibility at any refresh rate.
- * - Collapsing / shrinking uses a 340ms timed cubic-bezier(0.45, 0, 0.2, 1) curve with zero
- *   undershoot so the folded pill never pinches smaller than its resting capsule.
+ * Critically damped (ζ = 1.0) closed-form spring architecture:
+ * - Zero overshoot when expanding on hover (edges never bounce past resting bounds).
+ * - Zero undershoot when collapsing (folded capsule never pinches smaller than rest).
+ * - Exact analytical integration for ζ ≥ 1.0 so motion is 100% C²-continuous, velocity-preserving
+ *   on mid-flight reversals, and completely frame-rate independent (60Hz / 120Hz / 240Hz).
  */
 
 export type EaseFn = (t: number) => number;
@@ -35,19 +35,21 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
   };
 }
 
-/** Fluid Dynamic Island zero-overshoot retraction curve (instant response, cushioned landing) */
-export const closeCurve: EaseFn = cubicBezier(0.32, 0.72, 0, 1);
+/** Balanced zero-overshoot ease-out curve */
+export const closeCurve: EaseFn = cubicBezier(0.25, 1, 0.5, 1);
 
 /** Smooth content reveal curve */
 export const revealCurve: EaseFn = cubicBezier(0.22, 1, 0.36, 1);
 
-export const ISLAND_CLOSE_MS = 280;
-export const ISLAND_OPEN_RESPONSE = 0.32;
-export const ISLAND_OPEN_DAMPING = 0.78;
+export const ISLAND_CLOSE_MS = 300;
+export const ISLAND_OPEN_RESPONSE = 0.30;
+export const ISLAND_OPEN_DAMPING = 1.0;
+export const ISLAND_CLOSE_RESPONSE = 0.32;
+export const ISLAND_CLOSE_DAMPING = 1.0;
 
 /**
- * SwiftUI-equivalent damped harmonic oscillator integrated at 1/240s sub-steps
- * so frame drops or 60Hz/120Hz/240Hz displays never destabilize motion.
+ * Damped harmonic oscillator with exact analytical closed-form integration at ζ = 1.0
+ * (critical damping) and 1/240s sub-stepping for underdamped modes.
  */
 export class Spring {
   value: number;
@@ -79,11 +81,35 @@ export class Spring {
   }
 
   get settled(): boolean {
-    return Math.abs(this.target - this.value) < 0.08 && Math.abs(this.velocity) < 0.4;
+    return Math.abs(this.target - this.value) < 0.04 && Math.abs(this.velocity) < 0.25;
   }
 
   step(dtSeconds: number): void {
     const safeDt = clamp(dtSeconds, 0, 0.064);
+    if (safeDt <= 0) return;
+
+    // Exact analytical closed-form solution for critically damped (ζ >= 1.0) springs:
+    // Guarantees silky bell-shaped velocity and zero edge bounce at any display refresh rate.
+    if (this.zeta >= 0.999) {
+      const e0 = this.value - this.target;
+      const v0 = this.velocity;
+      const w = this.omega * this.zeta;
+      const expTerm = Math.exp(-w * safeDt);
+      const c2 = v0 + w * e0;
+      const e1 = (e0 + c2 * safeDt) * expTerm;
+      const v1 = (v0 - w * c2 * safeDt) * expTerm;
+
+      // Guard against any external over-critical velocity ever crossing target
+      if (e0 !== 0 && e1 * e0 < 0) {
+        this.value = this.target;
+        this.velocity = 0;
+      } else {
+        this.value = this.target + e1;
+        this.velocity = v1;
+      }
+      return;
+    }
+
     const steps = Math.max(1, Math.ceil(safeDt / (1 / 240)));
     const h = safeDt / steps;
     for (let i = 0; i < steps; i++) {
@@ -97,9 +123,9 @@ export class Spring {
 }
 
 /**
- * Hybrid tracked dimension:
- * - Grows via physics spring (elastic, velocity-preserving when re-targeted mid-flight)
- * - Shrinks via smooth cubic-bezier curve (clean landing, zero undershoot)
+ * Critically damped tracked dimension:
+ * Uses unified C²-continuous spring physics for both expand and collapse so mid-flight
+ * reversals preserve momentum seamlessly with zero edge bounce and zero pinch undershoot.
  */
 export class TrackedValue {
   private spring: Spring;
@@ -140,7 +166,7 @@ export class TrackedValue {
     damping = ISLAND_OPEN_DAMPING
   ): void {
     if (Math.abs(this.spring.target - v) < 0.05 && this.mode === "spring") return;
-    if (Math.abs(this.spring.value - v) < 0.05 && Math.abs(this.spring.velocity) < 0.1) {
+    if (Math.abs(this.spring.value - v) < 0.04 && Math.abs(this.spring.velocity) < 0.1) {
       this.jump(v);
       return;
     }
@@ -155,7 +181,7 @@ export class TrackedValue {
     nowMs = performance.now()
   ): void {
     if (Math.abs(this.spring.target - v) < 0.05 && this.mode === "curve") return;
-    if (Math.abs(this.spring.value - v) < 0.05) {
+    if (Math.abs(this.spring.value - v) < 0.04) {
       this.jump(v);
       return;
     }
@@ -167,7 +193,7 @@ export class TrackedValue {
     this.mode = "curve";
   }
 
-  /** Automatically chooses spring when growing and close-curve when shrinking. */
+  /** Smoothly morphs to `v` using zero-overshoot critically damped springs in both directions. */
   morphTo(
     v: number,
     opts?: {
@@ -183,15 +209,12 @@ export class TrackedValue {
       this.curveTowards(v, opts.durationMs ?? ISLAND_CLOSE_MS, opts.nowMs);
       return;
     }
-    if (opts?.forceSpring || v >= this.spring.value) {
-      this.springTo(
-        v,
-        opts?.response ?? ISLAND_OPEN_RESPONSE,
-        opts?.damping ?? ISLAND_OPEN_DAMPING
-      );
-    } else {
-      this.curveTowards(v, opts?.durationMs ?? ISLAND_CLOSE_MS, opts?.nowMs);
-    }
+    const isGrowing = v >= this.spring.value;
+    this.springTo(
+      v,
+      opts?.response ?? (isGrowing ? ISLAND_OPEN_RESPONSE : ISLAND_CLOSE_RESPONSE),
+      opts?.damping ?? (isGrowing ? ISLAND_OPEN_DAMPING : ISLAND_CLOSE_DAMPING)
+    );
   }
 
   step(dtSeconds: number, nowMs = performance.now()): void {
@@ -206,7 +229,6 @@ export class TrackedValue {
       const p = clamp((nowMs - this.curveStartMs) / this.curveDurMs, 0, 1);
       const next = p >= 1 ? this.curveTo : lerp(this.curveFrom, this.curveTo, closeCurve(p));
       this.spring.value = next;
-      // Track real instantaneous velocity so mid-collapse reversals hand smooth momentum to the spring
       this.spring.velocity = dtSeconds > 0.0005 ? (next - prev) / dtSeconds : 0;
       if (p >= 1) {
         this.spring.set(this.curveTo);

@@ -220,21 +220,27 @@ test("Headless agy uses persistent stream-json, safe model/effort pairing, and C
   );
 });
 
-test("Dynamic Island hover uses coupled underdamped spring, magnetic proximity swell, and clean rimless silhouette", () => {
+test("Dynamic Island hover uses critically damped zero-bounce spring, smooth collapse choreography, and clean rimless silhouette", () => {
   const springTs = fs.readFileSync(path.resolve("src/lib/islandSpring.ts"), "utf8");
   assert.ok(
-    springTs.includes("ISLAND_OPEN_DAMPING = 0.78"),
-    "Island open spring must remain underdamped (< 1.0) for organic Dynamic Island micro-overshoot"
+    springTs.includes("ISLAND_OPEN_DAMPING = 1.0") &&
+      springTs.includes("ISLAND_CLOSE_DAMPING = 1.0"),
+    "Island open and close springs must be critically damped (1.0) for zero edge bounce and silky-smooth collapse"
   );
 
   const islandTsx = fs.readFileSync(path.resolve("src/surfaces/IslandSurface.tsx"), "utf8");
   assert.ok(
-    islandTsx.includes("ISLAND_OPEN_DAMPING") && !islandTsx.includes("nova-island-rim"),
-    "IslandSurface must wire ISLAND_OPEN_DAMPING without top reflective rim light"
+    islandTsx.includes("ISLAND_OPEN_DAMPING") &&
+      islandTsx.includes("ISLAND_CLOSE_DAMPING") &&
+      !islandTsx.includes("nova-island-rim"),
+    "IslandSurface must wire critically damped open/close springs without top reflective rim light"
   );
   assert.ok(
-    islandTsx.includes("proximityRef"),
-    "IslandSurface must respond to magnetic proximity approach before full contact"
+    islandTsx.includes("proximityRef") &&
+      islandTsx.includes("wakeScale") &&
+      islandTsx.includes("closedStatusRef") &&
+      islandTsx.includes("isMorphingRef"),
+    "IslandSurface must drive GPU pre-wake scale from proximityRef, fade status text cleanly during cold-boot unfurl, and guard orb layout reads while morphing"
   );
 
   const libRs = fs.readFileSync(path.resolve("src-tauri/src/lib.rs"), "utf8");
@@ -256,6 +262,20 @@ test("Dynamic Island hover uses coupled underdamped spring, magnetic proximity s
   assert.ok(
     stylesCss.includes(".nova-island-shadow") && stylesCss.includes("contain: strict"),
     "Island shell must use strict CSS containment and GPU-scaled shadow quad instead of per-frame box-shadow blur repaints"
+  );
+
+  const soundTs = fs.readFileSync(path.resolve("src/lib/soundEngine.ts"), "utf8");
+  const supernovaTsx = fs.readFileSync(
+    path.resolve("src/components/SupernovaIntroOverlay.tsx"),
+    "utf8"
+  );
+  assert.ok(
+    soundTs.includes('latencyHint: "interactive"') &&
+      soundTs.includes("syncKeepAlive") &&
+      soundTs.includes("playSupernovaBootAudio") &&
+      supernovaTsx.includes("SupernovaIntroOverlay") &&
+      !islandTsx.includes('setTimeout(() => playNovaCue('),
+    "Hover open/close sounds must fire synchronously via pre-baked interactive AudioContext and Supernova Pure 1B boot sequence must be wired"
   );
 });
 

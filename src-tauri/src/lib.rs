@@ -679,6 +679,15 @@ async fn show_hub_window(app: AppHandle) -> Result<(), String> {
     show_or_create_hub_window(app).await
 }
 
+#[tauri::command]
+fn replay_island_intro(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("island") {
+        let _ = win.show();
+        let _ = win.emit("nova-replay-intro", ());
+    }
+    Ok(())
+}
+
 pub fn run_headless() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -798,6 +807,18 @@ pub fn run() {
         return;
     }
 
+    // Keep the unfocused always-on-top Dynamic Island WebView2 overlay free from Chromium's
+    // background timer throttling and autoplay suspension so hover audio/springs fire instantly.
+    #[cfg(windows)]
+    {
+        const LOW_LATENCY_FLAGS: &str = "--autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-renderer-backgrounding";
+        let merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+            Ok(existing) if !existing.trim().is_empty() => format!("{existing} {LOW_LATENCY_FLAGS}"),
+            _ => LOW_LATENCY_FLAGS.to_string(),
+        };
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+    }
+
     // Fast single-instance wake BEFORE initializing AppCore (avoids state.json clobbering
     // and avoids Windows 127.0.0.1 vs 0.0.0.0 dual-bind collisions).
     match try_wake_existing_instance() {
@@ -853,6 +874,7 @@ pub fn run() {
             get_ipc_token,
             focus_island_window,
             show_hub_window,
+            replay_island_intro,
         ])
         .setup(move |app| {
             let ping_handle = app.handle().clone();

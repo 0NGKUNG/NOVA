@@ -1198,10 +1198,10 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
           type="button"
           className="ide-jump-bottom-btn"
           onClick={scrollToBottom}
-          title={lang === "th" ? "เลื่อนไปข้อความล่าสุด" : "Jump to latest response"}
+          aria-label={lang === "th" ? "เลื่อนไปข้อความล่าสุด" : "Jump to latest"}
+          title={lang === "th" ? "เลื่อนไปข้อความล่าสุด" : "Jump to latest"}
         >
-          <ArrowDown size={11} />
-          <span>{lang === "th" ? "ข้อความล่าสุด" : "Jump to latest"}</span>
+          <ArrowDown size={14} strokeWidth={2.2} />
         </button>
       )}
     </div>

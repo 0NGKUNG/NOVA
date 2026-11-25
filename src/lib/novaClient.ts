@@ -410,6 +410,35 @@ export const novaApi = {
     }
     window.open("/?surface=hub", "_blank");
   },
+  replayLaunchIntro: async () => {
+    window.dispatchEvent(new CustomEvent("nova-replay-intro"));
+    if (!isTauriRuntime()) return;
+    try {
+      const invoke = cachedInvoke ?? (await getTauriInvoke());
+      if (invoke) await invoke("replay_island_intro");
+    } catch {
+      // ignore
+    }
+  },
+  onReplayIntro: async (handler: () => void): Promise<() => void> => {
+    const domListener = () => handler();
+    window.addEventListener("nova-replay-intro", domListener);
+    let tauriUnlisten: (() => void) | undefined;
+    if (isTauriRuntime()) {
+      try {
+        const listen = cachedListen ?? (await getTauriListen());
+        if (listen) {
+          tauriUnlisten = await listen("nova-replay-intro", () => handler());
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return () => {
+      window.removeEventListener("nova-replay-intro", domListener);
+      tauriUnlisten?.();
+    };
+  },
 };
 
 export function connectNovaRealtime(handlers: {

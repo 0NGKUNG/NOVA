@@ -4,11 +4,12 @@
   --bg-card: #0f1628;
   --bg-elevated: #162038;
   --border-subtle: rgba(148, 163, 184, 0.14);
-  --border-accent: rgba(34, 211, 238, 0.42);
+  --border-accent: rgba(167, 139, 250, 0.45);
   --text-main: #f1f5f9;
   --text-muted: #8b9bb4;
-  --accent: #22d3ee;
-  --accent-soft: rgba(34, 211, 238, 0.14);
+  --accent: #a78bfa;
+  --accent-sub: #60a5fa;
+  --accent-soft: rgba(167, 139, 250, 0.16);
   --allow-green: #10b981;
   --deny-red: #ef4444;
   --warn-amber: #f59e0b;
@@ -193,7 +194,10 @@ html[data-surface="orb"] {
 .nova-island-topbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  min-width: 0;
 }
 .nova-brand-cluster {
   display: flex;
@@ -204,109 +208,25 @@ html[data-surface="orb"] {
 .nova-brand-titles {
   display: flex;
   flex-direction: column;
-  line-height: 1.15;
+  line-height: 1.12;
 }
 .nova-logo-text {
   font-weight: 800;
-  font-size: 14px;
+  font-size: 13px;
   letter-spacing: 0.08em;
   color: #ffffff;
 }
 .nova-sub-badge {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--accent);
-}
-
-/* COMMAND PALETTE BAR */
-.nova-cmd-bar-wrap {
-  position: relative;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  padding: 0 10px;
-  height: 34px;
-}
-.nova-cmd-bar-wrap:focus-within {
-  border-color: var(--accent);
-}
-.cmd-search-icon {
-  color: var(--text-muted);
-  margin-right: 7px;
-  flex-shrink: 0;
-}
-.nova-cmd-input {
-  flex: 1;
-  background: transparent;
-  border: none;
-  outline: none;
-  color: var(--text-main);
-  font-size: 12.5px;
-}
-.nova-kbd {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text-muted);
-  border: 1px solid var(--border-subtle);
-}
-
-.nova-cmd-dropdown {
-  position: absolute;
-  top: 38px;
-  left: 0;
-  right: 0;
-  z-index: 40;
-  background: #0b1222;
-  border: 1px solid var(--border-accent);
-  border-radius: 12px;
-  padding: 5px;
-  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.8);
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.nova-cmd-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  background: transparent;
-  border: none;
-  color: var(--text-main);
-  padding: 7px 9px;
-  border-radius: 8px;
-  cursor: pointer;
-  text-align: left;
-  font-size: 12.5px;
-}
-.nova-cmd-item:hover {
-  background: var(--accent-soft);
-}
-.cmd-item-badge {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  padding: 2px 6px;
-  border-radius: 5px;
-  background: rgba(34, 211, 238, 0.16);
-  color: var(--accent);
-}
-.cmd-item-label {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .nova-header-controls {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
 }
 .nova-icon-btn {
   display: inline-flex;
@@ -314,7 +234,8 @@ html[data-surface="orb"] {
   justify-content: center;
   gap: 3px;
   height: 28px;
-  padding: 0 7px;
+  width: 28px;
+  padding: 0;
   border-radius: 8px;
   border: 1px solid var(--border-subtle);
   background: var(--bg-card);
@@ -327,17 +248,15 @@ html[data-surface="orb"] {
   border-color: var(--border-accent);
   background: var(--accent-soft);
 }
-.tiny-lang {
-  font-size: 10px;
-  font-weight: 700;
-}
 
-/* ISLAND NAVIGATION PILLS */
+/* ISLAND NAVIGATION PILLS (INLINE IN MERGED TOPBAR) */
 .nova-island-nav {
   display: flex;
-  gap: 6px;
-  border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: 8px;
+  align-items: center;
+  gap: 4px;
+  padding-left: 12px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  min-width: 0;
 }
 .nova-nav-pill {
   display: inline-flex;
@@ -1542,12 +1461,11 @@ select:focus-visible,
 }
 
 .nova-island-nav {
-  gap: 5px;
-  border-bottom-color: var(--border-subtle);
+  gap: 4px;
 }
 
 .nova-nav-pill {
-  padding: 7px 13px;
+  padding: 6px 12px;
   border-color: transparent;
   background: transparent;
   border-radius: 999px;
@@ -1785,14 +1703,16 @@ select:focus-visible,
   overflow: hidden;
   contain: strict;
   pointer-events: auto;
-  background: #0d0d10;
-  border: 1px solid rgba(255, 255, 255, 0.125);
+  background: #0e0e11;
+  border: 1px solid rgba(255, 255, 255, 0.13);
   transform: translate3d(0, 0, 0);
   backface-visibility: hidden;
   will-change: transform;
-  transition:
-    background-color 160ms ease,
-    border-color 140ms ease;
+  transition: border-color 140ms ease;
+}
+
+.nova-island-shell.is-morphing {
+  transition: none !important;
 }
 
 .nova-island-shell.is-embedded {
@@ -1802,7 +1722,7 @@ select:focus-visible,
 }
 
 .nova-island-shell.theme-acrylic {
-  background: rgba(14, 17, 26, 0.965);
+  background: #0e111a;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
@@ -1817,20 +1737,24 @@ select:focus-visible,
 }
 
 .nova-island-shell.is-prewake {
-  border-color: rgba(255, 255, 255, 0.25);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .nova-island-shell.is-expanded {
-  background: rgba(15, 15, 18, 0.988);
+  background: #0e0e11;
   border-color: rgba(255, 255, 255, 0.15);
 }
 
+.nova-island-shell.is-launching {
+  will-change: transform, width, height, border-radius;
+}
+
 .nova-island-shell.theme-acrylic.is-expanded {
-  background: rgba(13, 17, 27, 0.97);
+  background: #0e111a;
 }
 
 .nova-island-shell.theme-tactical.is-expanded {
-  background: rgba(6, 12, 10, 0.988);
+  background: #060b09;
 }
 
 .nova-island-shell.state-alert {
@@ -1839,6 +1763,13 @@ select:focus-visible,
 
 .nova-island-shell.is-morphing * {
   scroll-behavior: auto !important;
+}
+
+.nova-island-shell.is-folded.is-morphing .nova-expanded-layer,
+.nova-island-shell.is-folded.is-morphing .nova-expanded-layer * {
+  animation-play-state: paused !important;
+  transition: none !important;
+  pointer-events: none !important;
 }
 
 /* Layer A: Constant-Box Compact Pill (pure GPU transform + opacity, zero flex resize) */
@@ -2341,28 +2272,30 @@ select:focus-visible,
 .ide-jump-bottom-btn {
   position: absolute;
   bottom: 8px;
-  right: 14px;
+  right: 12px;
   z-index: 15;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  background: var(--accent);
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: rgba(28, 30, 38, 0.94);
+  color: #e2e8f0;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 999px;
-  padding: 4px 11px;
-  font-size: 11px;
-  font-weight: 500;
   cursor: pointer;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(8px);
-  transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+  transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   animation: fadeInBottom 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .ide-jump-bottom-btn:hover {
+  background: rgba(42, 46, 56, 0.98);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #ffffff;
   transform: translateY(-1px);
-  filter: brightness(1.1);
 }
 
 @keyframes fadeInBottom {

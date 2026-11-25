@@ -100,6 +100,9 @@ export const App: React.FC = () => {
   }, [refreshSystem]);
 
   if (!snapshot) {
+    if ((surface === "island" || surface === "orb") && !bootTimedOut) {
+      return null;
+    }
     return (
       <div className="nova-boot-screen">
         <div className="boot-pulse" />
