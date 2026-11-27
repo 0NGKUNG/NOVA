@@ -356,6 +356,54 @@ export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
       continue;
     }
 
+    // Markdown table (`| col1 | col2 |` + separator `| --- | --- |`)
+    if (
+      t.startsWith("|") &&
+      i + 1 < lines.length &&
+      /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])
+    ) {
+      const splitTableCells = (row: string) =>
+        row
+          .trim()
+          .replace(/^\|/, "")
+          .replace(/\|$/, "")
+          .split("|")
+          .map((c) => c.trim());
+
+      const headers = splitTableCells(lines[i]);
+      const rows: string[][] = [];
+      i += 2; // skip header + separator line
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        rows.push(splitTableCells(lines[i]));
+        i++;
+      }
+      blocks.push(
+        <div key={`tbl-${i}`} className="md-table-wrap">
+          <table className="md-table">
+            <thead>
+              <tr>
+                {headers.map((h, hIdx) => (
+                  <th key={hIdx}>{renderInlineTokens(h, `th-${i}-${hIdx}`)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, rIdx) => (
+                <tr key={rIdx}>
+                  {headers.map((_h, cIdx) => (
+                    <td key={cIdx}>
+                      {renderInlineTokens(r[cIdx] ?? "", `td-${i}-${rIdx}-${cIdx}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
     // Fenced code block
     if (t.startsWith("```")) {
       const fenceLang = t.slice(3).trim();
@@ -418,7 +466,7 @@ export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
       continue;
     }
 
-    // Blockquote
+    // Blockquote & GitHub-style Alerts (`> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]`, `> [!CAUTION]`)
     if (t.startsWith(">")) {
       const bqLines: string[] = [];
       while (i < lines.length) {
@@ -427,11 +475,25 @@ export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
         bqLines.push(cur.replace(/^>\s?/, ""));
         i++;
       }
-      blocks.push(
-        <blockquote key={`bq-${i}`} className="md-blockquote">
-          {renderInlineTokens(bqLines.join(" "), `bq-${i}`)}
-        </blockquote>
-      );
+      const firstLine = bqLines[0] ?? "";
+      const alertMatch = firstLine.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i);
+      if (alertMatch) {
+        const kind = alertMatch[1].toLowerCase();
+        const restFirst = alertMatch[2];
+        const bodyText = [restFirst, ...bqLines.slice(1)].filter(Boolean).join(" ");
+        blocks.push(
+          <div key={`alert-${i}`} className={`md-alert md-alert-${kind}`}>
+            <span className="md-alert-tag">{alertMatch[1].toUpperCase()}</span>
+            <span className="md-alert-body">{renderInlineTokens(bodyText, `al-${i}`)}</span>
+          </div>
+        );
+      } else {
+        blocks.push(
+          <blockquote key={`bq-${i}`} className="md-blockquote">
+            {renderInlineTokens(bqLines.join(" "), `bq-${i}`)}
+          </blockquote>
+        );
+      }
       continue;
     }
 
