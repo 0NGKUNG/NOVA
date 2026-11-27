@@ -253,6 +253,7 @@ export const novaApi = {
     mode?: "auto" | "accept-edits" | "plan";
     model?: string | null;
     effort?: string;
+    agentProvider?: "agy" | "claude_code" | "codex_cli";
     imageDataUrl?: string | null;
     images?: Array<{ dataUrl: string; name?: string }>;
   }) =>

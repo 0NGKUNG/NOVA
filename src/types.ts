@@ -163,6 +163,8 @@ export interface SessionTurn {
 export interface AgentSession {
   conversationId: string;
   agent: string;
+  /** CLI runtime that NOVA launched; null for observed app-only activity. */
+  runtimeProvider?: "agy" | "claude_code" | "codex_cli" | null;
   workspacePath: string;
   workspaceName: string;
   gitBranch?: string | null;

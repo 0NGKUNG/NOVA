@@ -1,5 +1,6 @@
 use crate::agy_hooks::{inspect_antigravity_hooks, nova_data_dir};
 use crate::ai_services::{build_mobile_pairing_info, secret_presence_map, send_telegram_approval_alert};
+use crate::agents::AgentProvider;
 use crate::models::{
     AccountQuotaInfo, AgentSession, AnalyticsCounters, ApprovalRule, ChatMessage, ChatPersona,
     ChatThread, ClipboardEntry, FileDiffPreview, FocusGroup, FocusState, HookRelayResponse,
@@ -11,7 +12,7 @@ use crate::risk::{assess_tool_risk, build_file_diff_preview};
 use crate::system_tools::{
     annotate_altgr_conflicts, detect_antigravity_permission_mode, discover_recent_workspaces,
     kill_owned_child_tree, local_lan_ipv4, read_clipboard_text, resolve_agy_cli_path,
-    save_image_data_url_to_disk, spawn_headless_agy_turn,
+    save_image_data_url_to_disk,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2969,6 +2970,7 @@ impl AppCore {
                     AgentSession {
                         conversation_id: env.conversation_id.clone(),
                         agent: env.agent.clone(),
+                        runtime_provider: None,
                         workspace_path: env.workspace_path.clone(),
                         workspace_name: workspace_name.clone(),
                         git_branch: env.git_branch.clone(),
@@ -4412,6 +4414,7 @@ impl AppCore {
         mode: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
+        requested_provider: Option<&str>,
         image_data_url: Option<&str>,
         images: Option<&[(String, Option<String>)]>,
     ) -> Result<Value, String> {
@@ -4495,9 +4498,26 @@ impl AppCore {
             }
         }
 
-        // 2. Otherwise spawn/resume headless `agy.exe` silently in the background!
-        let agy_exe = resolve_agy_cli_path()
-            .ok_or_else(|| "Antigravity CLI (agy.exe) not found in %LOCALAPPDATA%\\agy\\bin".to_string())?;
+        // 2. Resolve the runtime attached to this chat (or the requested default).
+        // The session's `agent` field separately identifies app/IDE-observed activity.
+        let runtime_provider = {
+            let g = self.inner.lock().unwrap();
+            let existing_provider = conversation_id.and_then(|cid| {
+                g.sessions
+                    .iter()
+                    .find(|s| s.conversation_id == cid || s.cli_conversation_id.as_deref() == Some(cid))
+                    .and_then(|s| s.runtime_provider)
+            });
+            match existing_provider {
+                Some(provider) => provider,
+                None => AgentProvider::parse(requested_provider)?,
+            }
+        };
+        let agent_cli = crate::agents::resolve_cli_path(runtime_provider).ok_or_else(|| {
+            match runtime_provider {
+                AgentProvider::Agy => "Antigravity CLI (agy.exe) not found in %LOCALAPPDATA%\\agy\\bin".to_string(),
+            }
+        })?;
 
         let resolved_ws = {
             let g = self.inner.lock().unwrap();
@@ -4672,6 +4692,7 @@ impl AppCore {
                                 sess.status = "active".into();
                                 sess.phase = "thinking".into();
                                 sess.bg_running = true;
+                                sess.runtime_provider = Some(runtime_provider);
                                 sess.stop_requested = false;
                                 sess.last_user_input = Some(summary_prompt.clone());
                                 for prev_turn in &mut sess.turns {
@@ -4798,8 +4819,9 @@ impl AppCore {
             let _ = kill_owned_child_tree(ev_pid);
         }
 
-        let mut child = spawn_headless_agy_turn(
-            &agy_exe,
+        let mut child = crate::agents::spawn_turn(
+            runtime_provider,
+            &agent_cli,
             &dir_buf,
             resume_cli_cid.as_deref(),
             &prompt_for_agy,
@@ -4846,6 +4868,7 @@ impl AppCore {
                     sess.status = "active".into();
                     sess.phase = "thinking".into();
                     sess.bg_running = true;
+                    sess.runtime_provider = Some(runtime_provider);
                     sess.stop_requested = false;
                     sess.last_user_input = Some(summary_prompt.clone());
                     if let Some(m) = requested_display_model.clone() {
@@ -4895,6 +4918,7 @@ impl AppCore {
                     AgentSession {
                         conversation_id: pending_id.clone(),
                         agent: "antigravity".into(),
+                        runtime_provider: Some(runtime_provider),
                         workspace_path: clean_ws.clone(),
                         workspace_name: ws_name,
                         git_branch: detect_git_branch_for_dir(&clean_ws),
@@ -5660,7 +5684,7 @@ mod tests {
     use super::{
         apply_insights_to_session, clean_user_prompt, dedup_and_merge_focus_groups,
         dedup_session_diffs, hook_completion_sound, is_cli_hook_event,
-        is_nova_cli_session_origin, AgentSession,
+        is_nova_cli_session_origin, AgentProvider, AgentSession,
         FileDiffPreview, FocusGroup, SessionStep, SessionTurn, TranscriptInsights,
     };
     use crate::models::{NormalizedHookEnvelope, ProcessAncestor};
@@ -5837,6 +5861,7 @@ mod tests {
         let mut sess = AgentSession {
             conversation_id: "c1".into(),
             agent: "antigravity".into(),
+            runtime_provider: Some(AgentProvider::Agy),
             workspace_path: "c:\\repo".into(),
             workspace_name: "repo".into(),
             git_branch: None,

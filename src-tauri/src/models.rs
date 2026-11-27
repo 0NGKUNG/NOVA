@@ -408,6 +408,10 @@ pub struct SessionTurn {
 pub struct AgentSession {
     pub conversation_id: String,
     pub agent: String,
+    /// CLI runtime used to create/control this session. `None` means this is
+    /// observed app activity rather than a NOVA-managed CLI session.
+    #[serde(default)]
+    pub runtime_provider: Option<crate::agents::AgentProvider>,
     pub workspace_path: String,
     pub workspace_name: String,
     pub git_branch: Option<String>,

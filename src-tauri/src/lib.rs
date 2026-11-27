@@ -1,4 +1,5 @@
 pub mod agy_hooks;
+pub mod agents;
 pub mod ai_services;
 pub mod models;
 pub mod risk;

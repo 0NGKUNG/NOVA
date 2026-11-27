@@ -560,6 +560,7 @@ struct SessionSendReq {
     mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    agent_provider: Option<String>,
     image_data_url: Option<String>,
     images: Option<Vec<ImageAttachmentReq>>,
 }
@@ -579,6 +580,7 @@ async fn api_session_send(
         req.mode.as_deref(),
         req.model.as_deref(),
         req.effort.as_deref(),
+        req.agent_provider.as_deref(),
         req.image_data_url.as_deref(),
         image_pairs.as_deref(),
     ) {
