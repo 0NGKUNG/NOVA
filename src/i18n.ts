@@ -1,7 +1,7 @@
 export type Lang = "en" | "th";
 
 const STRINGS: Record<string, { en: string; th: string }> = {
-  missionControl: { en: "Mission Control", th: "ศูนย์ควบคุมเอเจนต์" },
+  missionControl: { en: "Workspace", th: "พื้นที่ทำงาน" },
   missionDescription: {
     en: "Monitor parallel Antigravity workspaces, subagent swarms, live file diffs, and smart approvals.",
     th: "ติดตาม Workspace ของ Antigravity, งานจาก Subagent, การเปลี่ยนแปลงไฟล์ และคำขออนุมัติได้ในที่เดียว",
@@ -13,15 +13,16 @@ const STRINGS: Record<string, { en: string; th: string }> = {
     th: "เชื่อมต่อ Antigravity เพื่อดู Workspace ที่กำลังทำงาน คำขออนุมัติ และการเปลี่ยนแปลงไฟล์ที่นี่",
   },
   setupAntigravity: { en: "Set up Antigravity", th: "ตั้งค่า Antigravity" },
-  quickChat: { en: "AI Chat & Context", th: "แชท AI & บริบทหน้าจอ" },
-  voiceSuite: { en: "Voice & Notes", th: "สั่งงานเสียง & จดประชุม" },
-  devTools: { en: "Dev & Focus", th: "เครื่องมือ Dev & โฟกัส" },
+  quickChat: { en: "Chat", th: "แชต" },
+  voiceSuite: { en: "Voice", th: "เสียง" },
+  devTools: { en: "Tools", th: "เครื่องมือ" },
   commandPlaceholder: {
     en: "Search workspaces, approve commands, kill ports, clipboard, or ask NOVA...",
     th: "ค้นหาโปรเจกต์, อนุมัติคำสั่ง, ปิดพอร์ต, คลิปบอร์ด หรือถาม NOVA...",
   },
   activeAgents: { en: "active", th: "กำลังทำงาน" },
   waitingApproval: { en: "approval waiting", th: "รออนุมัติ" },
+  waitingQuestion: { en: "question waiting", th: "รอคำตอบ" },
   idleReady: { en: "NOVA Ready", th: "NOVA พร้อมทำงาน" },
   allowOnce: { en: "Allow Once", th: "อนุญาตครั้งนี้" },
   allowSession: { en: "Allow Session", th: "อนุญาตตลอดเซสชัน" },
