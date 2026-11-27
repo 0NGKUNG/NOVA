@@ -30,6 +30,7 @@ import {
   Zap,
 } from "lucide-react";
 import {
+  AgentSession,
   AVAILABLE_MODELS,
   GitHubOverview,
   HardwareTelemetry,
@@ -102,6 +103,16 @@ const SHADOW_BASE_W = 880;
 const SHADOW_BASE_H = 520;
 const STARTUP_DROP_MS = 160;
 const STARTUP_UNFURL_DELAY_MS = 100;
+
+const isNovaCliSession = (session: AgentSession) => {
+  const transcriptPath = session.transcriptPath?.replace(/\\/g, "/").toLowerCase() ?? "";
+  const isAppTranscript = transcriptPath.includes("/.gemini/antigravity/") &&
+    !transcriptPath.includes("/.gemini/antigravity-cli/");
+  if (isAppTranscript) return false;
+  return transcriptPath.includes("/.gemini/antigravity-cli/") ||
+    Boolean(session.cliConversationId) ||
+    session.conversationId.startsWith("pending-");
+};
 
 export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   snapshot,
@@ -1459,7 +1470,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
   const allProjectPaths = [
     ...(snapshot.recentWorkspaces ?? []).map((workspace) => workspace.path),
-    ...sessions.map((session) => session.workspacePath),
+    ...sessions.filter(isNovaCliSession).map((session) => session.workspacePath),
     ...recentProjectPaths,
     ...addedWorkspacePaths,
   ].reduce<string[]>((unique, path) => {
@@ -1471,7 +1482,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     ? selectedWorkspacePath
     : projectPaths[0]) ?? "";
   const workspaceSessions = sessions.filter((session) =>
-    session.workspacePath.toLowerCase() === activeWorkspacePath.toLowerCase() && !hiddenChatIds.includes(session.conversationId)
+    session.workspacePath.toLowerCase() === activeWorkspacePath.toLowerCase() &&
+    !hiddenChatIds.includes(session.conversationId) &&
+    isNovaCliSession(session)
   );
   const selectedSession = isNewChatDraft
     ? null

@@ -1153,6 +1153,39 @@ fn discover_transcript_path(
     None
 }
 
+fn is_antigravity_cli_transcript(path: &str) -> bool {
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/.gemini/antigravity-cli/")
+}
+
+fn is_antigravity_app_transcript(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/.gemini/antigravity/")
+        && !normalized.contains("/.gemini/antigravity-cli/")
+}
+
+fn is_nova_cli_session_origin(
+    transcript_path: Option<&str>,
+    has_cli_conversation_id: bool,
+    conversation_id: &str,
+) -> bool {
+    if transcript_path.is_some_and(is_antigravity_app_transcript) {
+        return false;
+    }
+    transcript_path.is_some_and(is_antigravity_cli_transcript)
+        || has_cli_conversation_id
+        || conversation_id.starts_with("pending-")
+}
+
+fn is_cli_hook_event(env: &NormalizedHookEnvelope, transcript_path: Option<&str>) -> bool {
+    transcript_path.is_some_and(is_antigravity_cli_transcript)
+        || env.process_chain.iter().any(|process| {
+            let name = process.name.rsplit(['\\', '/']).next().unwrap_or(&process.name);
+            name.eq_ignore_ascii_case("agy.exe") || name.eq_ignore_ascii_case("agy")
+        })
+}
+
 #[derive(Default, Debug)]
 struct TranscriptInsights {
     has_explicit_turn: bool,
@@ -2479,6 +2512,13 @@ impl AppCore {
         let active_paths: Vec<String> = guard
             .sessions
             .iter()
+            .filter(|session| {
+                is_nova_cli_session_origin(
+                    session.transcript_path.as_deref(),
+                    session.cli_conversation_id.is_some(),
+                    &session.conversation_id,
+                )
+            })
             .map(|s| s.workspace_path.clone())
             .collect();
         let recent_workspaces = discover_recent_workspaces(&active_paths);
@@ -2809,6 +2849,7 @@ impl AppCore {
             env.transcript_path.as_deref(),
             &env.raw_payload,
         );
+        let cli_hook_event = is_cli_hook_event(&env, resolved_transcript.as_deref());
         let transcript_insights = if let Some(tp) = resolved_transcript.clone() {
             tokio::task::spawn_blocking(move || read_transcript_insights(&tp))
                 .await
@@ -2887,6 +2928,9 @@ impl AppCore {
                         || s.cli_conversation_id.as_deref() == Some(env.conversation_id.as_str())
                 })
                 .or_else(|| {
+                    if !cli_hook_event {
+                        return None;
+                    }
                     g.sessions.iter().position(|s| {
                         s.conversation_id.starts_with("pending-")
                             && s.workspace_path
@@ -2972,6 +3016,15 @@ impl AppCore {
 
             {
                 let sess = &mut g.sessions[idx];
+                if !cli_hook_event
+                    && resolved_transcript
+                        .as_deref()
+                        .is_some_and(is_antigravity_app_transcript)
+                {
+                    // A same-workspace app hook can arrive while a CLI run is pending.
+                    // Never let that app conversation inherit the CLI identity.
+                    sess.cli_conversation_id = None;
+                }
                 let was_finished_turn = matches!(
                     sess.status.as_str(),
                     "completed" | "error" | "idle"
@@ -5602,9 +5655,65 @@ impl AppCore {
 mod tests {
     use super::{
         apply_insights_to_session, clean_user_prompt, dedup_and_merge_focus_groups,
-        dedup_session_diffs, AgentSession, FileDiffPreview, FocusGroup, SessionStep,
-        SessionTurn, TranscriptInsights,
+        dedup_session_diffs, is_cli_hook_event, is_nova_cli_session_origin, AgentSession,
+        FileDiffPreview, FocusGroup, SessionStep, SessionTurn, TranscriptInsights,
     };
+    use crate::models::{NormalizedHookEnvelope, ProcessAncestor};
+    use serde_json::Value;
+
+    #[test]
+    fn app_transcripts_never_enter_cli_lists_even_with_a_stale_cli_link() {
+        assert!(!is_nova_cli_session_origin(
+            Some(r"C:\Users\dev\.gemini\antigravity\brain\app-id\transcript.jsonl"),
+            true,
+            "app-id"
+        ));
+        assert!(is_nova_cli_session_origin(
+            Some(r"C:\Users\dev\.gemini\antigravity-cli\brain\cli-id\transcript.jsonl"),
+            false,
+            "cli-id"
+        ));
+        assert!(is_nova_cli_session_origin(None, false, "pending-run-1"));
+        assert!(!is_nova_cli_session_origin(None, false, "app-id"));
+    }
+
+    #[test]
+    fn same_workspace_app_hook_cannot_be_mistaken_for_a_pending_cli_hook() {
+        let base = NormalizedHookEnvelope {
+            agent: "antigravity".into(),
+            event: "PreToolUse".into(),
+            conversation_id: "app-id".into(),
+            workspace_path: r"C:\work\project".into(),
+            transcript_path: None,
+            git_branch: None,
+            model_name: None,
+            last_user_input: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_args: Value::Null,
+            command_line: None,
+            target_file: None,
+            step_idx: None,
+            error: None,
+            termination_reason: None,
+            subagent_role: None,
+            process_chain: vec![ProcessAncestor { pid: 10, name: "Antigravity.exe".into() }],
+            raw_payload: Value::Null,
+        };
+        assert!(!is_cli_hook_event(
+            &base,
+            Some(r"C:\Users\dev\.gemini\antigravity\brain\app-id\transcript.jsonl")
+        ));
+        assert!(is_cli_hook_event(
+            &base,
+            Some(r"C:\Users\dev\.gemini\antigravity-cli\brain\cli-id\transcript.jsonl")
+        ));
+        let cli_process = NormalizedHookEnvelope {
+            process_chain: vec![ProcessAncestor { pid: 20, name: "agy.exe".into() }],
+            ..base
+        };
+        assert!(is_cli_hook_event(&cli_process, None));
+    }
 
     #[test]
     fn dedup_merges_transcript_and_hook_focus_groups_without_collapsing_distinct_parallel_calls() {
