@@ -48,7 +48,46 @@ pub fn sync_hook_binary() -> PathBuf {
             break;
         }
     }
+    upgrade_existing_pretool_timeout_if_installed();
     dest
+}
+
+/// Keeps an already-installed `hooks.json` `nova.PreToolUse` timeout at >=180s so interactive
+/// `ask_question` prompts in NOVA never cut off prematurely after 10s/120s.
+fn upgrade_existing_pretool_timeout_if_installed() {
+    let hooks_path = antigravity_hooks_json_path();
+    let Ok(raw) = fs::read_to_string(&hooks_path) else {
+        return;
+    };
+    if raw.trim().is_empty() {
+        return;
+    }
+    let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let mut updated = false;
+    if let Some(pre_arr) = root
+        .get_mut("nova")
+        .and_then(|n| n.get_mut("PreToolUse"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for matcher_entry in pre_arr {
+            if let Some(hooks) = matcher_entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                for hk in hooks {
+                    let cur_t = hk.get("timeout").and_then(|t| t.as_u64()).unwrap_or(0);
+                    if cur_t > 0 && cur_t < 180 {
+                        hk["timeout"] = json!(300);
+                        updated = true;
+                    }
+                }
+            }
+        }
+    }
+    if updated {
+        if let Ok(serialized) = serde_json::to_string_pretty(&root) {
+            let _ = fs::write(&hooks_path, format!("{serialized}\n"));
+        }
+    }
 }
 
 /// Ensures `%APPDATA%\Microsoft\Windows\Start Menu\Programs\NOVA.lnk` exists and points to `nova.exe`
@@ -116,7 +155,7 @@ pub fn antigravity_hooks_json_path() -> PathBuf {
 }
 
 fn build_nova_hook_group(hook_exe: &str, approve_in_island: bool) -> Value {
-    let pre_timeout = if approve_in_island { 120 } else { 10 };
+    let pre_timeout = if approve_in_island { 300 } else { 180 };
     let quoted_exe = if hook_exe.contains(' ') {
         format!("\"{hook_exe}\"")
     } else {

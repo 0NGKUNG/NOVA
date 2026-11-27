@@ -97,6 +97,8 @@ pub struct NovaSettings {
     pub monitor_index: usize,
     pub follow_active_monitor: bool,
     pub dwell_ms: u64,
+    #[serde(default)]
+    pub island_collapse_delay_ms: u64,
     pub suppress_fullscreen: bool,
     pub sound_enabled: bool,
     pub custom_sounds_dir: String,
@@ -140,6 +142,7 @@ impl Default for NovaSettings {
             monitor_index: 0,
             follow_active_monitor: false,
             dwell_ms: 100,
+            island_collapse_delay_ms: 0,
             suppress_fullscreen: true,
             sound_enabled: true,
             custom_sounds_dir: sounds_dir,
@@ -320,6 +323,55 @@ pub struct SubagentNode {
     pub started_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionItem {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub is_multi_select: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionExchange {
+    pub id: String,
+    pub questions: Vec<QuestionItem>,
+    #[serde(default)]
+    pub answers: Vec<String>,
+    #[serde(default)]
+    pub skipped: bool,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionArtifact {
+    pub path: String,
+    pub file_name: String,
+    pub summary: String,
+    #[serde(default)]
+    pub user_facing: bool,
+    #[serde(default)]
+    pub request_feedback: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingQuestion {
+    pub id: String,
+    pub conversation_id: String,
+    pub agent: String,
+    pub workspace_path: String,
+    pub workspace_name: String,
+    pub git_branch: Option<String>,
+    pub questions: Vec<QuestionItem>,
+    pub created_at: String,
+    pub expires_in_sec: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTurn {
@@ -339,6 +391,10 @@ pub struct SessionTurn {
     pub focus_groups: Vec<FocusGroup>,
     #[serde(default)]
     pub diffs: Vec<FileDiffPreview>,
+    #[serde(default)]
+    pub question_exchanges: Vec<QuestionExchange>,
+    #[serde(default)]
+    pub artifacts: Vec<SessionArtifact>,
     #[serde(default)]
     pub started_at: Option<String>,
     #[serde(default)]
@@ -372,6 +428,10 @@ pub struct AgentSession {
     pub plan_steps: Vec<PlanStepItem>,
     #[serde(default)]
     pub focus_groups: Vec<FocusGroup>,
+    #[serde(default)]
+    pub question_exchanges: Vec<QuestionExchange>,
+    #[serde(default)]
+    pub artifacts: Vec<SessionArtifact>,
     #[serde(default)]
     pub turns: Vec<SessionTurn>,
     #[serde(default)]
@@ -462,6 +522,8 @@ pub struct ChatThread {
     pub id: String,
     pub title: String,
     pub persona_id: String,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub updated_at: String,
 }
@@ -754,6 +816,8 @@ pub struct NovaSnapshot {
     pub settings: NovaSettings,
     pub sessions: Vec<AgentSession>,
     pub pending_approvals: Vec<PendingApproval>,
+    #[serde(default)]
+    pub pending_questions: Vec<PendingQuestion>,
     pub approval_rules: Vec<ApprovalRule>,
     pub threads: Vec<ChatThread>,
     pub personas: Vec<ChatPersona>,

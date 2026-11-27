@@ -75,8 +75,14 @@ test("Two-way control: routes exist and relay emits Antigravity hook contracts",
   assert.ok(stateRs.includes("CREATE_NO_WINDOW") || fs.readFileSync(path.resolve("src-tauri/src/system_tools.rs"), "utf8").includes("CREATE_NO_WINDOW"));
 
   const telemetryTsx = fs.readFileSync(path.resolve("src/components/SessionTelemetryView.tsx"), "utf8");
+  const stylesCss = fs.readFileSync(path.resolve("src/styles.css"), "utf8");
   assert.ok(telemetryTsx.includes("ExpandablePrompt"), "session prompt must render via ExpandablePrompt");
   assert.ok(telemetryTsx.includes("normalizePromptForDisplay"), "session prompt must normalize handoff context and render full prompt");
+  assert.ok(
+    telemetryTsx.includes('<div className="ide-prompt-body">{formattedPrompt}</div>') &&
+      stylesCss.includes("white-space: pre-wrap"),
+    "ExpandablePrompt must render exact user newlines and blank lines verbatim via pre-wrap instead of stripping blank lines through renderMarkdownBlocks"
+  );
 });
 
 test("Live NOVA Core enforces token auth and blocks cross-site Origin attacks", async (t) => {
@@ -306,4 +312,128 @@ test("Step logs expand inline diffs, jump to workspace+line in IDE, preserve pas
       !ideMarkdownTsx.includes("Show full response"),
     "Past turns and prompts/responses must render directly without redundant outer collapse pills"
   );
+});
+
+test("Interactive ask_question card, Artifact review cards, and live hook resolution work end-to-end", async (t) => {
+  const questionCardSrc = fs.readFileSync(path.resolve("src/components/QuestionCard.tsx"), "utf8");
+  const islandSrc = fs.readFileSync(path.resolve("src/surfaces/IslandSurface.tsx"), "utf8");
+  const hubSrc = fs.readFileSync(path.resolve("src/surfaces/HubSurface.tsx"), "utf8");
+  const mobileSrc = fs.readFileSync(path.resolve("src/surfaces/MobilePwaSurface.tsx"), "utf8");
+  const telemetrySrc = fs.readFileSync(path.resolve("src/components/SessionTelemetryView.tsx"), "utf8");
+  const serverRs = fs.readFileSync(path.resolve("src-tauri/src/server.rs"), "utf8");
+
+  assert.ok(
+    questionCardSrc.includes("nova-qcard-pager") &&
+      questionCardSrc.includes("Other (write your answer)") &&
+      questionCardSrc.includes("nova-qcard-mic-btn") &&
+      questionCardSrc.includes("nova-qcard-skip-btn") &&
+      questionCardSrc.includes("nova-qcard-continue-btn"),
+    "QuestionCard must support multi-question stepper, numbered options, Other input, mic dictation, Skip, and Continue"
+  );
+  assert.ok(
+    islandSrc.includes("<QuestionCard") &&
+      hubSrc.includes("<QuestionCard") &&
+      mobileSrc.includes("<QuestionCard"),
+    "QuestionCard must be wired across Dynamic Island, Hub, and Mobile PWA surfaces"
+  );
+  assert.ok(
+    telemetrySrc.includes("AnsweredQuestionExchangeCard") &&
+      telemetrySrc.includes("SessionArtifactsList") &&
+      telemetrySrc.includes("ide-artifact-proceed-btn"),
+    "SessionTelemetryView must render settled Q&A exchanges and interactive Artifact Proceed cards"
+  );
+  assert.ok(
+    serverRs.includes("/questions/resolve") && serverRs.includes("/workspace/read-artifact"),
+    "Backend server must expose /api/questions/resolve and /api/workspace/read-artifact"
+  );
+
+  let healthOk = false;
+  try {
+    const h = await fetch("http://127.0.0.1:47920/api/health");
+    healthOk = h.ok;
+  } catch {
+    healthOk = false;
+  }
+  if (!healthOk) {
+    t.skip("NOVA Core is not currently running on 127.0.0.1:47920");
+    return;
+  }
+
+  const tokenPath = path.join(
+    process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
+    "NOVA",
+    "ipc.token"
+  );
+  const ipcToken = fs.readFileSync(tokenPath, "utf8").trim();
+  const headers = {
+    "Content-Type": "application/json",
+    Origin: "http://tauri.localhost",
+    "X-Nova-Token": ipcToken,
+  };
+
+  const testConvId = `test-ask-question-${Date.now()}`;
+  // Fire a simulated PreToolUse `ask_question` hook event (blocks awaiting user answer in NOVA)
+  const hookPromise = fetch("http://127.0.0.1:47920/api/hook", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      agent: "antigravity",
+      event: "PreToolUse",
+      conversationId: testConvId,
+      workspacePath: path.resolve("."),
+      toolName: "ask_question",
+      toolArgs: {
+        questions: [
+          {
+            question: "Which right-side indicator fits NOVA's theme best?",
+            options: [
+              "(Recommended) Aura Waveform Bars",
+              "Cosmic NOVA Star",
+              "Active-Only Indicator",
+            ],
+            is_multi_select: false,
+          },
+          {
+            question: "Which text-appear animation do you want?",
+            options: ["Apple Blur-Glide", "Horizontal Shimmer Wipe"],
+            is_multi_select: false,
+          },
+        ],
+      },
+      processChain: [],
+      rawPayload: {},
+    }),
+  }).then((r) => r.json());
+
+  // Poll snapshot briefly until pendingQuestion is registered
+  let pendingQ = null;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    await new Promise((r) => setTimeout(r, 40));
+    const snapRes = await fetch("http://127.0.0.1:47920/api/snapshot", { headers });
+    const snap = await snapRes.json();
+    pendingQ = (snap.pendingQuestions || []).find((q) => q.conversationId === testConvId);
+    if (pendingQ) break;
+  }
+
+  assert.ok(pendingQ, "PreToolUse ask_question must register a pendingQuestion in NovaSnapshot");
+  assert.equal(pendingQ.questions.length, 2);
+
+  // Resolve the multi-question prompt via /api/questions/resolve
+  const resolveRes = await fetch("http://127.0.0.1:47920/api/questions/resolve", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      questionId: pendingQ.id,
+      answers: ["(Recommended) Aura Waveform Bars", "Apple Blur-Glide"],
+      skipped: false,
+    }),
+  });
+  assert.equal(resolveRes.status, 200);
+  const resolveBody = await resolveRes.json();
+  assert.equal(resolveBody.ok, true);
+
+  const hookReply = await hookPromise;
+  assert.equal(hookReply.decision, "deny");
+  assert.match(hookReply.reason, /A1: \(Recommended\) Aura Waveform Bars/);
+  assert.match(hookReply.reason, /A2: Apple Blur-Glide/);
 });

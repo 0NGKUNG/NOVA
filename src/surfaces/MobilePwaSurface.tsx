@@ -3,6 +3,7 @@ import { Check, FolderGit2, Send, ShieldAlert, X } from "lucide-react";
 import { NovaSnapshot } from "../types";
 import { novaApi } from "../lib/novaClient";
 import { NovaOrb } from "../components/NovaOrb";
+import { QuestionCard } from "../components/QuestionCard";
 import { DiffViewer } from "../components/DiffViewer";
 import { renderMarkdownBlocks } from "../components/IdeMarkdown";
 
@@ -14,6 +15,8 @@ export const MobilePwaSurface: React.FC<MobilePwaSurfaceProps> = ({ snapshot }) 
   const [tab, setTab] = useState<"approvals" | "sessions" | "chat">("approvals");
   const [prompt, setPrompt] = useState("");
   const activeCount = snapshot.sessions.filter((s) => s.status === "active").length;
+  const pendingQuestions = snapshot.pendingQuestions ?? [];
+  const totalWaiting = snapshot.pendingApprovals.length + pendingQuestions.length;
   const thread = snapshot.threads[0];
 
   return (
@@ -23,13 +26,13 @@ export const MobilePwaSurface: React.FC<MobilePwaSurfaceProps> = ({ snapshot }) 
           <NovaOrb
             mode="orb"
             aura={snapshot.settings.aura}
-            state={snapshot.pendingApprovals.length > 0 ? "alert" : "active"}
+            state={totalWaiting > 0 ? "alert" : "active"}
             size={34}
           />
           <div>
             <div className="nova-logo-text">NOVA Mobile Link</div>
             <div className="muted-note">
-              {snapshot.pendingApprovals.length} waiting · {activeCount} active
+              {totalWaiting} waiting · {activeCount} active
             </div>
           </div>
         </div>
@@ -40,7 +43,7 @@ export const MobilePwaSurface: React.FC<MobilePwaSurfaceProps> = ({ snapshot }) 
           className={tab === "approvals" ? "active" : ""}
           onClick={() => setTab("approvals")}
         >
-          Approvals ({snapshot.pendingApprovals.length})
+          Approvals ({totalWaiting})
         </button>
         <button
           className={tab === "sessions" ? "active" : ""}
@@ -56,8 +59,17 @@ export const MobilePwaSurface: React.FC<MobilePwaSurfaceProps> = ({ snapshot }) 
       <main className="mobile-main">
         {tab === "approvals" && (
           <div className="mobile-stack">
-            {snapshot.pendingApprovals.length === 0 ? (
-              <div className="nova-empty-card">All clear — no pending approvals on your PC.</div>
+            {pendingQuestions.map((pq) => (
+              <QuestionCard
+                key={pq.id}
+                pending={pq}
+                lang={snapshot.settings.language}
+                sttProvider={snapshot.settings.sttProvider}
+                compact
+              />
+            ))}
+            {snapshot.pendingApprovals.length === 0 && pendingQuestions.length === 0 ? (
+              <div className="nova-empty-card">All clear — no pending approvals or questions on your PC.</div>
             ) : (
               snapshot.pendingApprovals.map((a) => (
                 <div key={a.id} className="nova-approval-card">

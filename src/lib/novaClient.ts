@@ -1,5 +1,6 @@
 import {
   ApprovalRule,
+  AgyQuotaSnapshot,
   FocusState,
   GitHubOverview,
   HardwareTelemetry,
@@ -42,6 +43,8 @@ let cachedInvoke: InvokeFn | null = null;
 let cachedListen: ListenFn | null = null;
 let coreLoadPromise: Promise<InvokeFn | null> | null = null;
 let eventLoadPromise: Promise<ListenFn | null> | null = null;
+let nextIslandRectSeq = 1;
+let nextIslandExpSeq = 1;
 
 function getTauriInvoke(): Promise<InvokeFn | null> {
   if (cachedInvoke) return Promise.resolve(cachedInvoke);
@@ -218,6 +221,20 @@ export const novaApi = {
       denyReason,
     }),
 
+  resolveQuestion: (payload: {
+    questionId: string;
+    answers?: string[];
+    skipped?: boolean;
+    passthroughToIde?: boolean;
+  }) =>
+    postJson<{ ok: boolean; error?: string }>("/api/questions/resolve", payload),
+
+  readArtifact: (filePath: string, conversationId?: string | null) =>
+    postJson<{ ok: boolean; content?: string; error?: string }>("/api/workspace/read-artifact", {
+      filePath,
+      conversationId,
+    }),
+
   sendSessionPrompt: (payload: {
     workspacePath?: string;
     conversationId?: string | null;
@@ -272,12 +289,14 @@ export const novaApi = {
     postJson<{ ok: boolean; activeAccount: string }>("/api/account/switch", { account }),
   getQuota: () => getJson<RealtimeQuotaState>("/api/quota"),
   refreshQuota: () => postJson<RealtimeQuotaState>("/api/quota/refresh", {}),
+  refreshAgyQuota: () => postJson<{ ok: boolean; quota?: AgyQuotaSnapshot; updatedAt?: string; error?: string }>("/api/agy/quota/refresh", {}),
   applyAntigravityHooks: (action: "install" | "uninstall" | "disable_coucou" | "enable_coucou") =>
     postJson<{ ok: boolean; backupPath?: string; error?: string }>("/api/hooks/antigravity", { action }),
 
   sendChat: (payload: {
     threadId: string;
     content: string;
+    workspacePath?: string;
     provider?: string;
     model?: string;
     personaId?: string;
@@ -285,7 +304,8 @@ export const novaApi = {
     attachedFile?: string | null;
   }) => postJson<{ ok: boolean; reply?: string; error?: string }>("/api/chat/send", payload),
 
-  newChatThread: (personaId?: string) => postJson<{ ok: boolean; threadId: string }>("/api/chat/new", { personaId }),
+  newChatThread: (personaId?: string, workspacePath?: string) =>
+    postJson<{ ok: boolean; threadId: string }>("/api/chat/new", { personaId, workspacePath }),
   deleteChatThread: (id: string) => postJson("/api/chat/delete", { id }),
 
   captureScreenSnip: () => postJson<{ ok: boolean; dataUrl?: string; error?: string }>("/api/context/snip", {}),
@@ -337,6 +357,7 @@ export const novaApi = {
     foldedH?: number
   ) => {
     if (!isTauriRuntime()) return;
+    const seq = nextIslandExpSeq++;
     try {
       const invoke = cachedInvoke ?? (await getTauriInvoke());
       if (invoke) {
@@ -346,33 +367,54 @@ export const novaApi = {
           expanded,
           foldedW,
           foldedH,
+          seq,
         });
       }
     } catch {
       // ignore
     }
   },
-  setIslandRect: (x: number, y: number, w: number, h: number): void => {
+  setIslandRect: (
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    extraRects?: Array<{ x: number; y: number; w: number; h: number }>,
+    expanded?: boolean
+  ): void => {
     if (!isTauriRuntime()) return;
+    const seq = nextIslandRectSeq++;
+    const args = { x, y, w, h, expanded, extraRects: extraRects ?? [], seq };
     if (cachedInvoke) {
-      void cachedInvoke("set_island_rect", { x, y, w, h }).catch(() => {});
+      void cachedInvoke("set_island_rect", args).catch(() => {});
       return;
     }
     void getTauriInvoke().then((invoke) => {
-      if (invoke) void invoke("set_island_rect", { x, y, w, h }).catch(() => {});
+      if (invoke) void invoke("set_island_rect", args).catch(() => {});
     });
   },
   onIslandPointer: async (
-    handler: (payload: { inside: boolean; x: number; y: number; proximity?: number }) => void
+    handler: (payload: {
+      inside: boolean;
+      on_main?: boolean;
+      fullscreen?: boolean;
+      x: number;
+      y: number;
+      proximity?: number;
+    }) => void
   ): Promise<() => void> => {
     if (!isTauriRuntime()) return () => {};
     try {
       const listen = cachedListen ?? (await getTauriListen());
       if (!listen) return () => {};
-      const unlisten = await listen<{ inside: boolean; x: number; y: number; proximity?: number }>(
-        "nova-island-pointer",
-        (ev) => handler(ev.payload)
-      );
+      const unlisten = await listen<{
+        inside: boolean;
+        on_main?: boolean;
+        fullscreen?: boolean;
+        x: number;
+        y: number;
+        proximity?: number;
+      }>("nova-island-pointer", (ev) => handler(ev.payload));
       return unlisten;
     } catch {
       return () => {};

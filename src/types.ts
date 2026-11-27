@@ -22,6 +22,7 @@ export interface NovaSettings {
   monitorIndex: number;
   followActiveMonitor: boolean;
   dwellMs: number;
+  islandCollapseDelayMs?: number;
   suppressFullscreen: boolean;
   soundEnabled: boolean;
   customSoundsDir: string;
@@ -107,6 +108,41 @@ export interface SubagentNode {
   startedAt: string;
 }
 
+export interface QuestionItem {
+  question: string;
+  options: string[];
+  isMultiSelect?: boolean;
+}
+
+export interface QuestionExchange {
+  id: string;
+  questions: QuestionItem[];
+  answers: string[];
+  skipped?: boolean;
+  timestamp: string;
+}
+
+export interface SessionArtifact {
+  path: string;
+  fileName: string;
+  summary: string;
+  userFacing?: boolean;
+  requestFeedback?: boolean;
+  updatedAt: string;
+}
+
+export interface PendingQuestion {
+  id: string;
+  conversationId: string;
+  agent: string;
+  workspacePath: string;
+  workspaceName: string;
+  gitBranch?: string | null;
+  questions: QuestionItem[];
+  createdAt: string;
+  expiresInSec: number;
+}
+
 export interface SessionTurn {
   id: string;
   userPrompt: string;
@@ -117,6 +153,8 @@ export interface SessionTurn {
   filesTouchedCount?: number;
   focusGroups?: FocusGroup[];
   diffs?: FileDiffPreview[];
+  questionExchanges?: QuestionExchange[];
+  artifacts?: SessionArtifact[];
   startedAt?: string | null;
   completedAt?: string | null;
   isActive?: boolean;
@@ -138,6 +176,8 @@ export interface AgentSession {
   latestOutput?: string | null;
   planSteps?: PlanStepItem[];
   focusGroups?: FocusGroup[];
+  questionExchanges?: QuestionExchange[];
+  artifacts?: SessionArtifact[];
   turns?: SessionTurn[];
   transcriptPath?: string | null;
   queuedMessages?: string[];
@@ -209,6 +249,7 @@ export interface ChatThread {
   id: string;
   title: string;
   personaId: string;
+  workspacePath?: string | null;
   messages: ChatMessage[];
   updatedAt: string;
 }
@@ -435,6 +476,25 @@ export interface AgyCliModelOption {
   hint: string;
 }
 
+export interface AgyQuotaBucket {
+  id: string;
+  name: string;
+  description?: string;
+  window?: string;
+  remaining_fraction?: number;
+  reset_time?: string;
+}
+
+export interface AgyQuotaGroup {
+  name: string;
+  description?: string;
+  buckets: AgyQuotaBucket[];
+}
+
+export interface AgyQuotaSnapshot {
+  groups: AgyQuotaGroup[];
+}
+
 export const AGY_CLI_MODELS: AgyCliModelOption[] = [
   { id: "gemini-4-carbon-low", label: "4 Carbon (Low)", hint: "Fast frontier coding default" },
   { id: "gemini-4-carbon-medium", label: "4 Carbon (Med)", hint: "Balanced frontier coding" },
@@ -474,6 +534,7 @@ export interface NovaSnapshot {
   settings: NovaSettings;
   sessions: AgentSession[];
   pendingApprovals: PendingApproval[];
+  pendingQuestions?: PendingQuestion[];
   approvalRules: ApprovalRule[];
   threads: ChatThread[];
   personas: ChatPersona[];

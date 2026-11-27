@@ -3,8 +3,9 @@ use crate::ai_services::{build_mobile_pairing_info, secret_presence_map, send_te
 use crate::models::{
     AccountQuotaInfo, AgentSession, AnalyticsCounters, ApprovalRule, ChatMessage, ChatPersona,
     ChatThread, ClipboardEntry, FileDiffPreview, FocusGroup, FocusState, HookRelayResponse,
-    NormalizedHookEnvelope, NovaSettings, NovaSnapshot, PendingApproval, PlanStepItem,
-    RealtimeQuotaState, SessionStep, SessionTurn, SubagentNode, TechTerm, VoiceNote, VoiceSnippet,
+    NormalizedHookEnvelope, NovaSettings, NovaSnapshot, PendingApproval, PendingQuestion,
+    PlanStepItem, QuestionExchange, QuestionItem, RealtimeQuotaState, SessionArtifact,
+    SessionStep, SessionTurn, SubagentNode, TechTerm, VoiceNote, VoiceSnippet,
 };
 use crate::risk::{assess_tool_risk, build_file_diff_preview};
 use crate::system_tools::{
@@ -83,7 +84,9 @@ pub struct InnerState {
     pub settings: NovaSettings,
     pub sessions: Vec<AgentSession>,
     pub pending_approvals: Vec<PendingApproval>,
+    pub pending_questions: Vec<PendingQuestion>,
     pub approval_waiters: HashMap<String, oneshot::Sender<HookRelayResponse>>,
+    pub question_waiters: HashMap<String, oneshot::Sender<HookRelayResponse>>,
     pub pending_tool_diffs: HashMap<String, FileDiffPreview>,
     pub bg_pids: HashMap<String, u32>,
     pub warm_workers: HashMap<String, WarmAgyWorker>,
@@ -190,30 +193,34 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn strip_nova_prompt_wrappers(s: &str) -> String {
-    let mut cur = s.trim();
+    let mut cur = s.trim_matches(['\n', '\r']);
 
     // 1. Strip structured `<NOVA_HANDOFF_CONTEXT>...</NOVA_HANDOFF_CONTEXT>` wrapper
+    let trimmed_start = cur.trim_start();
     if let (Some(start), Some(end)) = (
-        cur.find("<NOVA_HANDOFF_CONTEXT>"),
-        cur.find("</NOVA_HANDOFF_CONTEXT>"),
+        trimmed_start.find("<NOVA_HANDOFF_CONTEXT>"),
+        trimmed_start.find("</NOVA_HANDOFF_CONTEXT>"),
     ) {
         if start == 0 && end >= start {
-            cur = cur[end + "</NOVA_HANDOFF_CONTEXT>".len()..].trim();
+            cur = trimmed_start[end + "</NOVA_HANDOFF_CONTEXT>".len()..]
+                .trim_start_matches([' ', '\t'])
+                .trim_matches(['\n', '\r']);
         }
     }
 
     // 2. Strip legacy `[Context from preceding Antigravity IDE session ...]\n\n` prefix
-    if cur.starts_with("[Context from preceding Antigravity IDE session") {
-        let summary_anchor = cur.find("Last assistant summary:").unwrap_or(0);
-        let tail = &cur[summary_anchor..];
+    let trimmed_legacy = cur.trim_start();
+    if trimmed_legacy.starts_with("[Context from preceding Antigravity IDE session") {
+        let summary_anchor = trimmed_legacy.find("Last assistant summary:").unwrap_or(0);
+        let tail = &trimmed_legacy[summary_anchor..];
         if let Some(rel_close) = tail.find("]\n\n") {
-            let after = tail[rel_close + 3..].trim();
-            if !after.is_empty() {
+            let after = tail[rel_close + 3..].trim_matches(['\n', '\r']);
+            if !after.trim().is_empty() {
                 cur = after;
             }
         } else if let Some(rel_close) = tail.find("]\n") {
-            let after = tail[rel_close + 2..].trim();
-            if !after.is_empty() {
+            let after = tail[rel_close + 2..].trim_matches(['\n', '\r']);
+            if !after.trim().is_empty() {
                 cur = after;
             }
         }
@@ -332,16 +339,13 @@ fn clean_user_prompt(raw: &str) -> Option<String> {
     let stripped = strip_nova_prompt_wrappers(extracted);
 
     let mut lines_out: Vec<&str> = Vec::new();
-    let mut blank_run = 0usize;
-    for line in stripped.trim().lines() {
+    for line in stripped.lines() {
         let rtrimmed = line.trim_end();
         if rtrimmed.trim().is_empty() {
-            blank_run += 1;
-            if blank_run <= 1 && !lines_out.is_empty() {
+            if !lines_out.is_empty() {
                 lines_out.push("");
             }
         } else {
-            blank_run = 0;
             lines_out.push(rtrimmed);
         }
     }
@@ -476,6 +480,191 @@ fn extract_plan_steps(args: &Value) -> Option<Vec<PlanStepItem>> {
         });
     }
     Some(out)
+}
+
+fn extract_question_items(args: &Value) -> Option<Vec<QuestionItem>> {
+    let raw_questions = args.get("questions")?;
+    let unwrapped = unwrap_protojson_arg(raw_questions);
+    let arr = unwrapped.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr.iter().take(12) {
+        let question = item
+            .get("question")
+            .or_else(|| item.get("header"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if question.is_empty() {
+            continue;
+        }
+        let options: Vec<String> = item
+            .get("options")
+            .map(unwrap_protojson_arg)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|opt| {
+                if let Some(s) = opt.as_str() {
+                    let t = s.trim();
+                    (!t.is_empty()).then(|| t.to_string())
+                } else if let Some(lbl) = opt.get("label").and_then(|v| v.as_str()) {
+                    let t = lbl.trim();
+                    (!t.is_empty()).then(|| t.to_string())
+                } else {
+                    None
+                }
+            })
+            .take(12)
+            .collect();
+        let is_multi_select = item
+            .get("is_multi_select")
+            .or_else(|| item.get("isMultiSelect"))
+            .or_else(|| item.get("multiSelect"))
+            .map(unwrap_protojson_arg)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(QuestionItem {
+            question: truncate_chars(question, 400),
+            options,
+            is_multi_select,
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn parse_question_result_answers(content: &str, question_count: usize) -> (Vec<String>, bool) {
+    let mut answers = vec![String::new(); question_count.max(1)];
+    let mut found_numbered = false;
+    let mut skipped = false;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("Created At:")
+            || line.starts_with("Completed At:")
+        {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("user skipped")
+            || lower.contains("skipped the question")
+            || lower == "skipped"
+        {
+            skipped = true;
+        }
+        if let Some(rest) = line.strip_prefix('A') {
+            if let Some((num_part, ans_part)) = rest.split_once(':') {
+                if let Ok(idx1) = num_part.trim().parse::<usize>() {
+                    if idx1 >= 1 && idx1 <= answers.len() {
+                        answers[idx1 - 1] = ans_part.trim().to_string();
+                        found_numbered = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_numbered && !skipped {
+        // Check if denied-hook reason carried embedded `A1:` lines or plain fallback
+        if content.to_ascii_lowercase().contains("skipped") {
+            skipped = true;
+        }
+    }
+
+    (answers, skipped)
+}
+
+fn extract_artifact_metadata(
+    tool_name: &str,
+    args: &Value,
+    target_file: Option<&str>,
+    timestamp: &str,
+) -> Option<SessionArtifact> {
+    if !matches!(
+        tool_name,
+        "write_file" | "edit_file" | "write_to_file" | "replace_file_content" | "Write" | "Edit"
+    ) {
+        return None;
+    }
+    let meta_raw = args
+        .get("ArtifactMetadata")
+        .or_else(|| args.get("artifactMetadata"))?;
+    let meta = unwrap_protojson_arg(meta_raw);
+    if !meta.is_object() {
+        return None;
+    }
+
+    let fp = target_file
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| arg_string(args, &["Path", "TargetFile", "file_path"]))?;
+    let file_name = Path::new(&fp)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fp.clone());
+
+    let summary = meta
+        .get("Summary")
+        .or_else(|| meta.get("summary"))
+        .map(unwrap_protojson_arg)
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let user_facing = meta
+        .get("UserFacing")
+        .or_else(|| meta.get("userFacing"))
+        .map(unwrap_protojson_arg)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let request_feedback = meta
+        .get("RequestFeedback")
+        .or_else(|| meta.get("requestFeedback"))
+        .map(unwrap_protojson_arg)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !user_facing && !request_feedback && summary.is_empty() {
+        return None;
+    }
+
+    Some(SessionArtifact {
+        path: fp,
+        file_name,
+        summary: truncate_chars(&summary, 1200),
+        user_facing,
+        request_feedback,
+        updated_at: timestamp.to_string(),
+    })
+}
+
+fn upsert_session_artifact(dst: &mut Vec<SessionArtifact>, incoming: SessionArtifact) {
+    let norm = normalize_path_key(&incoming.path);
+    if let Some(existing) = dst.iter_mut().find(|a| normalize_path_key(&a.path) == norm) {
+        if !incoming.summary.is_empty() {
+            existing.summary = incoming.summary;
+        }
+        existing.user_facing = incoming.user_facing;
+        existing.request_feedback = incoming.request_feedback;
+        existing.updated_at = incoming.updated_at;
+    } else {
+        dst.push(incoming);
+    }
+}
+
+fn merge_question_exchange(dst: &mut Vec<QuestionExchange>, incoming: QuestionExchange) {
+    if let Some(existing) = dst.iter_mut().find(|q| q.questions == incoming.questions) {
+        let existing_has_ans = existing.answers.iter().any(|a| !a.trim().is_empty()) || existing.skipped;
+        let incoming_has_ans = incoming.answers.iter().any(|a| !a.trim().is_empty()) || incoming.skipped;
+        if incoming_has_ans && !existing_has_ans {
+            existing.answers = incoming.answers;
+            existing.skipped = incoming.skipped;
+            existing.timestamp = incoming.timestamp;
+        }
+    } else {
+        dst.push(incoming);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -655,14 +844,19 @@ fn format_tool_step(
                 start_line: None,
             })
         }
-        "ask_question" | "AskUserQuestion" => Some(FormattedStepMeta {
-            verb: "Asked".to_string(),
-            summary: "Waiting for user answer".into(),
-            detail: None,
-            file_path: None,
-            line_range: None,
-            start_line: None,
-        }),
+        "ask_question" | "AskUserQuestion" => {
+            let summary = extract_question_items(args)
+                .and_then(|qs| qs.first().map(|q| truncate_chars(&q.question, 72)))
+                .unwrap_or_else(|| "Question for user".into());
+            Some(FormattedStepMeta {
+                verb: "Asked".to_string(),
+                summary,
+                detail: None,
+                file_path: None,
+                line_range: None,
+                start_line: None,
+            })
+        }
         other => Some(FormattedStepMeta {
             verb: "Called".to_string(),
             summary: other.replace('_', " "),
@@ -729,6 +923,8 @@ struct TranscriptInsights {
     plan_steps: Option<Vec<PlanStepItem>>,
     focus_groups: Vec<FocusGroup>,
     diffs: Vec<FileDiffPreview>,
+    question_exchanges: Vec<QuestionExchange>,
+    artifacts: Vec<SessionArtifact>,
     detected_ide_permission: Option<String>,
     turns: Vec<SessionTurn>,
 }
@@ -892,25 +1088,31 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
     let mut collected_turns: Vec<SessionTurn> = Vec::new();
     let mut current_turn: Option<SessionTurn> = None;
     let mut pending_pre_text: Option<String> = None;
+    let mut awaiting_question: Option<(Vec<QuestionItem>, String)> = None;
 
-    let finalize_turn_snapshot =
-        |turn: &mut SessionTurn, groups: &[FocusGroup], diffs: &[FileDiffPreview]| {
-            let mut turn_groups = groups.to_vec();
-            dedup_and_merge_focus_groups(&mut turn_groups);
-            let fallback_end = turn.completed_at.clone().or_else(|| turn.started_at.clone());
-            for g in &mut turn_groups {
-                if g.ended_at.is_none() {
-                    g.ended_at = fallback_end.clone();
-                }
+    let finalize_turn_snapshot = |turn: &mut SessionTurn,
+                                  groups: &[FocusGroup],
+                                  diffs: &[FileDiffPreview],
+                                  questions: &[QuestionExchange],
+                                  artifacts: &[SessionArtifact]| {
+        let mut turn_groups = groups.to_vec();
+        dedup_and_merge_focus_groups(&mut turn_groups);
+        let fallback_end = turn.completed_at.clone().or_else(|| turn.started_at.clone());
+        for g in &mut turn_groups {
+            if g.ended_at.is_none() {
+                g.ended_at = fallback_end.clone();
             }
-            let mut turn_diffs: Vec<FileDiffPreview> = diffs.iter().rev().cloned().collect();
-            dedup_session_diffs(&mut turn_diffs);
-            if !turn_diffs.is_empty() {
-                turn.files_touched_count = turn_diffs.len();
-            }
-            turn.focus_groups = turn_groups;
-            turn.diffs = turn_diffs;
-        };
+        }
+        let mut turn_diffs: Vec<FileDiffPreview> = diffs.iter().rev().cloned().collect();
+        dedup_session_diffs(&mut turn_diffs);
+        if !turn_diffs.is_empty() {
+            turn.files_touched_count = turn_diffs.len();
+        }
+        turn.focus_groups = turn_groups;
+        turn.diffs = turn_diffs;
+        turn.question_exchanges = questions.to_vec();
+        turn.artifacts = artifacts.to_vec();
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -947,7 +1149,13 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                     let effective_c = untruncated.as_deref().unwrap_or(c);
                     if let Some(cleaned) = clean_user_prompt(effective_c) {
                         if let Some(mut prev) = current_turn.take() {
-                            finalize_turn_snapshot(&mut prev, &out.focus_groups, &out.diffs);
+                            finalize_turn_snapshot(
+                                &mut prev,
+                                &out.focus_groups,
+                                &out.diffs,
+                                &out.question_exchanges,
+                                &out.artifacts,
+                            );
                             collected_turns.push(prev);
                         }
                         out.user_prompt = Some(cleaned.clone());
@@ -966,6 +1174,8 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                             files_touched_count: 0,
                             focus_groups: Vec::new(),
                             diffs: Vec::new(),
+                            question_exchanges: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: turn_ts,
                             completed_at: None,
                             is_active: false,
@@ -973,14 +1183,45 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                     }
                     // Strictly scope steps, focus groups, diffs, notes & output to the CURRENT user turn only!
                     pending_pre_text = None;
+                    awaiting_question = None;
                     out.plan_steps = None;
                     out.current_focus = None;
                     out.focus_groups.clear();
                     out.diffs.clear();
+                    out.question_exchanges.clear();
+                    out.artifacts.clear();
                     out.latest_thinking = None;
                     out.latest_output = None;
                     out.mid_process_note = None;
                 }
+            }
+            continue;
+        }
+
+        if step_type == "GENERIC" {
+            if let Some((q_items, q_ts)) = awaiting_question.take() {
+                let raw_c = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let (answers, skipped) = parse_question_result_answers(raw_c, q_items.len());
+                let ts = obj
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or(q_ts);
+                let next_qx_id = format!("qx-{}", out.question_exchanges.len() + 1);
+                merge_question_exchange(
+                    &mut out.question_exchanges,
+                    QuestionExchange {
+                        id: next_qx_id,
+                        questions: q_items,
+                        answers,
+                        skipped,
+                        timestamp: ts,
+                    },
+                );
             }
             continue;
         }
@@ -1084,6 +1325,15 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or_default();
                     let args = tc.get("args").unwrap_or(&Value::Null);
                     let call_id = tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    if matches!(name, "ask_question" | "AskUserQuestion") {
+                        if let Some(qs) = extract_question_items(args) {
+                            awaiting_question = Some((qs, step_ts.clone()));
+                        }
+                    }
+                    if let Some(art) = extract_artifact_metadata(name, args, None, &step_ts) {
+                        upsert_session_artifact(&mut out.artifacts, art);
+                    }
 
                     if name == "update_focus" {
                         if let Some(f) = extract_focus_phrase(args) {
@@ -1230,7 +1480,13 @@ fn read_transcript_insights(path_str: &str) -> Option<TranscriptInsights> {
     }
 
     if let Some(mut last) = current_turn.take() {
-        finalize_turn_snapshot(&mut last, &out.focus_groups, &out.diffs);
+        finalize_turn_snapshot(
+            &mut last,
+            &out.focus_groups,
+            &out.diffs,
+            &out.question_exchanges,
+            &out.artifacts,
+        );
         collected_turns.push(last);
     }
     let total_turns = collected_turns.len();
@@ -1466,6 +1722,12 @@ fn snapshot_logs_into_latest_turn(sess: &mut AgentSession) {
             last_turn.diffs = sess.diffs.clone();
             last_turn.files_touched_count = sess.diffs.len();
         }
+        if !sess.question_exchanges.is_empty() {
+            last_turn.question_exchanges = sess.question_exchanges.clone();
+        }
+        if !sess.artifacts.is_empty() {
+            last_turn.artifacts = sess.artifacts.clone();
+        }
         if last_turn.tool_calls_count == 0 && !last_turn.focus_groups.is_empty() {
             last_turn.tool_calls_count = last_turn.focus_groups.iter().map(|g| g.steps.len()).sum();
         }
@@ -1500,6 +1762,8 @@ fn apply_insights_to_session(
         sess.focus_groups.clear();
         sess.steps.clear();
         sess.diffs.clear();
+        sess.question_exchanges.clear();
+        sess.artifacts.clear();
         sess.plan_steps.clear();
         sess.current_focus = None;
         if sess.bg_running || ins.latest_output.is_some() {
@@ -1573,6 +1837,25 @@ fn apply_insights_to_session(
         changed = true;
     }
 
+    if !ins.question_exchanges.is_empty() {
+        let before = sess.question_exchanges.clone();
+        for qx in ins.question_exchanges {
+            merge_question_exchange(&mut sess.question_exchanges, qx);
+        }
+        if sess.question_exchanges != before {
+            changed = true;
+        }
+    }
+    if !ins.artifacts.is_empty() {
+        let before = sess.artifacts.clone();
+        for art in ins.artifacts {
+            upsert_session_artifact(&mut sess.artifacts, art);
+        }
+        if sess.artifacts != before {
+            changed = true;
+        }
+    }
+
     if allow_structural_backfill {
         if sess.focus_groups.is_empty() && !ins.focus_groups.is_empty() {
             sess.focus_groups = ins.focus_groups;
@@ -1633,11 +1916,23 @@ fn apply_insights_to_session(
                 if nt.diffs.is_empty() && !prev_t.diffs.is_empty() {
                     nt.diffs = prev_t.diffs.clone();
                 }
+                if nt.question_exchanges.is_empty() && !prev_t.question_exchanges.is_empty() {
+                    nt.question_exchanges = prev_t.question_exchanges.clone();
+                }
+                if nt.artifacts.is_empty() && !prev_t.artifacts.is_empty() {
+                    nt.artifacts = prev_t.artifacts.clone();
+                }
             }
         }
         if let Some(last) = next_turns.last_mut() {
             if last.assistant_output.is_none() && sess.latest_output.is_some() {
                 last.assistant_output = sess.latest_output.clone();
+            }
+            if last.question_exchanges.is_empty() && !sess.question_exchanges.is_empty() {
+                last.question_exchanges = sess.question_exchanges.clone();
+            }
+            if last.artifacts.is_empty() && !sess.artifacts.is_empty() {
+                last.artifacts = sess.artifacts.clone();
             }
             last.is_active = sess.status == "active" || sess.status == "waiting_approval";
         }
@@ -1650,6 +1945,8 @@ fn apply_insights_to_session(
                     && a.model_name == b.model_name
                     && a.tool_calls_count == b.tool_calls_count
                     && a.files_touched_count == b.files_touched_count
+                    && a.question_exchanges == b.question_exchanges
+                    && a.artifacts == b.artifacts
                     && a.is_active == b.is_active
             });
         if !same_turns {
@@ -1827,6 +2124,7 @@ impl AppCore {
                 id: "thread-main".into(),
                 title: "NOVA Quick Command Chat".into(),
                 persona_id: "architect".into(),
+                workspace_path: None,
                 messages: vec![ChatMessage {
                     id: "welcome-1".into(),
                     role: "assistant".into(),
@@ -1870,7 +2168,9 @@ impl AppCore {
                 settings,
                 sessions: Vec::new(),
                 pending_approvals: Vec::new(),
+                pending_questions: Vec::new(),
                 approval_waiters: HashMap::new(),
+                question_waiters: HashMap::new(),
                 pending_tool_diffs: HashMap::new(),
                 bg_pids: HashMap::new(),
                 warm_workers: HashMap::new(),
@@ -1957,6 +2257,7 @@ impl AppCore {
             settings: guard.settings.clone(),
             sessions: sessions_out,
             pending_approvals: guard.pending_approvals.clone(),
+            pending_questions: guard.pending_questions.clone(),
             approval_rules: guard.approval_rules.clone(),
             threads: guard.threads.clone(),
             personas: guard.personas.clone(),
@@ -2390,6 +2691,8 @@ impl AppCore {
                         latest_output: None,
                         plan_steps: Vec::new(),
                         focus_groups: Vec::new(),
+                        question_exchanges: Vec::new(),
+                        artifacts: Vec::new(),
                         turns: Vec::new(),
                         transcript_path: resolved_transcript.clone(),
                         queued_messages: Vec::new(),
@@ -2456,6 +2759,8 @@ impl AppCore {
                     sess.current_focus = None;
                     sess.plan_steps.clear();
                     sess.focus_groups.clear();
+                    sess.question_exchanges.clear();
+                    sess.artifacts.clear();
                     sess.steps.clear();
                     sess.diffs.clear();
                 }
@@ -2517,6 +2822,16 @@ impl AppCore {
                 if let Some(ps) = steps_override {
                     sess.plan_steps = ps;
                 }
+                if (is_pre_tool || is_post_tool) && !has_error {
+                    if let Some(art) = extract_artifact_metadata(
+                        &tool_name,
+                        &env.tool_args,
+                        env.target_file.as_deref(),
+                        &now,
+                    ) {
+                        upsert_session_artifact(&mut sess.artifacts, art);
+                    }
+                }
                 if !env.process_chain.is_empty() {
                     sess.process_chain = env.process_chain.clone();
                 }
@@ -2566,7 +2881,7 @@ impl AppCore {
                 if early_reply.is_none() && !sess.queued_messages.is_empty() {
                     if is_pre_inv || is_post_inv {
                         let joined = sess.queued_messages.drain(..).collect::<Vec<_>>().join("\n\n");
-                        sess.last_user_input = Some(truncate_chars(&joined, 240));
+                        sess.last_user_input = Some(truncate_chars(&joined, 16_000));
                         sess.status = "active".into();
                         sess.phase = "thinking".into();
                         early_reply = Some(HookRelayResponse {
@@ -2576,7 +2891,7 @@ impl AppCore {
                         });
                     } else if is_stop {
                         let joined = sess.queued_messages.drain(..).collect::<Vec<_>>().join("\n\n");
-                        sess.last_user_input = Some(truncate_chars(&joined, 240));
+                        sess.last_user_input = Some(truncate_chars(&joined, 16_000));
                         sess.status = "active".into();
                         sess.phase = "thinking".into();
                         early_reply = Some(HookRelayResponse {
@@ -3069,6 +3384,95 @@ impl AppCore {
             return HookRelayResponse::default();
         }
 
+        // 0. Interactive `ask_question` / `AskUserQuestion` interception:
+        //    Always surface multi-choice / open questions directly inside NOVA (even in `follow_agy`
+        //    or `turbo` permission modes, and crucially in headless `agy.exe` stream-json runs where
+        //    no IDE dialog exists!). Users can answer, dictate, skip, or click "Reply in IDE".
+        if matches!(tool_name.as_str(), "ask_question" | "AskUserQuestion") {
+            if let Some(questions) = extract_question_items(&env.tool_args) {
+                let question_id = uuid::Uuid::new_v4().to_string();
+                let (q_tx, q_rx) = oneshot::channel::<HookRelayResponse>();
+                let target_conv_id = {
+                    let mut g = self.inner.lock().unwrap();
+                    let resolved_cid = g
+                        .sessions
+                        .iter()
+                        .find(|s| {
+                            s.conversation_id == env.conversation_id
+                                || s.cli_conversation_id.as_deref()
+                                    == Some(env.conversation_id.as_str())
+                        })
+                        .map(|s| s.conversation_id.clone())
+                        .unwrap_or_else(|| env.conversation_id.clone());
+
+                    if let Some(sess) = g
+                        .sessions
+                        .iter_mut()
+                        .find(|s| s.conversation_id == resolved_cid)
+                    {
+                        sess.status = "waiting_approval".into();
+                        sess.phase = "waiting_approval".into();
+                        if let Some(st) = sess.steps.first_mut() {
+                            if st.status == "running" {
+                                st.status = "waiting".into();
+                            }
+                        }
+                        for fg in sess.focus_groups.iter_mut().rev() {
+                            if let Some(st) = fg.steps.last_mut() {
+                                if st.status == "running" {
+                                    st.status = "waiting".into();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    g.pending_questions.insert(
+                        0,
+                        PendingQuestion {
+                            id: question_id.clone(),
+                            conversation_id: resolved_cid.clone(),
+                            agent: env.agent.clone(),
+                            workspace_path: env.workspace_path.clone(),
+                            workspace_name: workspace_name.clone(),
+                            git_branch: env.git_branch.clone(),
+                            questions,
+                            created_at: now.clone(),
+                            expires_in_sec: 280,
+                        },
+                    );
+                    g.question_waiters.insert(question_id.clone(), q_tx);
+                    resolved_cid
+                };
+
+                self.broadcast_snapshot(Some("approval_needed"));
+
+                return match tokio::time::timeout(std::time::Duration::from_secs(280), q_rx).await {
+                    Ok(Ok(reply)) => reply,
+                    _ => {
+                        {
+                            let mut g = self.inner.lock().unwrap();
+                            g.pending_questions.retain(|q| q.id != question_id);
+                            g.question_waiters.remove(&question_id);
+                            if let Some(sess) = g
+                                .sessions
+                                .iter_mut()
+                                .find(|s| s.conversation_id == target_conv_id)
+                            {
+                                sess.status = "active".into();
+                                sess.phase = "working".into();
+                            }
+                        }
+                        self.broadcast_snapshot(None);
+                        HookRelayResponse {
+                            decision: Some("ask".into()),
+                            ..Default::default()
+                        }
+                    }
+                };
+            }
+        }
+
         // PreToolUse decision pipeline
         // 1. Custom Scoped Approval Rules always take top precedence
         if let Some(rule_act) = matched_rule_action {
@@ -3348,6 +3752,181 @@ impl AppCore {
         self.persist();
         self.broadcast_snapshot(sound_cue);
         Ok(())
+    }
+
+    pub fn resolve_question(
+        &self,
+        question_id: &str,
+        answers: Vec<String>,
+        skipped: bool,
+        passthrough_to_ide: bool,
+    ) -> Result<(), String> {
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let sound_cue = if passthrough_to_ide {
+            None
+        } else {
+            Some("approved")
+        };
+
+        {
+            let mut g = self.inner.lock().unwrap();
+            let pos = g
+                .pending_questions
+                .iter()
+                .position(|q| q.id == question_id)
+                .ok_or_else(|| "Question prompt already answered or expired".to_string())?;
+
+            let pending = g.pending_questions.remove(pos);
+
+            let normalized_answers: Vec<String> = (0..pending.questions.len())
+                .map(|idx| {
+                    answers
+                        .get(idx)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            if let Some(sess) = g
+                .sessions
+                .iter_mut()
+                .find(|s| s.conversation_id == pending.conversation_id)
+            {
+                sess.status = "active".into();
+                sess.phase = "working".into();
+                for st in &mut sess.steps {
+                    if st.status == "waiting" {
+                        st.status = if passthrough_to_ide { "running" } else { "done" }.into();
+                    }
+                }
+                for fg in &mut sess.focus_groups {
+                    for st in &mut fg.steps {
+                        if st.status == "waiting" {
+                            st.status = if passthrough_to_ide { "running" } else { "done" }.into();
+                        }
+                    }
+                }
+                if !passthrough_to_ide {
+                    let qx = QuestionExchange {
+                        id: pending.id.clone(),
+                        questions: pending.questions.clone(),
+                        answers: normalized_answers.clone(),
+                        skipped,
+                        timestamp: now_str.clone(),
+                    };
+                    merge_question_exchange(&mut sess.question_exchanges, qx.clone());
+                    if let Some(turn) = sess.turns.last_mut() {
+                        merge_question_exchange(&mut turn.question_exchanges, qx);
+                    }
+                }
+            }
+
+            let reply = if passthrough_to_ide {
+                HookRelayResponse {
+                    decision: Some("ask".into()),
+                    ..Default::default()
+                }
+            } else if skipped
+                || normalized_answers.iter().all(|a| a.trim().is_empty())
+            {
+                HookRelayResponse {
+                    decision: Some("deny".into()),
+                    reason: Some(
+                        "The user skipped the ask_question prompt in NOVA. Proceed directly using your recommended default options without calling ask_question again."
+                            .into(),
+                    ),
+                    ..Default::default()
+                }
+            } else {
+                let mut lines = Vec::with_capacity(pending.questions.len());
+                for (i, ans) in normalized_answers.iter().enumerate() {
+                    let display_ans = if ans.is_empty() {
+                        "(Skipped — use recommended default)"
+                    } else {
+                        ans.as_str()
+                    };
+                    lines.push(format!("A{}: {}", i + 1, display_ans));
+                }
+                HookRelayResponse {
+                    decision: Some("deny".into()),
+                    reason: Some(format!(
+                        "The user answered your ask_question directly in NOVA:\n{}\nProceed directly using these authoritative answers — do NOT call ask_question again for these questions.",
+                        lines.join("\n")
+                    )),
+                    ..Default::default()
+                }
+            };
+
+            if let Some(waiter) = g.question_waiters.remove(question_id) {
+                let _ = waiter.send(reply);
+            }
+        }
+
+        self.persist();
+        self.broadcast_snapshot(sound_cue);
+        Ok(())
+    }
+
+    /// Safely reads a Markdown or text artifact file associated with a tracked session or Antigravity brain folder.
+    pub fn read_session_artifact(
+        &self,
+        conversation_id: Option<&str>,
+        file_path: &str,
+    ) -> Result<String, String> {
+        let trimmed = file_path.trim();
+        if trimmed.is_empty() {
+            return Err("Artifact file path is empty".to_string());
+        }
+        let target_path = Path::new(trimmed);
+        let canonical_target = fs::canonicalize(target_path)
+            .map_err(|_| "Artifact file does not exist on disk".to_string())?;
+        if !canonical_target.is_file() {
+            return Err("Path is not a regular file".to_string());
+        }
+
+        let norm_target = normalize_path_key(&canonical_target.to_string_lossy());
+        let is_brain_artifact = norm_target.contains("/.gemini/antigravity/brain/")
+            || norm_target.contains("/.gemini/antigravity-cli/brain/");
+
+        let authorized = is_brain_artifact || {
+            let g = self.inner.lock().unwrap();
+            g.sessions.iter().any(|s| {
+                if let Some(cid) = conversation_id.filter(|c| !c.trim().is_empty()) {
+                    if s.conversation_id != cid
+                        && s.cli_conversation_id.as_deref() != Some(cid)
+                    {
+                        return false;
+                    }
+                }
+                let ws_canon = fs::canonicalize(&s.workspace_path)
+                    .map(|p| normalize_path_key(&p.to_string_lossy()))
+                    .unwrap_or_else(|_| normalize_path_key(&s.workspace_path));
+                if !ws_canon.is_empty() && norm_target.starts_with(&format!("{ws_canon}/")) {
+                    return true;
+                }
+                s.artifacts
+                    .iter()
+                    .chain(s.turns.iter().flat_map(|t| t.artifacts.iter()))
+                    .any(|a| {
+                        fs::canonicalize(&a.path)
+                            .map(|p| normalize_path_key(&p.to_string_lossy()) == norm_target)
+                            .unwrap_or_else(|_| normalize_path_key(&a.path) == norm_target)
+                    })
+            })
+        };
+
+        if !authorized {
+            return Err("File is outside tracked session workspaces and Antigravity artifact directories".to_string());
+        }
+
+        let meta = fs::metadata(&canonical_target).map_err(|e| e.to_string())?;
+        if meta.len() > 512_000 {
+            return Err("Artifact exceeds 512 KB inline preview limit; open in IDE instead".to_string());
+        }
+
+        let content = fs::read_to_string(&canonical_target)
+            .map_err(|e| format!("Failed reading artifact text: {e}"))?;
+        Ok(content)
     }
 
     /// Finalizes active turn, step states, and session status after a stream result or process exit.
@@ -3700,6 +4279,8 @@ impl AppCore {
                                     files_touched_count: 0,
                                     focus_groups: Vec::new(),
                                     diffs: Vec::new(),
+                                    question_exchanges: Vec::new(),
+                                    artifacts: Vec::new(),
                                     started_at: Some(now.clone()),
                                     completed_at: None,
                                     is_active: true,
@@ -3713,6 +4294,8 @@ impl AppCore {
                                 }
                                 sess.plan_steps.clear();
                                 sess.focus_groups.clear();
+                                sess.question_exchanges.clear();
+                                sess.artifacts.clear();
                                 sess.steps.clear();
                                 sess.diffs.clear();
                                 sess.updated_at = now.clone();
@@ -3873,6 +4456,8 @@ impl AppCore {
                         files_touched_count: 0,
                         focus_groups: Vec::new(),
                         diffs: Vec::new(),
+                        question_exchanges: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(now.clone()),
                         completed_at: None,
                         is_active: true,
@@ -3886,6 +4471,8 @@ impl AppCore {
                     }
                     sess.plan_steps.clear();
                     sess.focus_groups.clear();
+                    sess.question_exchanges.clear();
+                    sess.artifacts.clear();
                     sess.steps.clear();
                     sess.diffs.clear();
                     sess.updated_at = now.clone();
@@ -3911,6 +4498,8 @@ impl AppCore {
                         latest_output: None,
                         plan_steps: Vec::new(),
                         focus_groups: Vec::new(),
+                        question_exchanges: Vec::new(),
+                        artifacts: Vec::new(),
                         turns: vec![SessionTurn {
                             id: "turn-1".into(),
                             user_prompt: summary_prompt,
@@ -3921,6 +4510,8 @@ impl AppCore {
                             files_touched_count: 0,
                             focus_groups: Vec::new(),
                             diffs: Vec::new(),
+                            question_exchanges: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: Some(now.clone()),
                             completed_at: None,
                             is_active: true,
@@ -4419,20 +5010,26 @@ impl AppCore {
     /// Halts an active session via hook termination + pending approval denial + owned headless PID kill.
     pub fn stop_agent_session(&self, conversation_id: &str) -> Result<(), String> {
         let pid_to_kill: Option<u32>;
-        let mut approval_ids_to_deny: Vec<String> = Vec::new();
-        let now_done = chrono::Utc::now().to_rfc3339();
+            let mut approval_ids_to_deny: Vec<String> = Vec::new();
+            let mut question_ids_to_cancel: Vec<String> = Vec::new();
+            let now_done = chrono::Utc::now().to_rfc3339();
 
-        {
-            let mut g = self.inner.lock().unwrap();
-            let bg_pid = g.bg_pids.remove(conversation_id);
-            let worker_pid = g.warm_workers.remove(conversation_id).map(|w| w.pid);
-            let mut extra_pid: Option<u32> = None;
+            {
+                let mut g = self.inner.lock().unwrap();
+                let bg_pid = g.bg_pids.remove(conversation_id);
+                let worker_pid = g.warm_workers.remove(conversation_id).map(|w| w.pid);
+                let mut extra_pid: Option<u32> = None;
 
-            for p in &g.pending_approvals {
-                if p.conversation_id == conversation_id {
-                    approval_ids_to_deny.push(p.id.clone());
+                for p in &g.pending_approvals {
+                    if p.conversation_id == conversation_id {
+                        approval_ids_to_deny.push(p.id.clone());
+                    }
                 }
-            }
+                for q in &g.pending_questions {
+                    if q.conversation_id == conversation_id {
+                        question_ids_to_cancel.push(q.id.clone());
+                    }
+                }
 
             let cli_cid_opt = g
                 .sessions
@@ -4472,6 +5069,9 @@ impl AppCore {
                 None,
                 Some("Session stopped by user"),
             );
+        }
+        for qid in question_ids_to_cancel {
+            let _ = self.resolve_question(&qid, Vec::new(), true, false);
         }
 
         if let Some(pid) = pid_to_kill {
@@ -4777,6 +5377,8 @@ mod tests {
             latest_output: None,
             plan_steps: Vec::new(),
             focus_groups: Vec::new(),
+            question_exchanges: Vec::new(),
+            artifacts: Vec::new(),
             turns: vec![
                 SessionTurn {
                     id: "turn-1".into(),
@@ -4788,6 +5390,8 @@ mod tests {
                     files_touched_count: 0,
                     focus_groups: Vec::new(),
                     diffs: Vec::new(),
+                    question_exchanges: Vec::new(),
+                    artifacts: Vec::new(),
                     started_at: None,
                     completed_at: None,
                     is_active: false,
@@ -4802,6 +5406,8 @@ mod tests {
                     files_touched_count: 0,
                     focus_groups: Vec::new(),
                     diffs: Vec::new(),
+                    question_exchanges: Vec::new(),
+                    artifacts: Vec::new(),
                     started_at: None,
                     completed_at: None,
                     is_active: true,
@@ -4873,6 +5479,13 @@ mod tests {
         assert!(cleaned.contains("  return aaaaa"));
         assert!(cleaned.len() > 600, "full prompt must not be truncated at 240 chars");
         assert!(!cleaned.contains("ADDITIONAL_METADATA"));
+
+        let spaced_paragraphs = "<USER_REQUEST>\nhey i let gpt do thing\n\nbecaseu of compact space\n\n\nget it\n</USER_REQUEST>";
+        assert_eq!(
+            clean_user_prompt(spaced_paragraphs).as_deref(),
+            Some("hey i let gpt do thing\n\nbecaseu of compact space\n\n\nget it"),
+            "must preserve exact blank lines and paragraph spacing typed by the user"
+        );
     }
 
     #[test]
@@ -4903,5 +5516,56 @@ mod tests {
             clean_user_prompt(with_multi).as_deref(),
             Some("Compare these two designs\n\n📎 Attached images: `mockup-1.png`, `photo-2.jpg`")
         );
+    }
+
+    #[test]
+    fn extract_questions_and_artifacts_support_protojson_and_live_hook_shapes() {
+        use super::{
+            extract_artifact_metadata, extract_question_items, parse_question_result_answers,
+        };
+        use serde_json::json;
+
+        // 1. Stringified protojson `questions` from `transcript.jsonl`
+        let tr_args = json!({
+            "questions": "[{\"options\":[\"(Recommended) Aura Waveform Bars\",\"Cosmic NOVA Star\"],\"question\":\"Which right-side indicator fits NOVA's theme best?\"},{\"options\":[\"Apple Blur-Glide\",\"Crisp Slot Flip\"],\"is_multi_select\":true,\"question\":\"Which text-appear animation do you want?\"}]"
+        });
+        let qs = extract_question_items(&tr_args).expect("should parse transcript questions");
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].question, "Which right-side indicator fits NOVA's theme best?");
+        assert_eq!(qs[0].options.len(), 2);
+        assert!(!qs[0].is_multi_select);
+        assert!(qs[1].is_multi_select);
+
+        // 2. Direct JSON array `questions` from `PreToolUse` hook
+        let hook_args = json!({
+            "questions": [
+                {
+                    "question": "Pick deployment target",
+                    "options": ["Vercel", "Cloudflare"],
+                    "is_multi_select": false
+                }
+            ]
+        });
+        let hqs = extract_question_items(&hook_args).expect("should parse hook questions");
+        assert_eq!(hqs.len(), 1);
+        assert_eq!(hqs[0].options, vec!["Vercel", "Cloudflare"]);
+
+        // 3. Parse `A1:` / `A2:` tool result
+        let tool_res = "Created At: 2026-11-27T12:01:26+07:00\nCompleted At: 2026-11-27T12:05:36+07:00\nA1: (Recommended) Aura Waveform Bars\nA2: Apple Blur-Glide";
+        let (answers, skipped) = parse_question_result_answers(tool_res, 2);
+        assert!(!skipped);
+        assert_eq!(answers, vec!["(Recommended) Aura Waveform Bars", "Apple Blur-Glide"]);
+
+        // 4. Extract `ArtifactMetadata` from `write_file`
+        let art_args = json!({
+            "Path": "C:\\Users\\ongch\\.gemini\\antigravity\\brain\\abc\\implementation_plan.md",
+            "ArtifactMetadata": "{\"RequestFeedback\":true,\"Summary\":\"Implementation plan for ask_question support\",\"UserFacing\":true}"
+        });
+        let art = extract_artifact_metadata("write_file", &art_args, None, "2026-11-27T05:10:00Z")
+            .expect("should extract artifact metadata");
+        assert_eq!(art.file_name, "implementation_plan.md");
+        assert!(art.request_feedback);
+        assert!(art.user_facing);
+        assert_eq!(art.summary, "Implementation plan for ask_question support");
     }
 }

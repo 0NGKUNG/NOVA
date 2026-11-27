@@ -7,15 +7,27 @@ import {
   Circle,
   ExternalLink,
   FileDiff,
+  FileText,
+  HelpCircle,
   Loader2,
+  Play,
+  Send,
   Terminal,
   Undo2,
   XCircle,
 } from "lucide-react";
-import { AgentSession, FileDiffPreview, FocusGroup, SessionStep, SessionTurn } from "../types";
+import {
+  AgentSession,
+  FileDiffPreview,
+  FocusGroup,
+  QuestionExchange,
+  SessionArtifact,
+  SessionStep,
+  SessionTurn,
+} from "../types";
 import { Lang } from "../i18n";
 import { novaApi } from "../lib/novaClient";
-import { getFileBadgeMeta, IdeMarkdown, renderMarkdownBlocks } from "./IdeMarkdown";
+import { getFileBadgeMeta, IdeMarkdown } from "./IdeMarkdown";
 
 function formatLiveProcessNote(note: string, lang: Lang): string {
   const trimmed = note.trim();
@@ -37,7 +49,13 @@ function formatLiveProcessNote(note: string, lang: Lang): string {
     return lang === "th" ? "ส่งต่อเข้า session อุ่นแล้ว — กำลังคิด…" : "Warm session — reasoning…";
   }
   if (lower.includes("prompt accepted")) {
-    return lang === "th" ? "รับคำสั่งแล้ว — กำลังคิด…" : "Prompt accepted — reasoning…";
+    return lang === "th" ? "กำลังวิเคราะห์คำขอ…" : "Analyzing your request…";
+  }
+  if (lower.startsWith("running ")) {
+    if (/read|open|list|find|search/.test(lower)) return lang === "th" ? "กำลังเปิดและค้นหาไฟล์…" : "Opening and searching files…";
+    if (/write|edit|patch|replace/.test(lower)) return lang === "th" ? "กำลังแก้ไขไฟล์…" : "Editing files…";
+    if (/command|shell|terminal|exec/.test(lower)) return lang === "th" ? "กำลังรันคำสั่ง…" : "Running a command…";
+    return lang === "th" ? "กำลังทำงาน…" : "Working…";
   }
   if (lower.includes("generating response")) {
     return lang === "th" ? "กำลังสร้างคำตอบ…" : "Generating response…";
@@ -46,6 +64,32 @@ function formatLiveProcessNote(note: string, lang: Lang): string {
     return lang === "th" ? "กำลังสรุปคำตอบ…" : "Finalizing response…";
   }
   return trimmed;
+}
+
+function getLiveActivityLabel(session: AgentSession, liveNote: string | null, lang: Lang): string {
+  if (session.status === "waiting_approval") return lang === "th" ? "รอการอนุมัติ" : "Waiting for approval";
+  const activeStep = session.steps.find((step) => step.status === "running")
+    || [...(session.focusGroups ?? [])].reverse().flatMap((group) => [...group.steps].reverse()).find((step) => step.status === "running");
+  if (activeStep) {
+    const detail = `${activeStep.verb || "Working"} ${activeStep.summary}`.trim();
+    if (detail.length > 82) return `${detail.slice(0, 79).trimEnd()}…`;
+    return detail;
+  }
+
+  if (session.activeTool) {
+    const tool = session.activeTool.trim();
+    const lower = tool.toLowerCase();
+    if (/read|open|list|find|search/.test(lower)) return lang === "th" ? "กำลังเปิดและค้นหาไฟล์…" : "Opening and searching files…";
+    if (/write|edit|patch|replace/.test(lower)) return lang === "th" ? "กำลังแก้ไขไฟล์…" : "Editing files…";
+    if (/command|shell|terminal|exec|ran/.test(lower)) return lang === "th" ? "กำลังรันคำสั่ง…" : "Running a command…";
+    if (tool.length > 82) return `${tool.slice(0, 79).trimEnd()}…`;
+    return tool;
+  }
+
+  if (liveNote) return formatLiveProcessNote(liveNote, lang);
+  if (session.latestOutput) return lang === "th" ? "กำลังเขียนคำตอบ…" : "Writing a response…";
+  if (session.latestThinking) return lang === "th" ? "กำลังวิเคราะห์คำขอ…" : "Analyzing your request…";
+  return lang === "th" ? "กำลังคิด…" : "Thinking…";
 }
 
 interface SessionTelemetryViewProps {
@@ -754,6 +798,276 @@ const FileChangesCard: React.FC<{
   );
 };
 
+/** Settled Q&A summary card for completed `ask_question` exchanges in a turn */
+const AnsweredQuestionExchangeCard: React.FC<{
+  exchange: QuestionExchange;
+  lang: Lang;
+}> = ({ exchange, lang }) => {
+  return (
+    <div className="ide-qexchange-card">
+      <div className="ide-qexchange-header">
+        <HelpCircle size={12.5} className="ide-qexchange-icon" />
+        <span>
+          {exchange.skipped
+            ? lang === "th"
+              ? "ข้ามคำถาม (ใช้ค่าแนะนำ)"
+              : "Questions skipped (used recommended defaults)"
+            : lang === "th"
+              ? "คำตอบที่เลือก"
+              : "Questions answered"}
+        </span>
+      </div>
+      <div className="ide-qexchange-list">
+        {exchange.questions.map((q, idx) => {
+          const ans = exchange.answers[idx]?.trim() || "";
+          return (
+            <div key={`${exchange.id}-${idx}`} className="ide-qexchange-row">
+              <div className="ide-qexchange-q">
+                <span className="ide-qexchange-idx">{idx + 1}</span>
+                <span>{q.question}</span>
+              </div>
+              <div className={`ide-qexchange-a ${!ans || exchange.skipped ? "is-skipped" : ""}`}>
+                {exchange.skipped || !ans
+                  ? lang === "th"
+                    ? "ข้าม"
+                    : "Skipped"
+                  : ans}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+/** Interactive Antigravity Artifact / Implementation Plan Card with inline Markdown preview & 1-click Proceed */
+const SessionArtifactsList: React.FC<{
+  artifacts: SessionArtifact[];
+  session: AgentSession;
+  compact: boolean;
+  lang: Lang;
+  isLatestTurn: boolean;
+}> = ({ artifacts, session, compact, lang, isLatestTurn }) => {
+  const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
+  const [loadedContent, setLoadedContent] = useState<Record<string, string>>({});
+  const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
+  const [loadErrors, setLoadErrors] = useState<Record<string, string>>({});
+  const [feedbackOpenPaths, setFeedbackOpenPaths] = useState<Record<string, boolean>>({});
+  const [feedbackDrafts, setFeedbackDrafts] = useState<Record<string, string>>({});
+  const [sendingAction, setSendingAction] = useState<Record<string, boolean>>({});
+  const [sentNotice, setSentNotice] = useState<Record<string, string>>({});
+
+  const visibleArtifacts = useMemo(
+    () => artifacts.filter((a) => a.userFacing !== false || a.requestFeedback),
+    [artifacts]
+  );
+
+  if (visibleArtifacts.length === 0) return null;
+
+  const togglePreview = async (art: SessionArtifact) => {
+    const key = art.path;
+    const nextOpen = !expandedPaths[key];
+    setExpandedPaths((prev) => ({ ...prev, [key]: nextOpen }));
+    if (nextOpen && loadedContent[key] === undefined && !loadingPaths[key]) {
+      setLoadingPaths((prev) => ({ ...prev, [key]: true }));
+      try {
+        const res = await novaApi.readArtifact(art.path, session.conversationId);
+        if (res.ok && typeof res.content === "string") {
+          setLoadedContent((prev) => ({ ...prev, [key]: res.content! }));
+          setLoadErrors((prev) => {
+            const copy = { ...prev };
+            delete copy[key];
+            return copy;
+          });
+        } else {
+          setLoadErrors((prev) => ({
+            ...prev,
+            [key]: res.error || "Unable to load artifact preview",
+          }));
+        }
+      } catch (err) {
+        setLoadErrors((prev) => ({ ...prev, [key]: String(err) }));
+      } finally {
+        setLoadingPaths((prev) => ({ ...prev, [key]: false }));
+      }
+    }
+  };
+
+  const sendArtifactReply = async (art: SessionArtifact, text: string, label: string) => {
+    const key = art.path;
+    if (!text.trim() || sendingAction[key]) return;
+    setSendingAction((prev) => ({ ...prev, [key]: true }));
+    try {
+      const res = await novaApi.sendSessionPrompt({
+        workspacePath: session.workspacePath,
+        conversationId: session.conversationId,
+        prompt: text.trim(),
+      });
+      if (res.ok) {
+        setSentNotice((prev) => ({ ...prev, [key]: label }));
+        setFeedbackOpenPaths((prev) => ({ ...prev, [key]: false }));
+        setFeedbackDrafts((prev) => ({ ...prev, [key]: "" }));
+      }
+    } finally {
+      setSendingAction((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  return (
+    <div className="ide-artifacts-stack">
+      {visibleArtifacts.map((art) => {
+        const key = art.path;
+        const isOpen = Boolean(expandedPaths[key]);
+        const isLoading = Boolean(loadingPaths[key]);
+        const content = loadedContent[key];
+        const err = loadErrors[key];
+        const feedbackOpen = Boolean(feedbackOpenPaths[key]);
+        const feedbackText = feedbackDrafts[key] ?? "";
+        const isBusy = Boolean(sendingAction[key]);
+        const notice = sentNotice[key];
+
+        return (
+          <div
+            key={key}
+            className={`ide-artifact-card ${art.requestFeedback ? "needs-feedback" : ""} ${
+              isOpen ? "is-open" : ""
+            }`}
+          >
+            <div className="ide-artifact-top" onClick={() => void togglePreview(art)}>
+              <div className="ide-artifact-title-group">
+                <span className="ide-artifact-badge">
+                  <FileText size={12} />
+                </span>
+                <span className="ide-artifact-name">{art.fileName}</span>
+                {art.requestFeedback && (
+                  <span className="ide-artifact-review-pill">
+                    {lang === "th" ? "รอคำยืนยัน" : "Review requested"}
+                  </span>
+                )}
+              </div>
+
+              <div className="ide-artifact-actions" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className="fc-action-mini"
+                  onClick={() => void togglePreview(art)}
+                >
+                  {isOpen ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+                  <span>{isOpen ? (lang === "th" ? "ซ่อน" : "Hide") : lang === "th" ? "อ่าน" : "Read"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="fc-action-mini"
+                  onClick={() => openAt(art.path, undefined, session.workspacePath)}
+                  title={art.path}
+                >
+                  <ExternalLink size={10} /> IDE
+                </button>
+                {art.requestFeedback && isLatestTurn && !notice && (
+                  <>
+                    <button
+                      type="button"
+                      className="fc-action-mini"
+                      disabled={isBusy}
+                      onClick={() =>
+                        setFeedbackOpenPaths((prev) => ({ ...prev, [key]: !prev[key] }))
+                      }
+                    >
+                      <span>{lang === "th" ? "แก้ไข/คอมเมนต์" : "Comment"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ide-artifact-proceed-btn"
+                      disabled={isBusy}
+                      onClick={() =>
+                        void sendArtifactReply(
+                          art,
+                          "Proceed",
+                          lang === "th" ? "ส่งคำสั่ง Proceed แล้ว" : "Proceed sent"
+                        )
+                      }
+                    >
+                      <Play size={10} />
+                      <span>{lang === "th" ? "ดำเนินการต่อ (Proceed)" : "Proceed"}</span>
+                    </button>
+                  </>
+                )}
+                {notice && <span className="ide-artifact-sent-pill">{notice}</span>}
+              </div>
+            </div>
+
+            {art.summary && <div className="ide-artifact-summary">{art.summary}</div>}
+
+            {feedbackOpen && (
+              <div className="ide-artifact-feedback-bar">
+                <input
+                  type="text"
+                  className="nova-input nova-input-xs"
+                  value={feedbackText}
+                  placeholder={
+                    lang === "th"
+                      ? `พิมพ์คอมเมนต์สำหรับ ${art.fileName}...`
+                      : `Write feedback on ${art.fileName}...`
+                  }
+                  onChange={(e) =>
+                    setFeedbackDrafts((prev) => ({ ...prev, [key]: e.target.value }))
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && feedbackText.trim()) {
+                      e.preventDefault();
+                      void sendArtifactReply(
+                        art,
+                        `Feedback on ${art.fileName}: ${feedbackText.trim()}`,
+                        lang === "th" ? "ส่งคอมเมนต์แล้ว" : "Feedback sent"
+                      );
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="ide-artifact-proceed-btn"
+                  disabled={isBusy || !feedbackText.trim()}
+                  onClick={() =>
+                    void sendArtifactReply(
+                      art,
+                      `Feedback on ${art.fileName}: ${feedbackText.trim()}`,
+                      lang === "th" ? "ส่งคอมเมนต์แล้ว" : "Feedback sent"
+                    )
+                  }
+                >
+                  <Send size={10} />
+                  <span>{lang === "th" ? "ส่ง" : "Send"}</span>
+                </button>
+              </div>
+            )}
+
+            {isOpen && (
+              <div className="ide-artifact-body">
+                {isLoading && (
+                  <div className="ide-live">
+                    <Loader2 size={11} className="spin-icon" />
+                    <span>{lang === "th" ? "กำลังโหลดเอกสาร…" : "Loading artifact…"}</span>
+                  </div>
+                )}
+                {err && (
+                  <div className="ide-error-box">
+                    <XCircle size={12} />
+                    <span>{err}</span>
+                  </div>
+                )}
+                {!isLoading && !err && content !== undefined && (
+                  <IdeMarkdown markdown={content} compact={compact} lang={lang} />
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const PastTurnLogsSection: React.FC<{
   turn: SessionTurn;
   session: AgentSession;
@@ -767,6 +1081,8 @@ const PastTurnLogsSection: React.FC<{
   );
   const pastDiffs = turn.diffs ?? [];
   const pastFiles = useMemo(() => aggregateSessionDiffs(pastDiffs), [pastDiffs]);
+  const pastQuestions = turn.questionExchanges ?? [];
+  const pastArtifacts = turn.artifacts ?? [];
 
   const stepCount = useMemo(() => {
     const counted = pastGroups.reduce((acc, g) => acc + g.steps.length, 0);
@@ -774,7 +1090,11 @@ const PastTurnLogsSection: React.FC<{
   }, [pastGroups, turn.toolCallsCount]);
 
   const fileCount = pastFiles.length > 0 ? pastFiles.length : turn.filesTouchedCount ?? 0;
-  const hasRichLogs = pastGroups.length > 0 || pastFiles.length > 0;
+  const hasRichLogs =
+    pastGroups.length > 0 ||
+    pastFiles.length > 0 ||
+    pastQuestions.length > 0 ||
+    pastArtifacts.length > 0;
   const hasSummaryBadge = !hasRichLogs && (stepCount > 0 || fileCount > 0);
 
   if (!hasRichLogs && !hasSummaryBadge && !turn.assistantOutput) {
@@ -815,8 +1135,22 @@ const PastTurnLogsSection: React.FC<{
         </div>
       )}
 
+      {pastQuestions.map((qx) => (
+        <AnsweredQuestionExchangeCard key={qx.id} exchange={qx} lang={lang} />
+      ))}
+
       {turn.assistantOutput && (
         <IdeMarkdown markdown={turn.assistantOutput} compact={compact} lang={lang} />
+      )}
+
+      {pastArtifacts.length > 0 && (
+        <SessionArtifactsList
+          artifacts={pastArtifacts}
+          session={session}
+          compact={compact}
+          lang={lang}
+          isLatestTurn={false}
+        />
       )}
 
       {pastFiles.length > 0 && (
@@ -832,30 +1166,33 @@ const PastTurnLogsSection: React.FC<{
 };
 
 export function normalizePromptForDisplay(raw: string): string {
-  let cur = raw.replace(/\r\n?/g, "\n").trim();
-  if (!cur) return "";
+  let cur = raw.replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
+  if (!cur.trim()) return "";
 
   // 1. Strip `<NOVA_HANDOFF_CONTEXT>...</NOVA_HANDOFF_CONTEXT>`
-  cur = cur.replace(/^<NOVA_HANDOFF_CONTEXT>[\s\S]*?<\/NOVA_HANDOFF_CONTEXT>\s*/i, "").trim();
+  cur = cur
+    .replace(/^\s*<NOVA_HANDOFF_CONTEXT>[\s\S]*?<\/NOVA_HANDOFF_CONTEXT>[ \t]*\n*/i, "")
+    .replace(/^\n+|\s+$/g, "");
 
   // 2. Strip legacy `[Context from preceding Antigravity IDE session ...]\n\n` prefix
-  if (cur.startsWith("[Context from preceding Antigravity IDE session")) {
-    const summaryAnchor = Math.max(0, cur.indexOf("Last assistant summary:"));
-    const tail = cur.slice(summaryAnchor);
+  if (cur.trimStart().startsWith("[Context from preceding Antigravity IDE session")) {
+    const trimmedCur = cur.trimStart();
+    const summaryAnchor = Math.max(0, trimmedCur.indexOf("Last assistant summary:"));
+    const tail = trimmedCur.slice(summaryAnchor);
     const dblClose = tail.indexOf("]\n\n");
     if (dblClose >= 0) {
-      const after = tail.slice(dblClose + 3).trim();
-      if (after) cur = after;
+      const after = tail.slice(dblClose + 3).replace(/^\n+|\s+$/g, "");
+      if (after.trim()) cur = after;
     } else {
       const singleClose = tail.indexOf("]\n");
       if (singleClose >= 0) {
-        const after = tail.slice(singleClose + 2).trim();
-        if (after) cur = after;
+        const after = tail.slice(singleClose + 2).replace(/^\n+|\s+$/g, "");
+        if (after.trim()) cur = after;
       }
     }
   }
 
-  // 3. Clean NOVA's internal screenshot instruction suffix
+  // 3. Clean NOVA's internal screenshot/images instruction suffix
   cur = cur.replace(
     /\n\n\[Attached Screenshot:\s*`([^`]+)`\s*—\s*inspect this image file[^\]]*\]$/,
     (_m, fullPath: string) => {
@@ -863,14 +1200,24 @@ export function normalizePromptForDisplay(raw: string): string {
       return `\n\n📎 Attached screenshot: \`${base}\``;
     }
   );
+  cur = cur.replace(
+    /\n\n\[Attached Images — inspect each image file with read_file:\n([\s\S]*?)\]$/,
+    (_m, listBlock: string) => {
+      const names = Array.from(listBlock.matchAll(/`([^`]+)`/g)).map(
+        (m) => `\`${m[1].split(/[/\\]/).pop() || "image.png"}\``
+      );
+      return names.length > 0 ? `\n\n📎 Attached images: ${names.join(", ")}` : "";
+    }
+  );
 
   // 4. Fallback for pre-truncated legacy handoff strings with no trailing prompt
-  if (cur.startsWith("[Context from preceding Antigravity IDE session")) {
+  if (cur.trimStart().startsWith("[Context from preceding Antigravity IDE session")) {
     cur = cur
+      .trim()
       .replace(/^\[/, "")
       .replace(/\]$/, "")
-      .replace(/\s*Last user request:\s*/g, "\n**Last user request:** ")
-      .replace(/\s*Last assistant summary:\s*/g, "\n**Last assistant summary:** ");
+      .replace(/\s*Last user request:\s*/g, "\nLast user request: ")
+      .replace(/\s*Last assistant summary:\s*/g, "\nLast assistant summary: ");
   }
 
   return cur;
@@ -880,13 +1227,12 @@ const ExpandablePrompt: React.FC<{
   prompt: string;
 }> = ({ prompt }) => {
   const formattedPrompt = useMemo(() => normalizePromptForDisplay(prompt), [prompt]);
-  const blocks = useMemo(() => renderMarkdownBlocks(formattedPrompt), [formattedPrompt]);
 
   if (!formattedPrompt) return null;
 
   return (
     <div className="ide-prompt-wrap">
-      <div className="ide-prompt-body">{blocks}</div>
+      <div className="ide-prompt-body">{formattedPrompt}</div>
     </div>
   );
 };
@@ -966,6 +1312,7 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
 
   const visibleGroups = groups;
   const liveNote = isLive ? session.midProcessNote || null : null;
+  const liveActivity = isLive ? getLiveActivityLabel(session, liveNote, lang) : null;
   const renderedMarkdown = session.latestOutput ? session.latestOutput : null;
   const errorText = session.lastError ? session.lastError : null;
 
@@ -1147,16 +1494,16 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
                     </div>
                   )}
 
-                  {/* 4a. Minimal single-line live spinner when waiting/reasoning without text */}
-                  {!renderedMarkdown && (liveNote || (isLive && visibleGroups.length === 0)) && (
+                  {/* 3b. Settled Q&A cards from `ask_question` tool calls in this turn */}
+                  {(session.questionExchanges ?? turn.questionExchanges ?? []).map((qx) => (
+                    <AnsweredQuestionExchangeCard key={qx.id} exchange={qx} lang={lang} />
+                  ))}
+
+                  {/* 4a. Minimal single-line live spinner ONLY before any focus group, plan, or output exists */}
+                  {isLive && visibleGroups.length === 0 && !renderedMarkdown && planSteps.length === 0 && (
                     <div className={`ide-live ${phase.key === "thinking" || isLive ? "pulse" : ""}`}>
                       <Loader2 size={11} className="spin-icon" />
-                      <span>
-                        {formatLiveProcessNote(
-                          liveNote || (lang === "th" ? "กำลังคิด…" : "Thinking…"),
-                          lang
-                        )}
-                      </span>
+                      <span>{liveActivity}</span>
                       <span className="ide-live-elapsed">
                         {formatElapsed(turn.startedAt || session.startedAt, null, nowMs)}
                       </span>
@@ -1166,6 +1513,17 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
                   {/* 4b. Borderless IDE Markdown output (streams live and stays on completion) */}
                   {renderedMarkdown && (
                     <IdeMarkdown markdown={renderedMarkdown} compact={compact} lang={lang} />
+                  )}
+
+                  {/* 4b-ii. Interactive Artifact / Plan Review Cards (`Proceed` + Inline Markdown Reader) */}
+                  {(session.artifacts ?? turn.artifacts ?? []).length > 0 && (
+                    <SessionArtifactsList
+                      artifacts={session.artifacts ?? turn.artifacts ?? []}
+                      session={session}
+                      compact={compact}
+                      lang={lang}
+                      isLatestTurn
+                    />
                   )}
 
                   {/* 4c. Inline error detail if a headless CLI turn failed */}

@@ -286,7 +286,7 @@ fn post_to_nova(envelope: &NormalizedHookEnvelope) -> Option<HookRelayResponse> 
         || envelope.event.eq_ignore_ascii_case("BeforeTool");
 
     let read_timeout = if is_blocking_approval {
-        Duration::from_secs(112)
+        Duration::from_secs(290)
     } else {
         Duration::from_millis(900)
     };

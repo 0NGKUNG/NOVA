@@ -106,6 +106,9 @@ fn mobile_route_allowed(path: &str) -> bool {
             | "/api/health"
             | "/api/snapshot"
             | "/api/approvals/resolve"
+            | "/api/questions/resolve"
+            | "/api/workspace/read-artifact"
+            | "/api/session/send"
             | "/api/chat/send"
             | "/api/chat/new"
             | "/api/account/switch"
@@ -231,6 +234,7 @@ pub async fn start_core_http_server(
         .route("/snapshot", get(api_snapshot))
         .route("/hook", post(api_hook))
         .route("/approvals/resolve", post(api_resolve_approval))
+        .route("/questions/resolve", post(api_resolve_question))
         .route("/session/send", post(api_session_send))
         .route("/session/stop", post(api_session_stop))
         .route("/session/permission", post(api_session_permission))
@@ -242,6 +246,7 @@ pub async fn start_core_http_server(
         .route("/account/switch", post(api_switch_account))
         .route("/quota", get(api_get_quota))
         .route("/quota/refresh", post(api_refresh_quota))
+        .route("/agy/quota/refresh", post(api_refresh_agy_quota))
         .route("/hooks/antigravity", post(api_apply_agy_hooks))
         .route("/telemetry", get(api_telemetry))
         .route("/ports", get(api_ports))
@@ -258,6 +263,7 @@ pub async fn start_core_http_server(
         .route("/context/clipboard-pin", post(api_clipboard_pin))
         .route("/workspace/focus", post(api_focus_session))
         .route("/workspace/open-editor", post(api_open_editor))
+        .route("/workspace/read-artifact", post(api_read_artifact))
         .route("/workspace/launch", post(api_launch_session))
         .route("/workspace/open-url", post(api_open_url))
         .route("/focus/control", post(api_focus_control))
@@ -404,6 +410,50 @@ async fn api_resolve_approval(
         req.deny_reason.as_deref(),
     ) {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveQuestionReq {
+    question_id: String,
+    #[serde(default)]
+    answers: Vec<String>,
+    #[serde(default)]
+    skipped: bool,
+    #[serde(default)]
+    passthrough_to_ide: bool,
+}
+
+async fn api_resolve_question(
+    State(core): State<AppCore>,
+    Json(req): Json<ResolveQuestionReq>,
+) -> impl IntoResponse {
+    match core.resolve_question(
+        &req.question_id,
+        req.answers,
+        req.skipped,
+        req.passthrough_to_ide,
+    ) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadArtifactReq {
+    conversation_id: Option<String>,
+    file_path: String,
+}
+
+async fn api_read_artifact(
+    State(core): State<AppCore>,
+    Json(req): Json<ReadArtifactReq>,
+) -> impl IntoResponse {
+    match core.read_session_artifact(req.conversation_id.as_deref(), &req.file_path) {
+        Ok(content) => (StatusCode::OK, Json(json!({ "ok": true, "content": content }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
     }
 }
@@ -641,6 +691,76 @@ async fn api_refresh_quota(State(core): State<AppCore>) -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::to_value(quota).unwrap_or_default()))
 }
 
+async fn api_refresh_agy_quota() -> impl IntoResponse {
+    let Some(agy_exe) = crate::system_tools::resolve_agy_cli_path() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "AGY CLI was not found." })),
+        );
+    };
+
+    let mut command = tokio::process::Command::new(agy_exe);
+    command
+        .args(["--print", "/usage", "--output-format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(25), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "error": format!("Could not query AGY quota: {error}") })),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({ "ok": false, "error": "AGY quota refresh timed out." })),
+            );
+        }
+    };
+
+    let response: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() { error.to_string() } else { stderr };
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "error": format!("AGY returned unreadable quota data: {detail}") })),
+            );
+        }
+    };
+
+    let Some(data) = response.pointer("/command/data") else {
+        let message = response.get("response").and_then(Value::as_str).unwrap_or("AGY did not return quota data.");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": message })),
+        );
+    };
+    if !data.get("groups").is_some_and(Value::is_array) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": "AGY quota response did not include model groups." })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "quota": data,
+            "updatedAt": chrono::Utc::now().to_rfc3339(),
+        })),
+    )
+}
+
 #[derive(Deserialize)]
 struct HookActionReq {
     action: String,
@@ -758,6 +878,7 @@ async fn api_github() -> Json<Value> {
 struct ChatSendReq {
     thread_id: String,
     content: String,
+    workspace_path: Option<String>,
     provider: Option<String>,
     model: Option<String>,
     persona_id: Option<String>,
@@ -840,6 +961,7 @@ async fn api_chat_send(
                 id: req.thread_id.clone(),
                 title: req.content.chars().take(42).collect(),
                 persona_id: req.persona_id.clone().unwrap_or_else(|| "architect".into()),
+                workspace_path: req.workspace_path.clone(),
                 messages: Vec::new(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
             });
@@ -848,13 +970,19 @@ async fn api_chat_send(
         if let Some(pid) = &req.persona_id {
             g.threads[pos].persona_id = pid.clone();
         }
+        if let Some(workspace_path) = req.workspace_path.as_ref().filter(|path| std::path::Path::new(path).is_dir()) {
+            g.threads[pos].workspace_path = Some(workspace_path.clone());
+        }
         let active_pid = g.threads[pos].persona_id.clone();
-        let sys_prompt = g
+        let mut sys_prompt = g
             .personas
             .iter()
             .find(|p| p.id == active_pid)
             .map(|p| p.system_prompt.clone())
             .unwrap_or_else(|| "You are NOVA AI.".into());
+        if let Some(workspace_path) = g.threads[pos].workspace_path.as_deref() {
+            sys_prompt.push_str(&format!("\n\nThe user's selected project workspace is: {workspace_path}. Keep project-related help scoped to this workspace."));
+        }
 
         g.threads[pos].messages.push(ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -931,6 +1059,7 @@ async fn api_chat_send(
 #[serde(rename_all = "camelCase")]
 struct NewThreadReq {
     persona_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn api_chat_new(State(core): State<AppCore>, Json(req): Json<NewThreadReq>) -> Json<Value> {
@@ -939,6 +1068,7 @@ async fn api_chat_new(State(core): State<AppCore>, Json(req): Json<NewThreadReq>
         id: id.clone(),
         title: "New NOVA Thread".into(),
         persona_id: req.persona_id.unwrap_or_else(|| "architect".into()),
+        workspace_path: req.workspace_path.filter(|path| std::path::Path::new(path).is_dir()),
         messages: Vec::new(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
