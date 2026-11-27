@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Camera,
+  ChevronDown,
   CheckSquare,
   Clipboard,
   Cpu,
@@ -22,7 +24,6 @@ import {
   Send,
   Settings,
   SkipForward,
-  Terminal,
   Trash2,
   User,
   X,
@@ -38,6 +39,20 @@ import {
 } from "../types";
 import { Lang, t } from "../i18n";
 import { isTauriRuntime, novaApi } from "../lib/novaClient";
+import { getRecentProjectPaths, rememberRecentProjectPath } from "../lib/projectHistory";
+import { listenForNativeDialogState, withNativeDialog } from "../lib/nativeDialog";
+import {
+  buildPopoverExtraRects,
+  computePopoverPlacement,
+  hitTestIslandRegions,
+  HoverRect,
+  ISLAND_HOVER_REGION_EVENT,
+  ISLAND_POPOVER_SELECT_EVENT,
+  IslandPopoverSelectDetail,
+  notifyIslandPopoverSelect,
+  resolvePopoverSelectCollapseLock,
+  stepIslandPointerHoverState,
+} from "../lib/islandHover";
 import { playNovaCue, warmNovaAudio } from "../lib/soundEngine";
 import {
   clamp,
@@ -52,9 +67,10 @@ import {
 import { NovaOrb, NovaOrbIntroPose, OrbState } from "../components/NovaOrb";
 import { SupernovaIntroOverlay } from "../components/SupernovaIntroOverlay";
 import { ApprovalCard } from "../components/ApprovalCard";
+import { QuestionCard } from "../components/QuestionCard";
 import { DiffViewer } from "../components/DiffViewer";
 import { renderMarkdownBlocks } from "../components/IdeMarkdown";
-import { getPhaseLabel, SessionTelemetryView } from "../components/SessionTelemetryView";
+import { SessionTelemetryView } from "../components/SessionTelemetryView";
 import {
   fileToDataUrl,
   isSupportedImageFile,
@@ -62,6 +78,7 @@ import {
   SessionCockpit,
 } from "../components/SessionCockpit";
 import { VoiceRecorderPanel } from "../components/VoiceRecorderPanel";
+import { ProjectSelectHero } from "../components/ProjectSelectHero";
 
 interface IslandSurfaceProps {
   snapshot: NovaSnapshot;
@@ -77,7 +94,9 @@ const PILL_HEIGHT = 38;
 const PILL_RADIUS = 19;
 const EXPANDED_WIDTH = 840;
 const EXPANDED_RADIUS = 26;
-const MIN_PILL_WIDTH = 148;
+const MIN_PILL_WIDTH = 176;
+const PILL_BREATHING_EXTRA_PX = 22;
+const MAX_PILL_WIDTH = 380;
 const MAX_EXPANDED_HEIGHT = 626;
 const SHADOW_BASE_W = 880;
 const SHADOW_BASE_H = 520;
@@ -94,6 +113,13 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   embeddedPreview = false,
 }) => {
   const { settings, sessions, pendingApprovals, focus } = snapshot;
+  const pendingQuestions = snapshot.pendingQuestions ?? [];
+  const totalUrgentCount = pendingApprovals.length + pendingQuestions.length;
+  const hasCloudSttKey = Boolean(
+    (settings.sttProvider === "groq" && snapshot.secrets.groq) ||
+      (settings.sttProvider === "gemini" && snapshot.secrets.gemini) ||
+      (settings.sttProvider === "openai" && snapshot.secrets.openai)
+  );
   const lang: Lang = settings.language;
 
   const [activeTab, setActiveTabState] = useState<"mission" | "chat" | "voice" | "devtools">("mission");
@@ -103,11 +129,29 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     setActiveTabState(next);
   }, []);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [showNewRunDrawer, setShowNewRunDrawer] = useState(false);
+  const [isNewChatDraft, setIsNewChatDraft] = useState(true);
 
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
+  const [selectedWorkspacePath, setSelectedWorkspacePath] = useState("");
+  const [addedWorkspacePaths, setAddedWorkspacePaths] = useState<string[]>([]);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [projectMenuPosition, setProjectMenuPosition] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
+  const projectSwitcherRef = useRef<HTMLDivElement | null>(null);
+  const projectMenuRef = useRef<HTMLDivElement | null>(null);
+  const [recentProjectPaths, setRecentProjectPaths] = useState<string[]>(getRecentProjectPaths);
+  const [hiddenProjectPaths, setHiddenProjectPaths] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("nova_hidden_project_tabs") || "[]"); } catch { return []; }
+  });
+  const [hiddenChatIds, setHiddenChatIds] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("nova_hidden_chat_tabs") || "[]"); } catch { return []; }
+  });
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [snipPreview, setSnipPreview] = useState<string | null>(null);
   const [droppedFilePath, setDroppedFilePath] = useState<string | null>(null);
   const [showClipboardDrawer, setShowClipboardDrawer] = useState(false);
@@ -133,6 +177,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const islandBodyRef = useRef<HTMLDivElement | null>(null);
   const pillLayerRef = useRef<HTMLDivElement | null>(null);
   const pillMeasureRef = useRef<HTMLDivElement | null>(null);
+  const pillSizerRef = useRef<HTMLDivElement | null>(null);
   const closedStatusRef = useRef<HTMLDivElement | null>(null);
   const expandedLayerRef = useRef<HTMLDivElement | null>(null);
   const expandedMeasureRef = useRef<HTMLDivElement | null>(null);
@@ -154,7 +199,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const foldTimerRef = useRef<number | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
 
-  const pillWidthRef = useRef<number>(168);
+  const pillWidthRef = useRef<number>(176);
   const expandedHeightRef = useRef<number>(280);
   const expandedRef = useRef<boolean>(embeddedPreview);
   const startupIntroPlayedRef = useRef(false);
@@ -164,10 +209,18 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const pillHoveredRef = useRef<boolean>(false);
   const proximityRef = useRef<number>(0);
   const pointerInsideRef = useRef<boolean>(false);
+  const suppressCollapseUntilMainReturnRef = useRef<boolean>(false);
+  const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
+  const pushedExtraKeyRef = useRef<string>("");
+  const keepOpenAfterSendUntilRef = useRef<number>(0);
+  const nativeDialogOpenRef = useRef<boolean>(false);
   const soundEnabledRef = useRef<boolean>(settings.soundEnabled);
   const snapZoneRef = useRef<string>(settings.snapZone);
   const monitorIndexRef = useRef<number>(settings.monitorIndex);
-  const pendingCountRef = useRef<number>(pendingApprovals.length);
+  const pendingCountRef = useRef<number>(totalUrgentCount);
+  const collapseDelayMsRef = useRef<number>(settings.islandCollapseDelayMs ?? 0);
+  const suppressFullscreenSettingRef = useRef<boolean>(Boolean(settings.suppressFullscreen));
+  const liveFullscreenRef = useRef<boolean | null>(null);
   const suppressFullscreenRef = useRef<boolean>(
     Boolean(settings.suppressFullscreen && telemetry?.fullscreenActive)
   );
@@ -175,14 +228,16 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   soundEnabledRef.current = settings.soundEnabled;
   snapZoneRef.current = settings.snapZone;
   monitorIndexRef.current = settings.monitorIndex;
-  pendingCountRef.current = pendingApprovals.length;
+  pendingCountRef.current = totalUrgentCount;
+  collapseDelayMsRef.current = Math.max(0, Math.min(60_000, settings.islandCollapseDelayMs ?? 0));
+  suppressFullscreenSettingRef.current = Boolean(settings.suppressFullscreen);
   suppressFullscreenRef.current = Boolean(
-    settings.suppressFullscreen && telemetry?.fullscreenActive
+    settings.suppressFullscreen && (liveFullscreenRef.current ?? telemetry?.fullscreenActive)
   );
 
   // Physics tracks initialized to starting state
   const widthTrackRef = useRef<TrackedValue>(
-    new TrackedValue(embeddedPreview ? EXPANDED_WIDTH : 168)
+    new TrackedValue(embeddedPreview ? EXPANDED_WIDTH : 176)
   );
   const heightTrackRef = useRef<TrackedValue>(
     new TrackedValue(embeddedPreview ? 280 : PILL_HEIGHT)
@@ -205,11 +260,57 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   );
 
   const orbState: OrbState =
-    pendingApprovals.length > 0
+    totalUrgentCount > 0
       ? "alert"
       : activeAgentCount > 0
       ? "active"
       : "idle";
+
+  const liveClosedStatus = useMemo(() => {
+    if (pendingQuestions.length > 0) {
+      return {
+        cls: "closed-alert-text",
+        text: `${pendingQuestions.length} ${t(lang, "waitingQuestion")}`,
+      };
+    }
+    if (pendingApprovals.length > 0) {
+      return {
+        cls: "closed-alert-text",
+        text: `${pendingApprovals.length} ${t(lang, "waitingApproval")}`,
+      };
+    }
+    if (activeAgentCount > 0) {
+      const live = sessions.find(
+        (s) => s.status === "active" || s.status === "waiting_approval"
+      );
+      let label = `${activeAgentCount} ${t(lang, "activeAgents")}`;
+      if (live?.phase === "thinking") {
+        label = lang === "th" ? "กำลังคิด…" : "Thinking…";
+      } else if (live?.activeTool) {
+        label =
+          live.activeTool.length > 30
+            ? `${live.activeTool.slice(0, 30)}…`
+            : live.activeTool;
+      }
+      return { cls: "closed-active-text", text: label };
+    }
+    return { cls: "closed-idle-text", text: t(lang, "idleReady") };
+  }, [activeAgentCount, lang, pendingApprovals.length, pendingQuestions.length, sessions]);
+
+  const [displayedClosedStatus, setDisplayedClosedStatus] = useState(liveClosedStatus);
+  const [pillAwaitingExpand, setPillAwaitingExpand] = useState(false);
+  const [pillTextAnimSeq, setPillTextAnimSeq] = useState(0);
+  const pendingClosedStatusRef = useRef(liveClosedStatus);
+  const isExpandingPillContentRef = useRef(false);
+  const pillExpandStartWRef = useRef(MIN_PILL_WIDTH);
+  const commitPendingPillContentRef = useRef<(() => void) | null>(null);
+
+  commitPendingPillContentRef.current = () => {
+    isExpandingPillContentRef.current = false;
+    setDisplayedClosedStatus(pendingClosedStatusRef.current);
+    setPillAwaitingExpand(false);
+    setPillTextAnimSeq((seq) => seq + 1);
+  };
 
   const syncDomShellFlags = useCallback(() => {
     const shell = shellRef.current;
@@ -245,26 +346,66 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     [embeddedPreview]
   );
 
+  const getSettledMainIslandRect = useCallback((): HoverRect => {
+    const isExp = expandedRef.current;
+    const w = isExp ? getMaxExpandedWidth() : pillWidthRef.current;
+    const h = isExp ? expandedHeightRef.current : PILL_HEIGHT;
+    const { rx, ry } = computeZoneRect(w, h);
+    return { x: rx, y: ry, w, h };
+  }, [computeZoneRect, getMaxExpandedWidth]);
+
+  const collectPopoverExtraRects = useCallback((mainRect: HoverRect): HoverRect[] => {
+    if (!expandedRef.current) return [];
+    const rawRects: HoverRect[] = [];
+    document
+      .querySelectorAll<HTMLElement>("[data-nova-island-hover-region='true']")
+      .forEach((region) => {
+        const rect = region.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          rawRects.push({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
+        }
+      });
+    return buildPopoverExtraRects(mainRect, rawRects);
+  }, []);
+
   const pushHitRectIfNeeded = useCallback(
     (rx: number, ry: number, hitW: number, hitH: number, force = false) => {
       if (embeddedPreview) return;
       const now = performance.now();
       if (!force && now - lastRectPushMsRef.current < 48) return;
+      const mainRect: HoverRect = { x: rx, y: ry, w: hitW, h: hitH };
+      const extraRects = collectPopoverExtraRects(mainRect);
+      const extraKey = extraRects
+        .map((r) => `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`)
+        .join("|");
       const prev = pushedRectRef.current;
+      const isExpNow = expandedRef.current;
       if (
         force ||
-        Math.abs(prev.x - rx) > 1 ||
-        Math.abs(prev.y - ry) > 1 ||
-        Math.abs(prev.w - hitW) > 1 ||
-        Math.abs(prev.h - hitH) > 1
+        extraKey !== pushedExtraKeyRef.current ||
+        Math.abs(prev.x - mainRect.x) > 0.5 ||
+        Math.abs(prev.y - mainRect.y) > 0.5 ||
+        Math.abs(prev.w - mainRect.w) > 0.5 ||
+        Math.abs(prev.h - mainRect.h) > 0.5
       ) {
-        pushedRectRef.current = { x: rx, y: ry, w: hitW, h: hitH };
+        pushedRectRef.current = mainRect;
+        pushedExtraKeyRef.current = extraKey;
         lastRectPushMsRef.current = now;
-        novaApi.setIslandRect(rx, ry, hitW, hitH);
+        novaApi.setIslandRect(mainRect.x, mainRect.y, mainRect.w, mainRect.h, extraRects, isExpNow);
       }
     },
-    [embeddedPreview]
+    [collectPopoverExtraRects, embeddedPreview]
   );
+
+  // Portaled menus sit outside the shell, so sync their exact bounds as separate hover regions.
+  useEffect(() => {
+    const syncPopoverHitRegion = () => {
+      const main = getSettledMainIslandRect();
+      pushHitRectIfNeeded(main.x, main.y, main.w, main.h, true);
+    };
+    window.addEventListener(ISLAND_HOVER_REGION_EVENT, syncPopoverHitRegion);
+    return () => window.removeEventListener(ISLAND_HOVER_REGION_EVENT, syncPopoverHitRegion);
+  }, [getSettledMainIslandRect, pushHitRectIfNeeded]);
 
   const applyFrameStyles = useCallback(
     (stillMoving = false) => {
@@ -305,11 +446,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         ? -12 * (1 - revealCurve(startupDropProgress))
         : 0;
       const frameShellY = shellY + startupDropOffset;
-      const wakeProx =
-        !embeddedPreview && !isOpening && !startupIntroActiveRef.current && p < 0.01
-          ? proximityRef.current
-          : 0;
-      const wakeScale = 1 + wakeProx * 0.026;
+      // Zero-scale pre-wake (`wakeScale = 1`): never scale the folded shell beyond its exact
+      // CSS hit-rect so visual pixels and hover hit-detection match 1:1 with zero phantom gap!
+      const wakeScale = 1;
 
       shell.style.width = `${w.toFixed(2)}px`;
       shell.style.height = `${h.toFixed(2)}px`;
@@ -365,16 +504,23 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         pillLayer.style.visibility = "visible";
         pillLayer.style.pointerEvents = "none";
       } else {
+        const isFoldedWidthMorph =
+          !isOpening && h <= PILL_HEIGHT + 0.5 && !startupIntroActiveRef.current;
+        const activePillBoxW = isFoldedWidthMorph ? w : basePillW;
         const pillScale = isOpening ? 1 + (1 - pillAlpha) * 0.025 : 0.97 + pillAlpha * 0.03;
-        const pillX = startupIntroActiveRef.current
-          ? 0
-          : zone === "top-left"
+        const pillX =
+          startupIntroActiveRef.current || isFoldedWidthMorph
             ? 0
-            : zone === "top-right"
-              ? w - basePillW
-              : (w - basePillW) * 0.5;
+            : zone === "top-left"
+              ? 0
+              : zone === "top-right"
+                ? w - activePillBoxW
+                : (w - activePillBoxW) * 0.5;
         const pillSlideY = (1 - pillAlpha) * (isBottom ? -2.5 : 2.5);
         const pillY = (isBottom ? h - PILL_HEIGHT : 0) + pillSlideY;
+        pillLayer.style.width = startupIntroActiveRef.current
+          ? ""
+          : `${activePillBoxW.toFixed(2)}px`;
         pillLayer.style.visibility = "visible";
         pillLayer.style.opacity = pillAlpha.toFixed(4);
         pillLayer.style.pointerEvents = !isOpening && p < 0.22 ? "auto" : "none";
@@ -467,6 +613,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       heightTrackRef.current.step(dt, now);
       radiusTrackRef.current.step(dt, now);
 
+      if (isExpandingPillContentRef.current) {
+        const targetW = pillWidthRef.current;
+        const span = Math.max(1, targetW - pillExpandStartWRef.current);
+        const threshold = targetW - Math.max(3, span * 0.12);
+        if (
+          expandedRef.current ||
+          !widthTrackRef.current.animating ||
+          widthTrackRef.current.value >= threshold
+        ) {
+          commitPendingPillContentRef.current?.();
+        }
+      }
+
       const startupStillMoving =
         startupIntroActiveRef.current &&
         (!startupUnfurlStartedRef.current || now - startupIntroStartedAtRef.current < STARTUP_DROP_MS);
@@ -546,6 +705,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         startupUnfurlStartedRef.current = true;
         shellRef.current?.classList.remove("is-launching");
       }
+      if (isExpandingPillContentRef.current) {
+        commitPendingPillContentRef.current?.();
+      }
       expandedRef.current = true;
       pillHoveredRef.current = false;
       proximityRef.current = 1;
@@ -604,6 +766,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       }
 
       const wasOpen = expandedRef.current;
+      suppressCollapseUntilMainReturnRef.current = false;
+      setProjectMenuOpen(false);
       expandedRef.current = false;
       pillHoveredRef.current = false;
       proximityRef.current = 0;
@@ -635,6 +799,8 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     if (supernovaActiveRef.current) return;
     pointerInsideRef.current = true;
 
+    if (nativeDialogOpenRef.current) return;
+
     if (foldTimerRef.current) {
       window.clearTimeout(foldTimerRef.current);
       foldTimerRef.current = null;
@@ -647,8 +813,47 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     openIsland();
   }, [openIsland]);
 
+  // When a popover option is selected while the cursor sits outside the main island
+  // (e.g. a modal opened below due to compact height), disable collapse until the cursor
+  // moves back onto the main island; if already inside the main island, keep normal collapse.
+  useEffect(() => {
+    const onPopoverSelect = (event: Event) => {
+      if (!expandedRef.current) return;
+      const detail = (event as CustomEvent<IslandPopoverSelectDetail>).detail;
+      const mainRect = getSettledMainIslandRect();
+      const shouldSuppress = resolvePopoverSelectCollapseLock(
+        detail?.clientX ?? -1,
+        detail?.clientY ?? -1,
+        lastPointerPosRef.current,
+        mainRect
+      );
+      suppressCollapseUntilMainReturnRef.current = shouldSuppress;
+      if (shouldSuppress) {
+        if (foldTimerRef.current) {
+          window.clearTimeout(foldTimerRef.current);
+          foldTimerRef.current = null;
+        }
+      } else {
+        pointerInsideRef.current = true;
+      }
+    };
+    window.addEventListener(ISLAND_POPOVER_SELECT_EVENT, onPopoverSelect);
+    return () => window.removeEventListener(ISLAND_POPOVER_SELECT_EVENT, onPopoverSelect);
+  }, [getSettledMainIslandRect]);
+
   const leaveHover = useCallback(() => {
-    if (!pointerInsideRef.current) return;
+    if (!pointerInsideRef.current && !expandedRef.current) return;
+    if (nativeDialogOpenRef.current) {
+      pointerInsideRef.current = false;
+      return;
+    }
+    if (suppressCollapseUntilMainReturnRef.current) {
+      if (foldTimerRef.current) {
+        window.clearTimeout(foldTimerRef.current);
+        foldTimerRef.current = null;
+      }
+      return;
+    }
     pointerInsideRef.current = false;
 
     if (!expandedRef.current) {
@@ -662,11 +867,24 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
     if (pendingCountRef.current > 0) return;
     if (foldTimerRef.current) window.clearTimeout(foldTimerRef.current);
+    const sendTransitionHoldMs = Math.max(0, keepOpenAfterSendUntilRef.current - Date.now());
     foldTimerRef.current = window.setTimeout(() => {
       foldTimerRef.current = null;
+      if (pointerInsideRef.current) return;
       closeIsland();
-    }, 95);
+    }, Math.max(collapseDelayMsRef.current, sendTransitionHoldMs));
   }, [closeIsland, retargetGeometry, syncDomShellFlags]);
+
+  useEffect(() => listenForNativeDialogState((open) => {
+    nativeDialogOpenRef.current = open;
+    if (open) {
+      if (foldTimerRef.current) window.clearTimeout(foldTimerRef.current);
+      foldTimerRef.current = null;
+      return;
+    }
+    keepOpenAfterSendUntilRef.current = Math.max(keepOpenAfterSendUntilRef.current, Date.now() + 900);
+    if (!pointerInsideRef.current) leaveHover();
+  }), [leaveHover]);
 
   // Pre-warm interactive WebAudio + WASAPI keep-alive so hover cues fire with zero cold-start delay
   useEffect(() => {
@@ -689,6 +907,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     }
     if (shadowRef.current) shadowRef.current.style.opacity = "0";
     if (pillLayerRef.current) {
+      pillLayerRef.current.style.width = "";
       pillLayerRef.current.style.opacity = "0";
       pillLayerRef.current.style.visibility = "hidden";
     }
@@ -763,18 +982,28 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
   // Measure natural pill width & expanded content height continuously via ResizeObserver
   useLayoutEffect(() => {
-    const pillEl = pillMeasureRef.current;
+    const sizerEl = pillSizerRef.current ?? pillMeasureRef.current;
     const expEl = expandedMeasureRef.current;
     vpSizeRef.current = {
       w: window.innerWidth || 900,
       h: window.innerHeight || 690,
     };
 
+    const measureTargetPillWidth = () => {
+      if (!sizerEl) return pillWidthRef.current;
+      return clamp(
+        Math.ceil(sizerEl.offsetWidth) + PILL_BREATHING_EXTRA_PX,
+        MIN_PILL_WIDTH,
+        MAX_PILL_WIDTH
+      );
+    };
+
     const syncPillWidth = () => {
-      if (!pillEl) return;
-      const measured = Math.max(MIN_PILL_WIDTH, Math.ceil(pillEl.offsetWidth));
+      if (!sizerEl) return;
+      const measured = measureTargetPillWidth();
       if (Math.abs(measured - pillWidthRef.current) >= 1) {
-        const firstMeasure = pillWidthRef.current === 168 && !widthTrackRef.current.animating;
+        const firstMeasure =
+          pillWidthRef.current === MIN_PILL_WIDTH && !widthTrackRef.current.animating;
         pillWidthRef.current = measured;
         if (!expandedRef.current && !startupIntroActiveRef.current && !supernovaActiveRef.current) {
           retargetGeometry({ immediate: firstMeasure });
@@ -864,7 +1093,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       syncPillWidth();
       syncExpandedHeight();
     });
-    if (pillEl) ro.observe(pillEl);
+    if (sizerEl) ro.observe(sizerEl);
     if (expEl) ro.observe(expEl);
 
     const onWinResize = () => {
@@ -893,6 +1122,78 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     syncDomShellFlags,
   ]);
 
+  // Stage folded-pill text transitions so when status text grows longer, the island capsule
+  // springs wider FIRST and reveals the longer text only once the island covers it.
+  useLayoutEffect(() => {
+    pendingClosedStatusRef.current = liveClosedStatus;
+    const sizerEl = pillSizerRef.current;
+    const nextW = sizerEl
+      ? clamp(
+          Math.ceil(sizerEl.offsetWidth) + PILL_BREATHING_EXTRA_PX,
+          MIN_PILL_WIDTH,
+          MAX_PILL_WIDTH
+        )
+      : pillWidthRef.current;
+    const curW = widthTrackRef.current.value;
+    const textChanged =
+      liveClosedStatus.text !== displayedClosedStatus.text ||
+      liveClosedStatus.cls !== displayedClosedStatus.cls;
+
+    const shouldExpandIslandFirst =
+      textChanged &&
+      !expandedRef.current &&
+      !supernovaActiveRef.current &&
+      !startupIntroActiveRef.current &&
+      !prefersReducedMotion() &&
+      heightTrackRef.current.value <= PILL_HEIGHT + 0.5 &&
+      nextW > curW + 4;
+
+    if (shouldExpandIslandFirst) {
+      pillExpandStartWRef.current = curW;
+      pillWidthRef.current = nextW;
+      isExpandingPillContentRef.current = true;
+      setPillAwaitingExpand(true);
+      if (!embeddedPreview) {
+        const { rx, ry } = computeZoneRect(nextW, PILL_HEIGHT);
+        pushHitRectIfNeeded(rx, ry, nextW, PILL_HEIGHT, true);
+      }
+      widthTrackRef.current.springTo(nextW, 0.2, ISLAND_OPEN_DAMPING);
+      ensurePhysicsLoop();
+      return;
+    }
+
+    if (!isExpandingPillContentRef.current) {
+      if (textChanged) {
+        setDisplayedClosedStatus(liveClosedStatus);
+        setPillAwaitingExpand(false);
+        if (!supernovaActiveRef.current && !startupIntroActiveRef.current) {
+          setPillTextAnimSeq((seq) => seq + 1);
+        }
+      }
+      if (Math.abs(nextW - pillWidthRef.current) >= 1) {
+        pillWidthRef.current = nextW;
+        if (!expandedRef.current && !startupIntroActiveRef.current && !supernovaActiveRef.current) {
+          retargetGeometry();
+        }
+      }
+    } else if (nextW <= curW + 4) {
+      pillWidthRef.current = nextW;
+      commitPendingPillContentRef.current?.();
+      if (!expandedRef.current && !startupIntroActiveRef.current && !supernovaActiveRef.current) {
+        retargetGeometry();
+      }
+    }
+  }, [
+    computeZoneRect,
+    displayedClosedStatus.cls,
+    displayedClosedStatus.text,
+    embeddedPreview,
+    ensurePhysicsLoop,
+    liveClosedStatus,
+    pushHitRectIfNeeded,
+    retargetGeometry,
+  ]);
+
   // Keep staged body transform synced whenever switching tabs while expanded
   useLayoutEffect(() => {
     applyFrameStyles();
@@ -907,13 +1208,26 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     };
   }, []);
 
-  // Auto-open whenever an urgent approval arrives
+  // Auto-open whenever an urgent approval or interactive agent question arrives
   useEffect(() => {
-    if (pendingApprovals.length > 0) {
+    if (totalUrgentCount > 0) {
       setActiveTab("mission");
       openIsland({ silent: true });
+      if (pendingQuestions.length > 0) {
+        const latestQ = pendingQuestions[0];
+        if (latestQ?.workspacePath) {
+          setSelectedWorkspacePath(latestQ.workspacePath);
+        }
+        if (latestQ?.conversationId) {
+          setSelectedSessionId(latestQ.conversationId);
+          setIsNewChatDraft(false);
+        }
+        if (!embeddedPreview) {
+          void novaApi.focusIslandWindow();
+        }
+      }
     }
-  }, [pendingApprovals.length, openIsland]);
+  }, [embeddedPreview, openIsland, pendingQuestions, totalUrgentCount]);
 
   // Reposition Tauri stage window ONLY when snapZone or monitorIndex changes in settings
   useEffect(() => {
@@ -926,58 +1240,125 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     applyFrameStyles();
   }, [settings.snapZone, settings.monitorIndex, embeddedPreview, applyFrameStyles]);
 
-  // Authoritative Win32 cursor hit-tester events in Tauri desktop mode
+  // Authoritative Win32 cursor hit-tester events in Tauri desktop mode.
+  // Keep a permanent single-mount subscription backed by a ref so re-renders never create
+  // async unlisten/re-listen dead windows where pointer transitions could be missed.
+  const islandPointerHandlerRef = useRef<
+    (payload: {
+      inside: boolean;
+      on_main?: boolean;
+      fullscreen?: boolean;
+      x: number;
+      y: number;
+      proximity?: number;
+    }) => void
+  >(() => {});
+
+  islandPointerHandlerRef.current = ({
+    inside,
+    on_main,
+    fullscreen,
+    x,
+    y,
+    proximity = 0,
+  }) => {
+    lastPointerPosRef.current = { x, y };
+    if (typeof fullscreen === "boolean" && (inside || proximity > 0)) {
+      liveFullscreenRef.current = fullscreen;
+      suppressFullscreenRef.current = Boolean(
+        suppressFullscreenSettingRef.current && fullscreen
+      );
+    }
+
+    const mainRect = getSettledMainIslandRect();
+    const onMain =
+      typeof on_main === "boolean"
+        ? on_main
+        : x >= mainRect.x &&
+          x <= mainRect.x + mainRect.w &&
+          y >= mainRect.y &&
+          y <= mainRect.y + mainRect.h;
+
+    const step = stepIslandPointerHoverState({
+      inside,
+      onMain,
+      suppressCollapseUntilMainReturn: suppressCollapseUntilMainReturnRef.current,
+      pointerInside: pointerInsideRef.current,
+    });
+    suppressCollapseUntilMainReturnRef.current = step.nextSuppressCollapse;
+
+    if (step.action === "enter") {
+      if (supernovaActiveRef.current && !expandedRef.current) {
+        // Once the intro capsule has docked into the top pill slot, allow immediate hover open
+        openIsland();
+        return;
+      }
+      enterHover();
+      return;
+    }
+    if (step.action === "hold") {
+      if (foldTimerRef.current) {
+        window.clearTimeout(foldTimerRef.current);
+        foldTimerRef.current = null;
+      }
+      return;
+    }
+    if (step.action === "leave") {
+      leaveHover();
+    }
+
+    // Subtle GPU pre-wake scale + border highlight ONLY when resting folded (zero layout
+    // resize, zero IPC feedback loop, and never allowed to interrupt an active collapse)
+    if (
+      !expandedRef.current &&
+      !isMorphingRef.current &&
+      !startupIntroActiveRef.current &&
+      !supernovaActiveRef.current &&
+      !(suppressFullscreenRef.current && pendingCountRef.current === 0)
+    ) {
+      const nextProx = clamp(proximity, 0, 1);
+      const nextNear = nextProx > 0.12;
+      const gatedProx = nextNear ? nextProx : 0;
+      if (
+        Math.abs(gatedProx - proximityRef.current) > 0.012 ||
+        (gatedProx === 0 && proximityRef.current !== 0)
+      ) {
+        proximityRef.current = gatedProx;
+        applyFrameStyles(false);
+      }
+      if (nextNear !== pillHoveredRef.current) {
+        if (nextNear) warmNovaAudio(soundEnabledRef.current);
+        pillHoveredRef.current = nextNear;
+        syncDomShellFlags();
+      }
+    }
+  };
+
   useEffect(() => {
     if (embeddedPreview) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    novaApi
-      .onIslandPointer(({ inside, proximity = 0 }) => {
-        if (inside) {
-          enterHover();
-          return;
-        }
-
-        if (pointerInsideRef.current) {
-          leaveHover();
-        }
-
-        // Subtle GPU pre-wake scale + border highlight ONLY when resting folded (zero layout
-        // resize, zero IPC feedback loop, and never allowed to interrupt an active collapse)
-        if (
-          !expandedRef.current &&
-          !isMorphingRef.current &&
-          !startupIntroActiveRef.current &&
-          !supernovaActiveRef.current &&
-          !(suppressFullscreenRef.current && pendingCountRef.current === 0)
-        ) {
-          const nextProx = clamp(proximity, 0, 1);
-          const nextNear = nextProx > 0.12;
-          const gatedProx = nextNear ? nextProx : 0;
-          if (Math.abs(gatedProx - proximityRef.current) > 0.012 || (gatedProx === 0 && proximityRef.current !== 0)) {
-            proximityRef.current = gatedProx;
-            applyFrameStyles(false);
-          }
-          if (nextNear !== pillHoveredRef.current) {
-            if (nextNear) warmNovaAudio(soundEnabledRef.current);
-            pillHoveredRef.current = nextNear;
-            syncDomShellFlags();
-          }
-        }
-      })
+    void novaApi
+      .onIslandPointer((payload) => islandPointerHandlerRef.current(payload))
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       });
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
-  }, [applyFrameStyles, embeddedPreview, enterHover, leaveHover, retargetGeometry, syncDomShellFlags]);
+  }, [embeddedPreview]);
 
   // Global keyboard shortcut inside window (`Ctrl+Alt+Space` / `Ctrl+K` / `Escape`)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && expandedRef.current) {
-        closeIsland({ force: pendingApprovals.length === 0 });
+        closeIsland({ force: totalUrgentCount === 0 });
       }
       if (
         (e.ctrlKey && e.altKey && e.code === "Space") ||
@@ -991,30 +1372,262 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     return () => {
       window.removeEventListener("keydown", onKey);
     };
-  }, [closeIsland, openIsland, pendingApprovals.length]);
+  }, [closeIsland, openIsland, totalUrgentCount]);
 
   const useNativePointerPoll = !embeddedPreview && isTauriRuntime();
 
-  const handleShellPointerEnter = () => {
-    if (useNativePointerPoll) return;
+  // Mirror the exact multi-rect + post-select hover state machine in browser / non-Tauri mode
+  useEffect(() => {
+    if (embeddedPreview || useNativePointerPoll) return;
+    const onPointerMove = (e: PointerEvent) => {
+      lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
+      if (!expandedRef.current) return;
+      const shellRect = shellRef.current?.getBoundingClientRect();
+      const mainRect: HoverRect = shellRect
+        ? { x: shellRect.left, y: shellRect.top, w: shellRect.width, h: shellRect.height }
+        : getSettledMainIslandRect();
+      const extraRects = collectPopoverExtraRects(mainRect);
+      const hit = hitTestIslandRegions(e.clientX, e.clientY, mainRect, extraRects, true);
+      const step = stepIslandPointerHoverState({
+        inside: hit.inside,
+        onMain: hit.onMain,
+        suppressCollapseUntilMainReturn: suppressCollapseUntilMainReturnRef.current,
+        pointerInside: pointerInsideRef.current,
+      });
+      suppressCollapseUntilMainReturnRef.current = step.nextSuppressCollapse;
+      if (step.action === "enter") {
+        enterHover();
+      } else if (step.action === "hold") {
+        if (foldTimerRef.current) {
+          window.clearTimeout(foldTimerRef.current);
+          foldTimerRef.current = null;
+        }
+      } else if (step.action === "leave") {
+        leaveHover();
+      }
+    };
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    return () => window.removeEventListener("pointermove", onPointerMove);
+  }, [collectPopoverExtraRects, embeddedPreview, enterHover, getSettledMainIslandRect, leaveHover, useNativePointerPoll]);
+
+  const handleShellPointerEnter = (e: React.MouseEvent) => {
+    if (embeddedPreview) return;
+    lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
+    if (useNativePointerPoll) {
+      // Instant zero-IPC backup when folded: Win32 only delivers mouseenter once the cursor is
+      // already inside the pill hit-rect and passthrough has been disabled.
+      if (!expandedRef.current) {
+        enterHover();
+      }
+      return;
+    }
+    suppressCollapseUntilMainReturnRef.current = false;
     enterHover();
   };
 
-  const handleShellPointerLeave = () => {
+  const handleShellPointerLeave = (e: React.MouseEvent) => {
     // In Tauri desktop overlay, Win32 GetCursorPos (`onIslandPointer`) handles leave so native
     // <select> popups or child transitions never trigger false mouseleave folds.
-    if (useNativePointerPoll) return;
-    leaveHover();
+    if (useNativePointerPoll || embeddedPreview) return;
+    lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
+    const shellRect = shellRef.current?.getBoundingClientRect();
+    const mainRect: HoverRect = shellRect
+      ? { x: shellRect.left, y: shellRect.top, w: shellRect.width, h: shellRect.height }
+      : getSettledMainIslandRect();
+    const extraRects = collectPopoverExtraRects(mainRect);
+    const relatedInPopover =
+      e.relatedTarget instanceof Element &&
+      Boolean(e.relatedTarget.closest("[data-nova-island-hover-region='true']"));
+    const hit = hitTestIslandRegions(
+      e.clientX,
+      e.clientY,
+      mainRect,
+      extraRects,
+      expandedRef.current
+    );
+    const step = stepIslandPointerHoverState({
+      inside: hit.inside || relatedInPopover,
+      onMain: hit.onMain,
+      suppressCollapseUntilMainReturn: suppressCollapseUntilMainReturnRef.current,
+      pointerInside: pointerInsideRef.current,
+    });
+    suppressCollapseUntilMainReturnRef.current = step.nextSuppressCollapse;
+    if (step.action === "leave") {
+      leaveHover();
+    }
   };
 
-  const selectedSession =
-    sessions.find((s) => s.conversationId === selectedSessionId) || sessions[0] || null;
+  const allProjectPaths = [
+    ...(snapshot.recentWorkspaces ?? []).map((workspace) => workspace.path),
+    ...sessions.map((session) => session.workspacePath),
+    ...recentProjectPaths,
+    ...addedWorkspacePaths,
+  ].reduce<string[]>((unique, path) => {
+    if (path && !unique.some((existing) => existing.toLowerCase() === path.toLowerCase())) unique.push(path);
+    return unique;
+  }, []);
+  const projectPaths = allProjectPaths.filter((path) => !hiddenProjectPaths.some((hidden) => hidden.toLowerCase() === path.toLowerCase()));
+  const activeWorkspacePath = (selectedWorkspacePath && projectPaths.some((path) => path.toLowerCase() === selectedWorkspacePath.toLowerCase())
+    ? selectedWorkspacePath
+    : projectPaths[0]) ?? "";
+  const workspaceSessions = sessions.filter((session) =>
+    session.workspacePath.toLowerCase() === activeWorkspacePath.toLowerCase() && !hiddenChatIds.includes(session.conversationId)
+  );
+  const selectedSession = isNewChatDraft
+    ? null
+    : workspaceSessions.find((session) => session.conversationId === selectedSessionId) || workspaceSessions[0] || null;
 
-  const activeThread = snapshot.threads[0] || null;
+  useLayoutEffect(() => {
+    if (!projectMenuOpen) {
+      setProjectMenuPosition(null);
+      return;
+    }
+    const rect = projectSwitcherRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const rawHeight = projectMenuRef.current?.scrollHeight ?? 180;
+    const desiredHeight = Math.min(280, rawHeight);
+    const menuWidth = projectMenuRef.current?.offsetWidth || 260;
+    const placement = computePopoverPlacement({
+      triggerRect: rect,
+      desiredHeight,
+      menuWidth,
+      viewportW: window.innerWidth,
+      viewportH: window.innerHeight,
+      gap: 8,
+      margin: 8,
+    });
+    setProjectMenuPosition({
+      top: placement.top,
+      left: placement.left,
+      maxHeight: Math.max(72, Math.min(280, placement.availableHeight)),
+    });
+  }, [projectMenuOpen, projectPaths.length]);
+
+  useLayoutEffect(() => {
+    if (!projectMenuOpen || !projectMenuPosition) return;
+    const notify = () => window.dispatchEvent(new Event(ISLAND_HOVER_REGION_EVENT));
+    notify();
+    const el = projectMenuRef.current;
+    const ro =
+      el && typeof ResizeObserver !== "undefined" ? new ResizeObserver(notify) : null;
+    if (el && ro) ro.observe(el);
+    return () => {
+      ro?.disconnect();
+      notify();
+    };
+  }, [projectMenuOpen, projectMenuPosition]);
+
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (
+        !projectSwitcherRef.current?.contains(event.target as Node) &&
+        !projectMenuRef.current?.contains(event.target as Node)
+      ) {
+        setProjectMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProjectMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectMenuOpen]);
+
+  useEffect(() => {
+    if (activeTab !== "mission" || pendingQuestions.length > 0) return;
+    let timer = 0;
+    let cancelled = false;
+    const focusComposer = (retries: number) => {
+      if (cancelled) return;
+      const input = document.querySelector<HTMLTextAreaElement>(".nova-mission-full textarea.cockpit-input");
+      if (input) {
+        input.focus({ preventScroll: true });
+        const cursor = input.value.length;
+        input.setSelectionRange(cursor, cursor);
+      } else if (retries > 0) {
+        timer = window.setTimeout(() => focusComposer(retries - 1), 40);
+      }
+    };
+    timer = window.setTimeout(() => focusComposer(6), 30);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeTab, activeWorkspacePath, isNewChatDraft, pendingQuestions.length, selectedSession?.conversationId]);
+
+  const activeThread =
+    snapshot.threads.find((thread) => thread.id === activeThreadId) ??
+    (activeThreadId ? null : snapshot.threads[0] || null);
+  const chatWorkspacePath = selectedWorkspacePath || activeThread?.workspacePath || "";
+
+  const selectWorkspaceForMission = (workspacePath: string) => {
+    const projectSessions = sessions.filter((session) => session.workspacePath.toLowerCase() === workspacePath.toLowerCase() && !hiddenChatIds.includes(session.conversationId));
+    setRecentProjectPaths(rememberRecentProjectPath(workspacePath));
+    setHiddenProjectPaths((hidden) => {
+      const next = hidden.filter((path) => path.toLowerCase() !== workspacePath.toLowerCase());
+      try { localStorage.setItem("nova_hidden_project_tabs", JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setSelectedWorkspacePath(workspacePath);
+    setProjectMenuOpen(false);
+    setAddedWorkspacePaths((paths) => paths.some((path) => path.toLowerCase() === workspacePath.toLowerCase()) ? paths : [...paths, workspacePath]);
+    setSelectedSessionId(null);
+    setIsNewChatDraft(true);
+    setChatInput("");
+  };
+
+  const closeProjectTab = (workspacePath: string) => {
+    setProjectMenuOpen(false);
+    const nextHidden = [...hiddenProjectPaths.filter((path) => path.toLowerCase() !== workspacePath.toLowerCase()), workspacePath];
+    setHiddenProjectPaths(nextHidden);
+    setAddedWorkspacePaths((paths) => paths.filter((path) => path.toLowerCase() !== workspacePath.toLowerCase()));
+    try { localStorage.setItem("nova_hidden_project_tabs", JSON.stringify(nextHidden)); } catch {}
+    if (activeWorkspacePath.toLowerCase() === workspacePath.toLowerCase()) {
+      const nextProject = projectPaths.find((path) => path.toLowerCase() !== workspacePath.toLowerCase());
+      if (nextProject) selectWorkspaceForMission(nextProject);
+      else {
+        setSelectedWorkspacePath("");
+        setSelectedSessionId(null);
+        setIsNewChatDraft(false);
+      }
+    }
+  };
+
+  const closeChatTab = (conversationId: string) => {
+    const nextHidden = [...hiddenChatIds.filter((id) => id !== conversationId), conversationId];
+    setHiddenChatIds(nextHidden);
+    try { localStorage.setItem("nova_hidden_chat_tabs", JSON.stringify(nextHidden)); } catch {}
+    if (selectedSessionId === conversationId) {
+      const nextSession = workspaceSessions.find((session) => session.conversationId !== conversationId);
+      setSelectedSessionId(nextSession?.conversationId ?? null);
+      setIsNewChatDraft(false);
+    }
+  };
+
+  const addProjectFromFolder = async () => {
+    setProjectMenuOpen(false);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await withNativeDialog(() => open({ directory: true, multiple: false, title: lang === "th" ? "เลือกโฟลเดอร์โปรเจกต์" : "Select project folder" }));
+      if (typeof selected === "string") selectWorkspaceForMission(selected);
+    } catch {
+      // The project picker remains available on the empty state if the native dialog cannot open.
+    }
+  };
+
+  const createChatThread = async () => {
+    const result = await novaApi.newChatThread(undefined, selectedWorkspacePath || undefined);
+    if (result.ok) setActiveThreadId(result.threadId);
+  };
 
   const handleSendChat = async () => {
     if (!chatInput.trim() && !snipPreview) return;
-    const threadId = activeThread?.id ?? "thread-main";
+    const threadId = activeThread?.id ?? activeThreadId ?? "thread-main";
     const text = chatInput.trim() || "Analyze this captured screen context.";
     setChatInput("");
     setChatSending(true);
@@ -1023,6 +1636,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       content: text,
       provider: settings.defaultChatProvider,
       model: settings.defaultChatModel,
+      workspacePath: chatWorkspacePath || undefined,
       imageDataUrl: snipPreview,
       attachedFile: droppedFilePath,
     });
@@ -1161,6 +1775,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             // Keep overflow visible while Hero NOVA is larger than 38px; clip right as docking completes
             // BEFORE unfurlP (>3.08s) begins so status text never peeks outside the capsule circle!
             shell.style.overflow = dockP >= 0.94 ? "hidden" : "visible";
+            if (dockP >= 0.96) {
+              pushHitRectIfNeeded(pillX, pillY, pillW, pillH);
+            }
 
             if (shellReveal <= 0.004) {
               shell.style.backgroundColor = "rgba(14, 14, 17, 0)";
@@ -1307,6 +1924,22 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       >
         {/* LAYER A: COMPACT FOLDED PILL */}
         <div ref={pillLayerRef} className="nova-pill-layer" aria-hidden={embeddedPreview}>
+          {/* Offscreen natural-width sizer so pre-paint layout knows incoming width before expanding */}
+          <div ref={pillSizerRef} className="nova-pill-measure nova-pill-sizer" aria-hidden="true">
+            <div className="nova-pill-orb-slot" />
+            <div className="nova-closed-status">
+              <span className={`nova-closed-label ${liveClosedStatus.cls}`}>
+                {liveClosedStatus.text}
+              </span>
+              <span className={`nova-pill-waveform state-${orbState}`}>
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
+            </div>
+          </div>
+
           <div ref={pillMeasureRef} className="nova-pill-measure">
             <div className="nova-pill-orb-slot">
               <NovaOrb
@@ -1323,31 +1956,24 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
               />
             </div>
             <div ref={closedStatusRef} className="nova-closed-status">
-              <span className={`live-pulse-dot state-${orbState}`} />
-              {pendingApprovals.length > 0 ? (
-                <span className="closed-alert-text">
-                  {pendingApprovals.length} {t(lang, "waitingApproval")}
-                </span>
-              ) : activeAgentCount > 0 ? (
-                <span className="closed-active-text">
-                  {(() => {
-                    const live = sessions.find(
-                      (s) => s.status === "active" || s.status === "waiting_approval"
-                    );
-                    if (live?.phase === "thinking") {
-                      return lang === "th" ? "กำลังคิด…" : "Thinking…";
-                    }
-                    if (live?.activeTool) {
-                      return live.activeTool.length > 26
-                        ? `${live.activeTool.slice(0, 26)}…`
-                        : live.activeTool;
-                    }
-                    return `${activeAgentCount} ${t(lang, "activeAgents")}`;
-                  })()}
-                </span>
-              ) : (
-                <span className="closed-idle-text">{t(lang, "idleReady")}</span>
-              )}
+              <span
+                key={pillTextAnimSeq}
+                className={`nova-closed-label ${displayedClosedStatus.cls}${
+                  pillAwaitingExpand
+                    ? " is-awaiting-island"
+                    : pillTextAnimSeq > 0
+                      ? " nova-pill-blur-glide"
+                      : ""
+                }`}
+              >
+                {displayedClosedStatus.text}
+              </span>
+              <span className={`nova-pill-waveform state-${orbState}`} aria-hidden="true">
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
             </div>
           </div>
         </div>
@@ -1375,9 +2001,11 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                 <div className="nova-brand-titles">
                   <span className="nova-logo-text">NOVA</span>
                   <span className="nova-sub-badge">
-                    {pendingApprovals.length > 0
-                      ? `${pendingApprovals.length} ${t(lang, "waitingApproval")}`
-                      : `${activeAgentCount} ${t(lang, "activeAgents")}`}
+                    {pendingQuestions.length > 0
+                      ? `${pendingQuestions.length} ${t(lang, "waitingQuestion")}`
+                      : pendingApprovals.length > 0
+                        ? `${pendingApprovals.length} ${t(lang, "waitingApproval")}`
+                        : `${activeAgentCount} ${t(lang, "activeAgents")}`}
                   </span>
                 </div>
               </div>
@@ -1389,9 +2017,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                 >
                   <Layers size={13} />
                   <span>{t(lang, "missionControl")}</span>
-                  {(pendingApprovals.length > 0 || sessions.length > 0) && (
-                    <span className={`pill-counter ${pendingApprovals.length > 0 ? "urgent" : ""}`}>
-                      {pendingApprovals.length > 0 ? `!${pendingApprovals.length}` : sessions.length}
+                  {(totalUrgentCount > 0 || sessions.length > 0) && (
+                    <span className={`pill-counter ${totalUrgentCount > 0 ? "urgent" : ""}`}>
+                      {totalUrgentCount > 0 ? `!${totalUrgentCount}` : sessions.length}
                     </span>
                   )}
                 </button>
@@ -1458,6 +2086,21 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
               {/* TAB 1: MISSION CONTROL */}
               {activeTab === "mission" && (
                 <div className="nova-mission-layout">
+                  {pendingQuestions.length > 0 && (
+                    <div className="nova-questions-stack">
+                      {pendingQuestions.map((pq) => (
+                        <QuestionCard
+                          key={pq.id}
+                          pending={pq}
+                          lang={lang}
+                          sttProvider={settings.sttProvider}
+                          hasCloudSttKey={hasCloudSttKey}
+                          compact
+                        />
+                      ))}
+                    </div>
+                  )}
+
                   {pendingApprovals.length > 0 && (
                     <div className="nova-approvals-stack">
                       {pendingApprovals.map((app) => (
@@ -1466,113 +2109,155 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                     </div>
                   )}
 
-                  {sessions.length === 0 ? (
-                    <div className="nova-empty-card">
-                      <p>{t(lang, "noActiveSessions")}</p>
-                      <div style={{ width: "100%", maxWidth: 560 }}>
-                        <NewRunBar snapshot={snapshot} lang={lang} />
-                      </div>
-                    </div>
+                  {!activeWorkspacePath ? (
+                    <ProjectSelectHero snapshot={snapshot} lang={lang} aura={settings.aura} compact onSelectWorkspace={selectWorkspaceForMission} />
                   ) : (
                     <div className="nova-mission-full">
-                      {/* Compact Top Project / Workspace Switcher Strip */}
-                      <div className="nova-ws-topbar">
-                        <div className="nova-ws-tabs">
-                          {sessions.map((s) => (
+                      <div className="nova-project-topbar nova-unified-topbar">
+                        <div className="nova-project-switcher-wrap" ref={projectSwitcherRef}>
+                          <div className="nova-project-switcher">
                             <button
-                              key={s.conversationId}
                               type="button"
-                              className={`nova-ws-tab ${
-                                selectedSession?.conversationId === s.conversationId
-                                  ? "selected"
-                                  : ""
-                              }`}
-                              onClick={() => setSelectedSessionId(s.conversationId)}
-                              title={s.workspacePath}
+                              className="nova-project-switcher-select"
+                              aria-haspopup="menu"
+                              aria-expanded={projectMenuOpen}
+                              onClick={() => setProjectMenuOpen((open) => !open)}
+                              title={activeWorkspacePath}
                             >
-                              <span className={`ws-status-dot status-${s.status}`} />
                               <FolderGit2 size={12} />
-                              <span className="ws-tab-name">{s.workspaceName}</span>
-                              {s.gitBranch && (
-                                <span className="ws-tab-branch">
-                                  <GitBranch size={10} /> {s.gitBranch}
-                                </span>
-                              )}
+                              <span>{snapshot.recentWorkspaces?.find((workspace) => workspace.path.toLowerCase() === activeWorkspacePath.toLowerCase())?.name
+                                || sessions.find((session) => session.workspacePath.toLowerCase() === activeWorkspacePath.toLowerCase())?.workspaceName
+                                || activeWorkspacePath.split(/[\\/]/).filter(Boolean).pop()
+                                || activeWorkspacePath}</span>
+                              <ChevronDown size={12} />
                             </button>
-                          ))}
+                            <button
+                              type="button"
+                              className="nova-project-switcher-close"
+                              aria-label={lang === "th" ? "ปิดแท็บโปรเจกต์" : "Close project tab"}
+                              title={lang === "th" ? "ปิดแท็บโปรเจกต์" : "Close project tab"}
+                              onClick={() => closeProjectTab(activeWorkspacePath)}
+                            >
+                              <X size={11} />
+                            </button>
+                          </div>
+                          {projectMenuOpen && createPortal(
+                            <div
+                              ref={projectMenuRef}
+                              className="nova-project-menu is-portaled"
+                              data-nova-island-hover-region={projectMenuPosition ? "true" : undefined}
+                              style={{
+                                top: `${projectMenuPosition?.top ?? -10000}px`,
+                                left: `${projectMenuPosition?.left ?? 8}px`,
+                                maxHeight: projectMenuPosition ? `${projectMenuPosition.maxHeight}px` : undefined,
+                                visibility: projectMenuPosition ? "visible" : "hidden",
+                              }}
+                              role="menu"
+                              aria-label={lang === "th" ? "เลือกโปรเจกต์" : "Choose project"}
+                            >
+                              {projectPaths.map((path) => {
+                                const label = snapshot.recentWorkspaces?.find((workspace) => workspace.path.toLowerCase() === path.toLowerCase())?.name
+                                  || sessions.find((session) => session.workspacePath.toLowerCase() === path.toLowerCase())?.workspaceName
+                                  || path.split(/[\\/]/).filter(Boolean).pop()
+                                  || path;
+                                const selected = activeWorkspacePath.toLowerCase() === path.toLowerCase();
+                                return (
+                                  <div key={path} className={`nova-project-menu-row ${selected ? "selected" : ""}`}>
+                                    <button type="button" role="menuitemradio" aria-checked={selected} className="nova-project-menu-select" title={path} onClick={(e) => { notifyIslandPopoverSelect(e); selectWorkspaceForMission(path); }}>
+                                      <FolderGit2 size={13} />
+                                      <span>{label}</span>
+                                      {selected && <CheckSquare size={12} />}
+                                    </button>
+                                    <button type="button" className="nova-project-menu-close" aria-label={`Close ${label} project tab`} title="Close project tab" onClick={(e) => { notifyIslandPopoverSelect(e); closeProjectTab(path); }}>
+                                      <X size={11} />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                              <div className="nova-project-menu-separator" />
+                              <button type="button" className="nova-project-menu-add" role="menuitem" onClick={(e) => { notifyIslandPopoverSelect(e); void addProjectFromFolder(); }}>
+                                <Plus size={13} /> {lang === "th" ? "เพิ่มโฟลเดอร์โปรเจกต์" : "Add project folder"}
+                              </button>
+                            </div>,
+                            document.body
+                          )}
                         </div>
-
+                        <span className="nova-unified-divider" aria-hidden="true" />
+                        <div className="nova-chat-tabs nova-unified-chat-tabs" aria-label={lang === "th" ? "แชตในโปรเจกต์" : "Chats in project"}>
+                        {workspaceSessions.map((session, index) => (
+                          <div key={session.conversationId} className={`nova-chat-tab ${selectedSession?.conversationId === session.conversationId ? "selected" : ""}`} title={session.lastUserInput || session.workspacePath}>
+                            <button type="button" className="nova-chat-tab-main" onClick={() => { setSelectedSessionId(session.conversationId); setIsNewChatDraft(false); }}>
+                              <span className={`ws-status-dot status-${session.status}`} />
+                              <span>{session.lastUserInput?.trim().slice(0, 24) || `Chat ${index + 1}`}</span>
+                            </button>
+                            <button type="button" className="nova-tab-close" aria-label="Close chat tab" title="Close chat tab" onClick={() => closeChatTab(session.conversationId)}>
+                              <X size={10} />
+                            </button>
+                          </div>
+                        ))}
+                        {isNewChatDraft && (
+                          <div className="nova-chat-tab selected">
+                            <button type="button" className="nova-chat-tab-main" onClick={() => setIsNewChatDraft(true)}><span>New chat</span></button>
+                            <button type="button" className="nova-tab-close" aria-label="Close new chat tab" title="Close chat tab" onClick={() => { setIsNewChatDraft(false); setSelectedSessionId(null); }}>
+                              <X size={10} />
+                            </button>
+                          </div>
+                        )}
+                        <button type="button" className="nova-chat-add nova-chat-add-icon" aria-label={lang === "th" ? "แชตใหม่" : "New chat"} title={lang === "th" ? "แชตใหม่" : "New chat"} onClick={() => { setSelectedSessionId(null); setIsNewChatDraft(true); }}>
+                          <Plus size={14} />
+                        </button>
+                        </div>
                         <button
                           type="button"
-                          className={`ide-mini ${showNewRunDrawer ? "on" : ""}`}
-                          onClick={() => setShowNewRunDrawer((v) => !v)}
-                          title={lang === "th" ? "เริ่มงานใหม่เบื้องหลัง" : "Start new background task"}
+                          className="nova-open-ide-pill"
+                          title={selectedSession?.workspacePath || activeWorkspacePath}
+                          onClick={() =>
+                            void novaApi.openInEditor(
+                              selectedSession?.workspacePath || activeWorkspacePath,
+                              undefined,
+                              "antigravity"
+                            )
+                          }
                         >
-                          <Plus size={11} />
-                          <span>{lang === "th" ? "งานใหม่" : "New Task"}</span>
+                          <ExternalLink size={11} />
+                          <span>{lang === "th" ? "เปิด IDE" : "Open IDE"}</span>
                         </button>
                       </div>
 
-                      {showNewRunDrawer && (
-                        <div className="nova-newrun-drawer">
-                          <NewRunBar snapshot={snapshot} lang={lang} />
-                        </div>
-                      )}
-
-                      {/* Full-Width Focused Workspace Coding Stream */}
-                      {selectedSession && (
-                        <div className="nova-session-detail">
-                          <div className="nova-row-between">
-                            <div className="nova-row-gap">
-                              <strong className="detail-ws-title">
-                                {selectedSession.workspaceName}
-                              </strong>
-                              <span className="ws-path-inline" title={selectedSession.workspacePath}>
-                                {selectedSession.workspacePath}
-                              </span>
-                              {selectedSession.modelName && (
-                                <span className="model-tag">{selectedSession.modelName}</span>
-                              )}
-                              {(() => {
-                                const ph = getPhaseLabel(selectedSession, lang);
-                                return (
-                                  <span className={`phase-pill phase-${ph.key}`}>{ph.label}</span>
-                                );
-                              })()}
-                            </div>
-                            <div className="nova-btn-group">
-                              <button
-                                className="nova-btn nova-btn-ghost nova-btn-xs"
-                                onClick={() =>
-                                  novaApi.focusSessionWindow(selectedSession.conversationId)
-                                }
-                              >
-                                <Terminal size={12} />
-                                <span>{t(lang, "jumpWindow")}</span>
-                              </button>
-                              <button
-                                className="nova-btn nova-btn-ghost nova-btn-xs"
-                                onClick={() =>
-                                  novaApi.openInEditor(
-                                    selectedSession.workspacePath,
-                                    undefined,
-                                    "antigravity"
-                                  )
-                                }
-                              >
-                                <ExternalLink size={12} />
-                                <span>IDE</span>
-                              </button>
-                            </div>
+                      {selectedSession ? (
+                        <>
+                          <div className="nova-session-detail nova-session-transcript-panel">
+                            <SessionTelemetryView
+                              session={selectedSession}
+                              lang={lang}
+                              compact
+                            />
                           </div>
-
-                          <SessionTelemetryView
-                            session={selectedSession}
+                          <div className="nova-session-composer-dock">
+                            <SessionCockpit snapshot={snapshot} session={selectedSession} lang={lang} compact />
+                          </div>
+                        </>
+                      ) : isNewChatDraft ? (
+                        <div className="nova-session-composer-dock nova-session-composer-dock-empty">
+                          <NewRunBar
+                            snapshot={snapshot}
                             lang={lang}
-                            compact
+                            workspacePath={activeWorkspacePath}
+                            onStarted={() => {
+                              keepOpenAfterSendUntilRef.current = Date.now() + 1200;
+                              setIsNewChatDraft(false);
+                            }}
                           />
-
-                          <SessionCockpit snapshot={snapshot} session={selectedSession} lang={lang} />
+                        </div>
+                      ) : (
+                        <div className="nova-session-detail nova-new-chat-detail">
+                          <div className="nova-new-chat-empty">
+                            <FolderGit2 size={18} />
+                            <span>{lang === "th" ? "ไม่ได้เปิดบทสนทนา" : "No chat tab open"}</span>
+                            <button type="button" className="nova-btn nova-btn-ghost nova-btn-xs" onClick={() => setIsNewChatDraft(true)}>
+                              <Plus size={12} /> {lang === "th" ? "แชตใหม่" : "New chat"}
+                            </button>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1585,6 +2270,11 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                 <div className="nova-chat-layout">
                   <div className="nova-chat-toolbar">
                     <div className="nova-row-gap">
+                      {chatWorkspacePath && (
+                        <button type="button" className="nova-btn nova-btn-ghost nova-btn-xs chat-workspace-pill" title={chatWorkspacePath} onClick={() => setActiveTab("mission")}>
+                          <FolderGit2 size={12} /> <span>{chatWorkspacePath.split(/[\\/]/).filter(Boolean).pop() || chatWorkspacePath}</span>
+                        </button>
+                      )}
                       <select
                         className="nova-select"
                         value={settings.defaultChatProvider}
@@ -1687,7 +2377,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
                     <button
                       className="nova-btn nova-btn-ghost nova-btn-xs"
-                      onClick={() => novaApi.newChatThread()}
+                      onClick={() => void createChatThread()}
                     >
                       <Plus size={13} />
                       <span>New</span>

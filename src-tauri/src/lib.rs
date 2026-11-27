@@ -6,9 +6,9 @@ pub mod server;
 pub mod state;
 pub mod system_tools;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::AppCore;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -26,7 +26,7 @@ const NEAR_ZONE_PX: f64 = 240.0;
 /// Distance (logical px) at which the folded pill starts magnetically swelling toward the cursor.
 const MAGNET_ZONE_PX: f64 = 72.0;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 pub struct IslandHitRect {
     pub x: f64,
     pub y: f64,
@@ -44,6 +44,8 @@ pub struct CachedWindowOrigin {
 #[derive(Clone, Copy, Serialize)]
 pub struct IslandPointerEvent {
     pub inside: bool,
+    pub on_main: bool,
+    pub fullscreen: bool,
     pub x: f64,
     pub y: f64,
     /// 0.0 (far) → 1.0 (touching the island silhouette) within `MAGNET_ZONE_PX`.
@@ -54,15 +56,47 @@ pub struct IslandStageState {
     pub is_expanded: AtomicBool,
     pub is_revealed: AtomicBool,
     pub rect: Mutex<IslandHitRect>,
+    pub extra_rects: Mutex<Vec<IslandHitRect>>,
+    pub last_rect_seq: AtomicU64,
+    pub last_exp_seq: AtomicU64,
     pub win_origin: Mutex<CachedWindowOrigin>,
     pub ignoring: AtomicBool,
     pub last_zone: Mutex<String>,
     pub last_monitor: AtomicUsize,
 }
 
+pub fn hit_test_island_stage(
+    lx: f64,
+    ly: f64,
+    main_rect: IslandHitRect,
+    extra_rects: &[IslandHitRect],
+    is_expanded: bool,
+) -> (bool, bool) {
+    // Strictly match ONLY the exact rendered island silhouette (`main_rect`) whether folded or
+    // expanded — zero top/bottom bezel cushion and zero horizontal padding! Extending the folded
+    // hit-rect into the 8px gap above `main_rect.y` caused an expand/collapse oscillation loop
+    // because `is_expanded = true` immediately excluded `y < main_rect.y`.
+    let on_main = main_rect.w > 0.0
+        && main_rect.h > 0.0
+        && lx >= main_rect.x
+        && lx <= main_rect.x + main_rect.w
+        && ly >= main_rect.y
+        && ly <= main_rect.y + main_rect.h;
+    let on_extra = is_expanded
+        && extra_rects.iter().any(|er| {
+            er.w > 0.0
+                && er.h > 0.0
+                && lx >= er.x
+                && lx <= er.x + er.w
+                && ly >= er.y
+                && ly <= er.y + er.h
+        });
+    (on_main || on_extra, on_main)
+}
+
 impl IslandStageState {
     pub fn new(zone: String, monitor_index: usize) -> Self {
-        let init_w = 168.0;
+        let init_w = 176.0;
         let init_h = 38.0;
         let init_rect = match zone.as_str() {
             "top-left" => IslandHitRect {
@@ -95,6 +129,9 @@ impl IslandStageState {
             is_expanded: AtomicBool::new(false),
             is_revealed: AtomicBool::new(false),
             rect: Mutex::new(init_rect),
+            extra_rects: Mutex::new(Vec::new()),
+            last_rect_seq: AtomicU64::new(0),
+            last_exp_seq: AtomicU64::new(0),
             win_origin: Mutex::new(CachedWindowOrigin {
                 px: 0.0,
                 py: 0.0,
@@ -198,6 +235,22 @@ fn cursor_physical() -> Option<(f64, f64)> {
     None
 }
 
+#[cfg(windows)]
+fn island_live_fullscreen(win: Option<&WebviewWindow>) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    let target_mon = win.and_then(|w| w.hwnd().ok()).map(|raw| unsafe {
+        let hwnd = HWND(raw.0 as *mut core::ffi::c_void);
+        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    });
+    system_tools::is_foreground_fullscreen_on_monitor(target_mon)
+}
+
+#[cfg(not(windows))]
+fn island_live_fullscreen(_win: Option<&WebviewWindow>) -> bool {
+    false
+}
+
 /// Adaptive zero-overhead Win32 cursor hit-tester (mirrors Coucou's `island.rs` architecture):
 /// Keeps the transparent 900×620 window 100% click-through (`WS_EX_TRANSPARENT`) everywhere
 /// outside the live animated pill/island silhouette (`rect ± margin`), so the OS window never
@@ -205,6 +258,7 @@ fn cursor_physical() -> Option<(f64, f64)> {
 fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
     std::thread::spawn(move || {
         let mut was_inside: Option<bool> = None;
+        let mut was_on_main: Option<bool> = None;
         let mut was_magnet = false;
         let mut ticks: u32 = 0;
         let mut sleep_ms: u64 = 32;
@@ -216,9 +270,9 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
         loop {
             std::thread::sleep(Duration::from_millis(sleep_ms));
 
-            // Periodically sync window physical origin in case of display hotplug or free-mode drag
+            // Sync window physical origin on first tick and regularly in case of display/DPI/drag updates
             ticks = ticks.wrapping_add(1);
-            if ticks % 45 == 0 {
+            if ticks == 1 || ticks % 20 == 0 {
                 if let Some(win) = app.get_webview_window("island") {
                     if let Ok(origin) = win.outer_position() {
                         let scale = win.scale_factor().unwrap_or(1.0).max(0.25);
@@ -247,16 +301,27 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
             let ly = (cy - origin.py) / origin.scale;
 
             let r = *stage.rect.lock().unwrap();
-            let on_island = r.w > 0.0
-                && lx >= r.x
-                && lx <= r.x + r.w
-                && ly >= r.y
-                && ly <= r.y + r.h;
+            let is_exp = stage.is_expanded.load(Ordering::Relaxed);
+            let (on_island, on_main, near_extra) = {
+                let extras = stage.extra_rects.lock().unwrap();
+                let (inside_any, inside_main) = hit_test_island_stage(lx, ly, r, &extras, is_exp);
+                let near_any_extra = is_exp
+                    && extras.iter().any(|er| {
+                        er.w > 0.0
+                            && er.h > 0.0
+                            && lx >= er.x - NEAR_ZONE_PX
+                            && lx <= er.x + er.w + NEAR_ZONE_PX
+                            && ly >= er.y - NEAR_ZONE_PX
+                            && ly <= er.y + er.h + NEAR_ZONE_PX
+                    });
+                (inside_any, inside_main, near_any_extra)
+            };
 
-            let near_island = lx >= r.x - NEAR_ZONE_PX
-                && lx <= r.x + r.w + NEAR_ZONE_PX
-                && ly >= r.y - NEAR_ZONE_PX
-                && ly <= r.y + r.h + NEAR_ZONE_PX;
+            let near_island = near_extra
+                || (lx >= r.x - NEAR_ZONE_PX
+                    && lx <= r.x + r.w + NEAR_ZONE_PX
+                    && ly >= r.y - NEAR_ZONE_PX
+                    && ly <= r.y + r.h + NEAR_ZONE_PX);
 
             // Euclidean distance from cursor to the silhouette rect → 0..1 magnetic proximity
             let dx = if lx < r.x {
@@ -297,11 +362,11 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
             }
 
             // Pointer transitions can be swallowed while Windows toggles the
-            // transparent stage's click-through style. While folded, send a
-            // low-rate hover heartbeat so the UI can recover its hover state.
-            let folded_hover_sync = on_island
-                && !stage.is_expanded.load(Ordering::Relaxed)
-                && last_folded_hover_sync.elapsed() >= Duration::from_millis(180);
+            // transparent stage's click-through style. Send a fast hover heartbeat
+            // whenever the cursor is inside so the UI always recovers within <90ms.
+            let hover_heartbeat_ms = if is_exp { 240 } else { 90 };
+            let folded_hover_sync =
+                on_island && last_folded_hover_sync.elapsed() >= Duration::from_millis(hover_heartbeat_ms);
             if folded_hover_sync {
                 last_folded_hover_sync = Instant::now();
             }
@@ -322,12 +387,29 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
             if pointer_transition {
                 was_inside = Some(on_island);
             }
-            if pointer_transition || folded_hover_sync || pointer_tracking || magnet_transition {
-                if let Some(win) = app.get_webview_window("island") {
+            let main_transition = was_on_main != Some(on_main);
+            if main_transition {
+                was_on_main = Some(on_main);
+            }
+            if pointer_transition
+                || main_transition
+                || folded_hover_sync
+                || pointer_tracking
+                || magnet_transition
+            {
+                let island_win = app.get_webview_window("island");
+                let fullscreen = if on_island || near_island {
+                    island_live_fullscreen(island_win.as_ref())
+                } else {
+                    false
+                };
+                if let Some(win) = island_win {
                     let _ = win.emit(
                         "nova-island-pointer",
                         IslandPointerEvent {
                             inside: on_island,
+                            on_main,
+                            fullscreen,
                             x: lx,
                             y: ly,
                             proximity,
@@ -347,6 +429,8 @@ fn spawn_island_hit_tester(app: AppHandle, stage: Arc<IslandStageState>) {
                                     "nova-island-pointer",
                                     IslandPointerEvent {
                                         inside: false,
+                                        on_main: false,
+                                        fullscreen: false,
                                         x: ox,
                                         y: oy,
                                         proximity: 0.0,
@@ -382,9 +466,49 @@ async fn set_island_rect(
     y: f64,
     w: f64,
     h: f64,
+    expanded: Option<bool>,
+    extra_rects: Option<Vec<IslandHitRect>>,
+    seq: Option<u64>,
 ) -> Result<(), String> {
+    if let Some(incoming_seq) = seq {
+        let mut cur = stage.last_rect_seq.load(Ordering::Acquire);
+        loop {
+            if incoming_seq < cur {
+                return Ok(());
+            }
+            match stage.last_rect_seq.compare_exchange_weak(
+                cur,
+                incoming_seq,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
     if x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() {
         *stage.rect.lock().unwrap() = IslandHitRect { x, y, w, h };
+    }
+    if let Some(exp) = expanded {
+        stage.is_expanded.store(exp, Ordering::Release);
+    }
+    let mut extras = stage.extra_rects.lock().unwrap();
+    extras.clear();
+    if stage.is_expanded.load(Ordering::Acquire) {
+        if let Some(list) = extra_rects {
+            for er in list {
+                if er.x.is_finite()
+                    && er.y.is_finite()
+                    && er.w.is_finite()
+                    && er.h.is_finite()
+                    && er.w > 0.0
+                    && er.h > 0.0
+                {
+                    extras.push(er);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -493,9 +617,34 @@ async fn apply_snap_zone(
     expanded: Option<bool>,
     _folded_w: Option<f64>,
     _folded_h: Option<f64>,
+    seq: Option<u64>,
 ) -> Result<(), String> {
     if let Some(exp) = expanded {
-        stage.is_expanded.store(exp, Ordering::Relaxed);
+        let mut accept_exp = true;
+        if let Some(incoming_seq) = seq {
+            let mut cur = stage.last_exp_seq.load(Ordering::Acquire);
+            loop {
+                if incoming_seq < cur {
+                    accept_exp = false;
+                    break;
+                }
+                match stage.last_exp_seq.compare_exchange_weak(
+                    cur,
+                    incoming_seq,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+        if accept_exp {
+            stage.is_expanded.store(exp, Ordering::Relaxed);
+            if !exp {
+                stage.extra_rects.lock().unwrap().clear();
+            }
+        }
     }
 
     let mut zone_or_mon_changed = false;
@@ -884,7 +1033,7 @@ pub fn run() {
     // background timer throttling and autoplay suspension so hover audio/springs fire instantly.
     #[cfg(windows)]
     {
-        const LOW_LATENCY_FLAGS: &str = "--autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-renderer-backgrounding";
+        const LOW_LATENCY_FLAGS: &str = "--autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling";
         let merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
             Ok(existing) if !existing.trim().is_empty() => format!("{existing} {LOW_LATENCY_FLAGS}"),
             _ => LOW_LATENCY_FLAGS.to_string(),
@@ -939,6 +1088,7 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             set_island_passthrough,
             set_island_rect,
@@ -1071,4 +1221,101 @@ pub fn run() {
                 app.state::<AppCore>().shutdown_warm_workers();
             }
         });
+}
+
+#[cfg(test)]
+mod island_hit_tests {
+    use super::{hit_test_island_stage, IslandHitRect};
+
+    #[test]
+    fn hit_test_without_modal_only_matches_main_island() {
+        let main = IslandHitRect {
+            x: 30.0,
+            y: 8.0,
+            w: 840.0,
+            h: 188.0,
+        };
+        assert_eq!(hit_test_island_stage(200.0, 100.0, main, &[], true), (true, true));
+        assert_eq!(hit_test_island_stage(200.0, 220.0, main, &[], true), (false, false));
+    }
+
+    #[test]
+    fn hit_test_with_modal_below_includes_modal_without_capturing_empty_side_area() {
+        let main = IslandHitRect {
+            x: 30.0,
+            y: 8.0,
+            w: 840.0,
+            h: 188.0,
+        };
+        let modal = IslandHitRect {
+            x: 590.0,
+            y: 196.0,
+            w: 254.0,
+            h: 196.0,
+        };
+        // Inside main island
+        assert_eq!(
+            hit_test_island_stage(200.0, 100.0, main, &[modal], true),
+            (true, true)
+        );
+        // Inside modal below main island
+        assert_eq!(
+            hit_test_island_stage(700.0, 290.0, main, &[modal], true),
+            (true, false)
+        );
+        // Empty desktop area below left side of main island (outside modal!) must NOT count as inside
+        assert_eq!(
+            hit_test_island_stage(250.0, 290.0, main, &[modal], true),
+            (false, false)
+        );
+        // Below modal must NOT count as inside
+        assert_eq!(
+            hit_test_island_stage(700.0, 410.0, main, &[modal], true),
+            (false, false)
+        );
+        // When folded, extra rects are ignored
+        assert_eq!(
+            hit_test_island_stage(700.0, 290.0, main, &[modal], false),
+            (false, false)
+        );
+
+        // When folded at top of screen (`y = 8`), the gap above `y = 8` (and beside `x..x+w`
+        // or below `y+h`) is OUTSIDE the island and MUST NOT trigger hover or expand/collapse loops!
+        let folded_pill = IslandHitRect {
+            x: 362.0,
+            y: 8.0,
+            w: 176.0,
+            h: 38.0,
+        };
+        assert_eq!(
+            hit_test_island_stage(450.0, 1.0, folded_pill, &[], false),
+            (false, false),
+            "Gap above folded pill (y < 8) is outside the island and must NOT trigger hover"
+        );
+        assert_eq!(
+            hit_test_island_stage(450.0, 7.9, folded_pill, &[], false),
+            (false, false),
+            "1px above folded pill top border must NOT trigger hover"
+        );
+        assert_eq!(
+            hit_test_island_stage(360.0, 24.0, folded_pill, &[], false),
+            (false, false),
+            "2px left of folded pill border must NOT trigger hover"
+        );
+        assert_eq!(
+            hit_test_island_stage(540.0, 24.0, folded_pill, &[], false),
+            (false, false),
+            "2px right of folded pill border must NOT trigger hover"
+        );
+        assert_eq!(
+            hit_test_island_stage(450.0, 47.0, folded_pill, &[], false),
+            (false, false),
+            "1px below folded pill bottom border must NOT trigger hover"
+        );
+        assert_eq!(
+            hit_test_island_stage(450.0, 8.0, folded_pill, &[], false),
+            (true, true),
+            "Exact top border of folded pill triggers hover cleanly and remains inside when expanded"
+        );
+    }
 }

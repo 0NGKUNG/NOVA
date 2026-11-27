@@ -24,6 +24,7 @@ import {
   Shield,
   Smartphone,
   Sparkles,
+  Timer,
   Trash2,
   User,
   Wrench,
@@ -40,9 +41,11 @@ import { Lang, t } from "../i18n";
 import { isTauriRuntime, novaApi } from "../lib/novaClient";
 import { NovaOrb } from "../components/NovaOrb";
 import { ApprovalCard } from "../components/ApprovalCard";
+import { QuestionCard } from "../components/QuestionCard";
 import { DiffViewer } from "../components/DiffViewer";
 import { getPhaseLabel, SessionTelemetryView } from "../components/SessionTelemetryView";
-import { NewRunBar, PermissionPill, SessionCockpit } from "../components/SessionCockpit";
+import { SessionCockpit } from "../components/SessionCockpit";
+import { ProjectSelectHero } from "../components/ProjectSelectHero";
 import { VoiceRecorderPanel } from "../components/VoiceRecorderPanel";
 import { IslandSurface } from "./IslandSurface";
 
@@ -64,7 +67,8 @@ type HubSection =
   | "devtools"
   | "recap"
   | "mobile"
-  | "appearance";
+  | "appearance"
+  | "general";
 
 export const HubSurface: React.FC<HubSurfaceProps> = ({
   snapshot,
@@ -136,6 +140,12 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
       label: t(lang, "missionControl"),
       keywords: "sessions workspaces subagents diffs approvals",
       icon: <Layers size={16} />,
+    },
+    {
+      id: "general",
+      label: lang === "th" ? "ทั่วไป" : "General",
+      keywords: "general island collapse delay hover mouse auto close",
+      icon: <Timer size={16} />,
     },
     {
       id: "hooks",
@@ -310,7 +320,11 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
             <NovaOrb
               mode={settings.avatarMode}
               aura={settings.aura}
-              state={snapshot.pendingApprovals.length > 0 ? "alert" : "active"}
+              state={
+                snapshot.pendingApprovals.length + (snapshot.pendingQuestions?.length ?? 0) > 0
+                  ? "alert"
+                  : "active"
+              }
               size={38}
             />
             <div>
@@ -371,17 +385,29 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
           {/* 1. MISSION CONTROL */}
           {section === "mission" && (
             <div className="hub-section">
-              <div className="nova-row-between">
-                <div>
-                  <h2>{t(lang, "missionControl")}</h2>
-                  <p className="muted-note">{t(lang, "missionDescription")}</p>
-                </div>
-                <PermissionPill snapshot={snapshot} session={null} />
-              </div>
+              <ProjectSelectHero snapshot={snapshot} lang={lang} aura={settings.aura} />
 
-              <div className="hub-card">
-                <NewRunBar snapshot={snapshot} lang={lang} />
-              </div>
+              {(snapshot.pendingQuestions?.length ?? 0) > 0 && (
+                <div className="hub-stack">
+                  <h3>
+                    {lang === "th" ? "คำถามจาก AI" : "Agent Questions"} (
+                    {snapshot.pendingQuestions?.length ?? 0})
+                  </h3>
+                  {(snapshot.pendingQuestions ?? []).map((pq) => (
+                    <QuestionCard
+                      key={pq.id}
+                      pending={pq}
+                      lang={lang}
+                      sttProvider={settings.sttProvider}
+                      hasCloudSttKey={Boolean(
+                        (settings.sttProvider === "groq" && secrets.groq) ||
+                          (settings.sttProvider === "gemini" && secrets.gemini) ||
+                          (settings.sttProvider === "openai" && secrets.openai)
+                      )}
+                    />
+                  ))}
+                </div>
+              )}
 
               {snapshot.pendingApprovals.length > 0 && (
                 <div className="hub-stack">
@@ -392,25 +418,7 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
                 </div>
               )}
 
-              {snapshot.sessions.length === 0 ? (
-                <section className="hub-empty-state" aria-labelledby="hub-empty-title">
-                  <div className="hub-empty-orb-frame">
-                    <NovaOrb mode="orb" aura={settings.aura} state="idle" size={76} />
-                  </div>
-                  <div className="hub-empty-copy">
-                    <div className="hub-empty-status">
-                      <span className="hub-empty-status-dot" /> {t(lang, "readyWhenYouAre")}
-                    </div>
-                    <h3 id="hub-empty-title">{t(lang, "nothingRunning")}</h3>
-                    <p>{t(lang, "connectAntigravityHint")}</p>
-                  </div>
-                  <div className="hub-empty-actions">
-                    <button className="nova-btn nova-btn-primary" onClick={() => setSection("hooks")}>
-                      <Wrench size={15} /> {t(lang, "setupAntigravity")}
-                    </button>
-                  </div>
-                </section>
-              ) : (
+              {snapshot.sessions.length > 0 && (
                 <div className="hub-grid-2">
                   {snapshot.sessions.map((s) => {
                     const ph = getPhaseLabel(s, lang);
@@ -433,6 +441,46 @@ export const HubSurface: React.FC<HubSurfaceProps> = ({
                   })}
                 </div>
               )}
+            </div>
+          )}
+
+          {section === "general" && (
+            <div className="hub-section">
+              <h2>{lang === "th" ? "ทั่วไป" : "General"}</h2>
+              <p className="muted-note">
+                {lang === "th"
+                  ? "ปรับพฤติกรรมทั่วไปของ NOVA Island"
+                  : "Adjust general NOVA Island behavior."}
+              </p>
+              <div className="hub-card general-setting-card">
+                <div className="general-setting-copy">
+                  <strong>{lang === "th" ? "เวลาหน่วงก่อนย่อ Island" : "Island collapse delay"}</strong>
+                  <p className="muted-note">
+                    {lang === "th"
+                      ? "รอก่อนย่อหลังจากเมาส์ออกจาก Island หากเลื่อนเมาส์กลับมาก่อนหมดเวลา Island จะยังเปิดอยู่"
+                      : "Wait after the pointer leaves. Move it back before the delay ends to keep the Island expanded."}
+                  </p>
+                </div>
+                <select
+                  className="nova-select general-setting-select"
+                  value={Math.round((settings.islandCollapseDelayMs ?? 0) / 1000)}
+                  onChange={(e) =>
+                    void novaApi.saveSettings({
+                      ...settings,
+                      islandCollapseDelayMs: Number(e.target.value) * 1000,
+                    })
+                  }
+                  aria-label={lang === "th" ? "เวลาหน่วงก่อนย่อ Island" : "Island collapse delay"}
+                >
+                  <option value={0}>{lang === "th" ? "ทันที (0 วินาที)" : "Immediately (0 seconds)"}</option>
+                  <option value={1}>1 second</option>
+                  <option value={2}>2 seconds</option>
+                  <option value={3}>3 seconds</option>
+                  <option value={5}>5 seconds</option>
+                  <option value={10}>10 seconds</option>
+                  <option value={30}>30 seconds</option>
+                </select>
+              </div>
             </div>
           )}
 

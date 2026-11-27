@@ -916,12 +916,18 @@ pub fn focus_session_window(_chain: &[ProcessAncestor], _fallback_workspace: &st
 
 /// Detects if the user's current foreground window covers the entire monitor (e.g., fullscreen video or game).
 #[cfg(windows)]
-pub fn is_foreground_fullscreen() -> bool {
+pub fn is_foreground_fullscreen_on_monitor(
+    target_monitor: Option<windows::Win32::Graphics::Gdi::HMONITOR>,
+) -> bool {
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowLongW, GetWindowRect,
-        GWL_STYLE, WS_CAPTION, WS_THICKFRAME,
+        GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowLongW,
+        GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
+        GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        WS_THICKFRAME,
     };
 
     unsafe {
@@ -929,13 +935,51 @@ pub fn is_foreground_fullscreen() -> bool {
         if fg.0.is_null() || fg == GetDesktopWindow() || fg == GetShellWindow() {
             return false;
         }
+        if !IsWindowVisible(fg).as_bool() || IsIconic(fg).as_bool() {
+            return false;
+        }
 
-        // Maximized browser and desktop windows can have a DWM rectangle that
-        // reaches the monitor edges. Their caption/resizable frame identifies
-        // them as ordinary windows, so don't suppress NOVA hover for them.
+        // Never treat NOVA's own overlay/hub windows as a fullscreen blocker.
+        let mut fg_pid: u32 = 0;
+        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+        if fg_pid == std::process::id() {
+            return false;
+        }
+
+        // Ignore click-through, toolwindow, and non-activating OS overlays.
+        let ex_style = GetWindowLongW(fg, GWL_EXSTYLE) as u32;
+        if ex_style & (WS_EX_TRANSPARENT.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+            return false;
+        }
+
+        // Maximized browser and desktop windows carry caption/resizable styles.
         let style = GetWindowLongW(fg, GWL_STYLE) as u32;
         if style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0 {
             return false;
+        }
+
+        // Exclude Windows Desktop/Wallpaper hosts (`WorkerW`, `Progman`) and Shell/XAML flyouts
+        // which report monitor-sized borderless rects whenever the user clicks the desktop or taskbar.
+        let mut class_buf = [0u16; 128];
+        let class_len = GetClassNameW(fg, &mut class_buf) as usize;
+        if class_len > 0 {
+            let class_name = String::from_utf16_lossy(&class_buf[..class_len]);
+            if matches!(
+                class_name.as_str(),
+                "Progman"
+                    | "WorkerW"
+                    | "Shell_TrayWnd"
+                    | "Shell_SecondaryTrayWnd"
+                    | "Windows.UI.Core.CoreWindow"
+                    | "XamlExplorerHostIslandWindow"
+                    | "TopLevelWindowForOverflowXamlIsland"
+                    | "MultitaskingViewFrame"
+                    | "ForegroundStaging"
+                    | "ApplicationFrameWindow"
+                    | "ScreenClippingHost"
+            ) {
+                return false;
+            }
         }
 
         let mut win_rect = RECT::default();
@@ -943,6 +987,11 @@ pub fn is_foreground_fullscreen() -> bool {
             return false;
         }
         let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        if let Some(expected_mon) = target_monitor {
+            if !expected_mon.0.is_null() && mon != expected_mon {
+                return false;
+            }
+        }
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -956,6 +1005,11 @@ pub fn is_foreground_fullscreen() -> bool {
             && win_rect.right >= mr.right
             && win_rect.bottom >= mr.bottom
     }
+}
+
+#[cfg(windows)]
+pub fn is_foreground_fullscreen() -> bool {
+    is_foreground_fullscreen_on_monitor(None)
 }
 
 #[cfg(not(windows))]
