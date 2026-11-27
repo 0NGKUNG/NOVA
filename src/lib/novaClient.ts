@@ -79,7 +79,7 @@ if (typeof window !== "undefined" && isTauriRuntime()) {
   void getTauriListen();
 }
 
-function getApiBase(): string {
+export function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:47920";
   const { protocol, hostname, port } = window.location;
   // When running inside Tauri production protocol (`tauri://localhost` or `http://tauri.localhost`)
@@ -234,6 +234,17 @@ export const novaApi = {
       filePath,
       conversationId,
     }),
+
+  createEmbedTicket: (payload: {
+    filePath: string;
+    conversationId?: string | null;
+    embedId: string;
+    inline?: boolean;
+  }) =>
+    postJson<{ ok: boolean; ticket?: string; renderPath?: string; error?: string }>(
+      "/api/workspace/embed-ticket",
+      payload
+    ),
 
   sendSessionPrompt: (payload: {
     workspacePath?: string;

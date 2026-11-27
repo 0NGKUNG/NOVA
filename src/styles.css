@@ -5550,3 +5550,116 @@ select:focus-visible,
   background: rgba(239, 68, 68, 0.09);
 }
 .md-alert-caution .md-alert-tag { color: #fca5a5; }
+
+/* =========================================================================
+   GENERATIVE UI (`<agent-embed>`) & SANDBOXED HTML ARTIFACT WIDGETS
+   ========================================================================= */
+
+.nova-agent-embed {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  margin: 4px 0;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.nova-agent-embed.is-standalone {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #0d0e12;
+}
+
+.nova-agent-embed-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color-scheme: dark;
+  transition: height 140ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 150ms ease;
+}
+
+.nova-agent-embed.is-loading .nova-agent-embed-frame {
+  opacity: 0;
+  position: absolute;
+  pointer-events: none;
+}
+
+.nova-agent-embed.is-ready .nova-agent-embed-frame {
+  opacity: 1;
+}
+
+.nova-agent-embed-skeleton {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 11.5px;
+  color: #9ca3af;
+}
+
+.nova-agent-embed-toolbar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(14, 15, 20, 0.84);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 130ms ease;
+}
+
+.nova-agent-embed:hover .nova-agent-embed-toolbar,
+.nova-agent-embed:focus-within .nova-agent-embed-toolbar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.nova-agent-embed-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #a1a1aa;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.nova-agent-embed-btn:hover {
+  background: rgba(255, 255, 255, 0.11);
+  color: #f4f4f5;
+}
+
+.nova-agent-embed-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 29, 29, 0.2);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  color: #fca5a5;
+  font-size: 11.5px;
+}
+
+.ide-artifact-body.is-html-embed {
+  padding: 4px;
+  max-height: none;
+  overflow: visible;
+  background: transparent;
+  border: 0;
+}

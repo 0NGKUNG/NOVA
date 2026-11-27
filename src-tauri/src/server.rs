@@ -108,6 +108,8 @@ fn mobile_route_allowed(path: &str) -> bool {
             | "/api/approvals/resolve"
             | "/api/questions/resolve"
             | "/api/workspace/read-artifact"
+            | "/api/workspace/embed-ticket"
+            | "/api/workspace/embed-frame"
             | "/api/session/send"
             | "/api/chat/send"
             | "/api/chat/new"
@@ -142,10 +144,13 @@ async fn security_gate(
         )
     };
 
+    let is_embed_frame = path == "/api/workspace/embed-frame" && req.method() == Method::GET;
+
     // 1. Strict Origin check on every browser request (blocks cross-site localhost CSRF / drive-by attacks)
     if let Some(origin_hdr) = req.headers().get(ORIGIN) {
         let origin_str = origin_hdr.to_str().unwrap_or_default();
-        if !is_trusted_origin(origin_str, &lan_ip, lan_enabled) {
+        let allow_null_sandbox_reload = is_embed_frame && origin_str.eq_ignore_ascii_case("null");
+        if !allow_null_sandbox_reload && !is_trusted_origin(origin_str, &lan_ip, lan_enabled) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({ "ok": false, "error": "Untrusted Origin blocked by NOVA security policy" })),
@@ -159,8 +164,8 @@ async fn security_gate(
         return next.run(req).await;
     }
 
-    // Safe unauthenticated liveness check
-    if path == "/api/health" {
+    // Safe unauthenticated liveness check (embed-frame validates its own 256-bit capability ticket)
+    if path == "/api/health" || is_embed_frame {
         req.extensions_mut().insert(AuthScope::PublicHealth);
         return next.run(req).await;
     }
@@ -264,6 +269,8 @@ pub async fn start_core_http_server(
         .route("/workspace/focus", post(api_focus_session))
         .route("/workspace/open-editor", post(api_open_editor))
         .route("/workspace/read-artifact", post(api_read_artifact))
+        .route("/workspace/embed-ticket", post(api_create_embed_ticket))
+        .route("/workspace/embed-frame", get(api_render_embed_frame))
         .route("/workspace/launch", post(api_launch_session))
         .route("/workspace/open-url", post(api_open_url))
         .route("/focus/control", post(api_focus_control))
@@ -455,6 +462,85 @@ async fn api_read_artifact(
     match core.read_session_artifact(req.conversation_id.as_deref(), &req.file_path) {
         Ok(content) => (StatusCode::OK, Json(json!({ "ok": true, "content": content }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateEmbedTicketReq {
+    conversation_id: Option<String>,
+    file_path: String,
+    embed_id: Option<String>,
+    inline: Option<bool>,
+}
+
+async fn api_create_embed_ticket(
+    State(core): State<AppCore>,
+    Json(req): Json<CreateEmbedTicketReq>,
+) -> impl IntoResponse {
+    let embed_id = req.embed_id.as_deref().unwrap_or("nova-embed");
+    let inline = req.inline.unwrap_or(true);
+    match core.create_embed_ticket(
+        req.conversation_id.as_deref(),
+        &req.file_path,
+        embed_id,
+        inline,
+    ) {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "ticket": ticket,
+                "renderPath": format!("/api/workspace/embed-frame?ticket={ticket}")
+            })),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenderEmbedQuery {
+    ticket: Option<String>,
+}
+
+async fn api_render_embed_frame(
+    State(core): State<AppCore>,
+    Query(q): Query<RenderEmbedQuery>,
+) -> Response {
+    let ticket = q.ticket.as_deref().unwrap_or_default();
+    match core.render_embed_ticket(ticket) {
+        Ok(html) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            headers.insert(
+                HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static(
+                    "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com; style-src 'unsafe-inline' https://fonts.googleapis.com; img-src data: blob: https:; media-src data: blob:; font-src data: https://fonts.gstatic.com; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+                ),
+            );
+            headers.insert(
+                HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(
+                HeaderName::from_static("referrer-policy"),
+                HeaderValue::from_static("no-referrer"),
+            );
+            headers.insert(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("no-store"),
+            );
+            (StatusCode::OK, headers, html).into_response()
+        }
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            err,
+        )
+            .into_response(),
     }
 }
 

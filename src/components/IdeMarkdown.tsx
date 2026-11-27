@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Copy, Check } from "lucide-react";
 import { novaApi } from "../lib/novaClient";
 import { Lang } from "../i18n";
+import { AgentEmbedWidget, normalizeEmbedSrcPath } from "./AgentEmbedWidget";
 
 export function getFileBadgeMeta(path?: string | null, verb?: string): { text: string; cls: string } {
   if (verb === "Ran") return { text: ">_", cls: "b-shell" };
@@ -339,7 +340,57 @@ const CodeFenceBlock: React.FC<{ langLabel: string; code: string }> = ({ langLab
   );
 };
 
-export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
+const AGENT_EMBED_SINGLE_RE =
+  /^<agent-embed\b[^>]*\bsrc=(?:"([^"]+)"|'([^']+)')[^>]*>(?:\s*<\/agent-embed>)?$/i;
+
+export function isValidLiveEmbedSrc(rawSrc: string): boolean {
+  const s = rawSrc.trim();
+  if (!s) return false;
+  // Reject documentation placeholders like `file:///...` or `file:///<artifact_path>/widget.html`
+  if (s.includes("...") || /[<>{}*$]/.test(s)) return false;
+  const resolved = normalizeEmbedSrcPath(s).replace(/\\/g, "/");
+  if (!/\.(html|htm)$/i.test(resolved)) return false;
+  const isAbsOrFileUri =
+    s.startsWith("file://") || /^[a-zA-Z]:\//.test(resolved) || resolved.startsWith("/");
+  if (!isAbsOrFileUri) return false;
+  const fileName = resolved.split("/").pop() || "";
+  return fileName.length > 5 && !fileName.startsWith(".");
+}
+
+export function extractEmbeddedArtifactPaths(markdown?: string | null): Set<string> {
+  const out = new Set<string>();
+  if (!markdown) return out;
+  const lines = markdown.split("\n");
+  let inFence = false;
+  for (const rawLine of lines) {
+    const t = rawLine.trim();
+    if (t.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || !t) continue;
+    const m = t.match(AGENT_EMBED_SINGLE_RE);
+    if (!m) continue;
+    const raw = (m[1] ?? m[2] ?? "").trim();
+    if (!isValidLiveEmbedSrc(raw)) continue;
+    const norm = normalizeEmbedSrcPath(raw)
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "")
+      .toLowerCase();
+    if (norm) out.add(norm);
+  }
+  return out;
+}
+
+export interface MarkdownRenderOptions {
+  conversationId?: string | null;
+  compact?: boolean;
+}
+
+export function renderMarkdownBlocks(
+  markdown: string,
+  options?: MarkdownRenderOptions
+): React.ReactNode[] {
   const trimmed = markdown.trim();
   if (!trimmed) return [];
 
@@ -354,6 +405,26 @@ export function renderMarkdownBlocks(markdown: string): React.ReactNode[] {
     if (!t) {
       i++;
       continue;
+    }
+
+    // Standalone Generative UI `<agent-embed src="file:///.../widget.html"></agent-embed>`
+    // Only triggers on its own non-backticked block line with a real `.html`/`.htm` artifact path.
+    const embedMatch = t.match(AGENT_EMBED_SINGLE_RE);
+    if (embedMatch) {
+      const embedSrc = (embedMatch[1] ?? embedMatch[2] ?? "").trim();
+      if (isValidLiveEmbedSrc(embedSrc)) {
+        blocks.push(
+          <AgentEmbedWidget
+            key={`embed-${i}-${embedSrc}`}
+            srcPath={embedSrc}
+            conversationId={options?.conversationId}
+            compact={options?.compact}
+            inline
+          />
+        );
+        i++;
+        continue;
+      }
     }
 
     // Markdown table (`| col1 | col2 |` + separator `| --- | --- |`)
@@ -513,13 +584,18 @@ interface IdeMarkdownProps {
   markdown: string;
   compact?: boolean;
   lang: Lang;
+  conversationId?: string | null;
 }
 
-export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({ markdown }) => {
+export const IdeMarkdown: React.FC<IdeMarkdownProps> = ({
+  markdown,
+  compact,
+  conversationId,
+}) => {
   const trimmed = markdown.trim();
   if (!trimmed) return null;
 
-  const blocks = renderMarkdownBlocks(trimmed);
+  const blocks = renderMarkdownBlocks(trimmed, { conversationId, compact });
 
   return (
     <div className="ide-md-wrap">

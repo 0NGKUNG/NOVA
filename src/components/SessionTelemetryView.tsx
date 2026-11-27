@@ -27,7 +27,8 @@ import {
 } from "../types";
 import { Lang } from "../i18n";
 import { novaApi } from "../lib/novaClient";
-import { getFileBadgeMeta, IdeMarkdown } from "./IdeMarkdown";
+import { AgentEmbedWidget, normalizeEmbedSrcPath } from "./AgentEmbedWidget";
+import { extractEmbeddedArtifactPaths, getFileBadgeMeta, IdeMarkdown } from "./IdeMarkdown";
 
 function formatLiveProcessNote(note: string, lang: Lang): string {
   const trimmed = note.trim();
@@ -562,7 +563,18 @@ const FocusGroupSection: React.FC<{
   lang: Lang;
   workspacePath: string;
   turnDiffs: FileDiffPreview[];
-}> = ({ group, isLatest, isLiveSession, nowMs, compact, lang, workspacePath, turnDiffs }) => {
+  conversationId?: string | null;
+}> = ({
+    group,
+    isLatest,
+    isLiveSession,
+    nowMs,
+    compact,
+    lang,
+    workspacePath,
+    turnDiffs,
+    conversationId,
+  }) => {
   const isRunningGroup = isLatest && isLiveSession && !group.endedAt;
   // Steps and processes auto-collapse by default. Only open while actively running.
   const [open, setOpen] = useState<boolean>(() => Boolean(isRunningGroup));
@@ -594,7 +606,12 @@ const FocusGroupSection: React.FC<{
     <>
       {group.preText && (
         <div className="fg-pre-text">
-          <IdeMarkdown markdown={group.preText} compact={compact} lang={lang} />
+          <IdeMarkdown
+            markdown={group.preText}
+            compact={compact}
+            lang={lang}
+            conversationId={conversationId}
+          />
         </div>
       )}
       {group.steps.length > 0 || isRunningGroup ? (
@@ -841,14 +858,15 @@ const AnsweredQuestionExchangeCard: React.FC<{
   );
 };
 
-/** Interactive Antigravity Artifact / Implementation Plan Card with inline Markdown preview & 1-click Proceed */
+/** Interactive Antigravity Artifact / Implementation Plan Card with inline Markdown or HTML preview & 1-click Proceed */
 const SessionArtifactsList: React.FC<{
   artifacts: SessionArtifact[];
   session: AgentSession;
   compact: boolean;
   lang: Lang;
   isLatestTurn: boolean;
-}> = ({ artifacts, session, compact, lang, isLatestTurn }) => {
+  embeddedPaths?: Set<string>;
+}> = ({ artifacts, session, compact, lang, isLatestTurn, embeddedPaths }) => {
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [loadedContent, setLoadedContent] = useState<Record<string, string>>({});
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
@@ -859,16 +877,34 @@ const SessionArtifactsList: React.FC<{
   const [sentNotice, setSentNotice] = useState<Record<string, string>>({});
 
   const visibleArtifacts = useMemo(
-    () => artifacts.filter((a) => a.userFacing !== false || a.requestFeedback),
-    [artifacts]
+    () =>
+      artifacts.filter((a) => {
+        if (a.requestFeedback) return true;
+        if (a.userFacing === false) return false;
+        if (embeddedPaths && embeddedPaths.size > 0) {
+          const norm = normalizeEmbedSrcPath(a.path)
+            .replace(/\\/g, "/")
+            .replace(/\/+$/, "")
+            .toLowerCase();
+          if (embeddedPaths.has(norm)) return false;
+        }
+        return true;
+      }),
+    [artifacts, embeddedPaths]
   );
 
   if (visibleArtifacts.length === 0) return null;
+
+  const isHtmlArtifact = (art: SessionArtifact) =>
+    /\.(html|htm)$/i.test(art.fileName || art.path);
 
   const togglePreview = async (art: SessionArtifact) => {
     const key = art.path;
     const nextOpen = !expandedPaths[key];
     setExpandedPaths((prev) => ({ ...prev, [key]: nextOpen }));
+    if (isHtmlArtifact(art)) {
+      return;
+    }
     if (nextOpen && loadedContent[key] === undefined && !loadingPaths[key]) {
       setLoadingPaths((prev) => ({ ...prev, [key]: true }));
       try {
@@ -918,6 +954,7 @@ const SessionArtifactsList: React.FC<{
     <div className="ide-artifacts-stack">
       {visibleArtifacts.map((art) => {
         const key = art.path;
+        const isHtml = isHtmlArtifact(art);
         const isOpen = Boolean(expandedPaths[key]);
         const isLoading = Boolean(loadingPaths[key]);
         const content = loadedContent[key];
@@ -954,7 +991,19 @@ const SessionArtifactsList: React.FC<{
                   onClick={() => void togglePreview(art)}
                 >
                   {isOpen ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-                  <span>{isOpen ? (lang === "th" ? "ซ่อน" : "Hide") : lang === "th" ? "อ่าน" : "Read"}</span>
+                  <span>
+                    {isOpen
+                      ? lang === "th"
+                        ? "ซ่อน"
+                        : "Hide"
+                      : isHtml
+                      ? lang === "th"
+                        ? "ดูตัวอย่าง"
+                        : "Preview"
+                      : lang === "th"
+                      ? "อ่าน"
+                      : "Read"}
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -1043,21 +1092,38 @@ const SessionArtifactsList: React.FC<{
             )}
 
             {isOpen && (
-              <div className="ide-artifact-body">
-                {isLoading && (
-                  <div className="ide-live">
-                    <Loader2 size={11} className="spin-icon" />
-                    <span>{lang === "th" ? "กำลังโหลดเอกสาร…" : "Loading artifact…"}</span>
-                  </div>
-                )}
-                {err && (
-                  <div className="ide-error-box">
-                    <XCircle size={12} />
-                    <span>{err}</span>
-                  </div>
-                )}
-                {!isLoading && !err && content !== undefined && (
-                  <IdeMarkdown markdown={content} compact={compact} lang={lang} />
+              <div className={`ide-artifact-body ${isHtml ? "is-html-embed" : ""}`}>
+                {isHtml ? (
+                  <AgentEmbedWidget
+                    srcPath={art.path}
+                    conversationId={session.conversationId}
+                    compact={compact}
+                    inline={false}
+                    title={art.fileName}
+                  />
+                ) : (
+                  <>
+                    {isLoading && (
+                      <div className="ide-live">
+                        <Loader2 size={11} className="spin-icon" />
+                        <span>{lang === "th" ? "กำลังโหลดเอกสาร…" : "Loading artifact…"}</span>
+                      </div>
+                    )}
+                    {err && (
+                      <div className="ide-error-box">
+                        <XCircle size={12} />
+                        <span>{err}</span>
+                      </div>
+                    )}
+                    {!isLoading && !err && content !== undefined && (
+                      <IdeMarkdown
+                        markdown={content}
+                        compact={compact}
+                        lang={lang}
+                        conversationId={session.conversationId}
+                      />
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -1083,6 +1149,10 @@ const PastTurnLogsSection: React.FC<{
   const pastFiles = useMemo(() => aggregateSessionDiffs(pastDiffs), [pastDiffs]);
   const pastQuestions = turn.questionExchanges ?? [];
   const pastArtifacts = turn.artifacts ?? [];
+  const pastEmbeddedPaths = useMemo(
+    () => extractEmbeddedArtifactPaths(turn.assistantOutput),
+    [turn.assistantOutput]
+  );
 
   const stepCount = useMemo(() => {
     const counted = pastGroups.reduce((acc, g) => acc + g.steps.length, 0);
@@ -1130,6 +1200,7 @@ const PastTurnLogsSection: React.FC<{
               lang={lang}
               workspacePath={session.workspacePath}
               turnDiffs={pastDiffs}
+              conversationId={session.conversationId}
             />
           ))}
         </div>
@@ -1140,7 +1211,12 @@ const PastTurnLogsSection: React.FC<{
       ))}
 
       {turn.assistantOutput && (
-        <IdeMarkdown markdown={turn.assistantOutput} compact={compact} lang={lang} />
+        <IdeMarkdown
+          markdown={turn.assistantOutput}
+          compact={compact}
+          lang={lang}
+          conversationId={session.conversationId}
+        />
       )}
 
       {pastArtifacts.length > 0 && (
@@ -1150,6 +1226,7 @@ const PastTurnLogsSection: React.FC<{
           compact={compact}
           lang={lang}
           isLatestTurn={false}
+          embeddedPaths={pastEmbeddedPaths}
         />
       )}
 
@@ -1314,6 +1391,10 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
   const liveNote = isLive ? session.midProcessNote || null : null;
   const liveActivity = isLive ? getLiveActivityLabel(session, liveNote, lang) : null;
   const renderedMarkdown = session.latestOutput ? session.latestOutput : null;
+  const activeEmbeddedPaths = useMemo(
+    () => extractEmbeddedArtifactPaths(renderedMarkdown),
+    [renderedMarkdown]
+  );
   const errorText = session.lastError ? session.lastError : null;
 
   const aggregatedFiles = useMemo(
@@ -1489,6 +1570,7 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
                           lang={lang}
                           workspacePath={session.workspacePath}
                           turnDiffs={session.diffs}
+                          conversationId={session.conversationId}
                         />
                       ))}
                     </div>
@@ -1512,7 +1594,12 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
 
                   {/* 4b. Borderless IDE Markdown output (streams live and stays on completion) */}
                   {renderedMarkdown && (
-                    <IdeMarkdown markdown={renderedMarkdown} compact={compact} lang={lang} />
+                    <IdeMarkdown
+                      markdown={renderedMarkdown}
+                      compact={compact}
+                      lang={lang}
+                      conversationId={session.conversationId}
+                    />
                   )}
 
                   {/* 4b-ii. Interactive Artifact / Plan Review Cards (`Proceed` + Inline Markdown Reader) */}
@@ -1523,6 +1610,7 @@ export const SessionTelemetryView: React.FC<SessionTelemetryViewProps> = ({
                       compact={compact}
                       lang={lang}
                       isLatestTurn
+                      embeddedPaths={activeEmbeddedPaths}
                     />
                   )}
 

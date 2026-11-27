@@ -80,6 +80,15 @@ pub struct WarmAgyWorker {
     pub last_used_at: std::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbedTicketEntry {
+    pub file_path: String,
+    pub conversation_id: Option<String>,
+    pub embed_id: String,
+    pub inline: bool,
+    pub expires_at: std::time::Instant,
+}
+
 pub struct InnerState {
     pub settings: NovaSettings,
     pub sessions: Vec<AgentSession>,
@@ -90,6 +99,7 @@ pub struct InnerState {
     pub pending_tool_diffs: HashMap<String, FileDiffPreview>,
     pub bg_pids: HashMap<String, u32>,
     pub warm_workers: HashMap<String, WarmAgyWorker>,
+    pub embed_tickets: HashMap<String, EmbedTicketEntry>,
     pub approval_rules: Vec<ApprovalRule>,
     pub threads: Vec<ChatThread>,
     pub personas: Vec<ChatPersona>,
@@ -572,6 +582,238 @@ fn parse_question_result_answers(content: &str, question_count: usize) -> (Vec<S
     }
 
     (answers, skipped)
+}
+
+fn percent_decode_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(d1), Some(d2)) = (h1, h2) {
+                out.push(((d1 << 4) | d2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+pub fn normalize_embed_file_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_scheme = if let Some(rest) = trimmed.strip_prefix("file://") {
+        rest
+    } else {
+        trimmed
+    };
+    let before_frag = without_scheme
+        .split('#')
+        .next()
+        .unwrap_or(without_scheme)
+        .split('?')
+        .next()
+        .unwrap_or(without_scheme);
+    let decoded = percent_decode_path(before_frag);
+    let d_bytes = decoded.as_bytes();
+    if d_bytes.len() >= 3 && d_bytes[0] == b'/' && d_bytes[1].is_ascii_alphabetic() && d_bytes[2] == b':' {
+        decoded[1..].to_string()
+    } else if !decoded.starts_with('/') && !(d_bytes.len() >= 2 && d_bytes[0].is_ascii_alphabetic() && d_bytes[1] == b':') && trimmed.starts_with("file://") {
+        format!("/{decoded}")
+    } else {
+        decoded
+    }
+}
+
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let nlen = needle_lower.len();
+    if nlen == 0 || haystack.len() < nlen {
+        return None;
+    }
+    let hbytes = haystack.as_bytes();
+    let nbytes = needle_lower.as_bytes();
+    (0..=hbytes.len() - nlen).find(|&i| {
+        hbytes[i..i + nlen]
+            .iter()
+            .zip(nbytes.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    })
+}
+
+fn rfind_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let nlen = needle_lower.len();
+    if nlen == 0 || haystack.len() < nlen {
+        return None;
+    }
+    let hbytes = haystack.as_bytes();
+    let nbytes = needle_lower.as_bytes();
+    (0..=hbytes.len() - nlen).rev().find(|&i| {
+        hbytes[i..i + nlen]
+            .iter()
+            .zip(nbytes.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    })
+}
+
+pub fn inject_nova_embed_runtime(raw_html: &str, embed_id: &str, inline: bool) -> String {
+    let bg_default = if inline { "transparent" } else { "var(--background)" };
+    let theme_style = format!(
+        r#"<style id="nova-agent-embed-vars">
+:root {{
+  color-scheme: dark;
+  --background: #0d0e12;
+  --content: #111217;
+  --card: #16181f;
+  --sidebar: #111216;
+  --card-border: rgba(255, 255, 255, 0.10);
+  --border: rgba(255, 255, 255, 0.12);
+  --foreground: #eceef2;
+  --muted-foreground: #9ca3af;
+  --placeholder: #6b7280;
+  --code-foreground: #e2e8f0;
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(255, 255, 255, 0.08);
+  --secondary-foreground: #f4f4f5;
+  --accent: #8b5cf6;
+  --link: #60a5fa;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --chart-1: #60a5fa;
+  --chart-2: #a78bfa;
+  --chart-3: #34d399;
+  --chart-4: #fbbf24;
+  --chart-5: #f472b6;
+  --chart-6: #38bdf8;
+}}
+html {{
+  margin: 0;
+  padding: 0;
+  height: auto !important;
+  min-height: 0 !important;
+  background: {bg_default};
+}}
+body {{
+  margin: 0;
+  padding: 0;
+  display: flow-root;
+  height: auto !important;
+  min-height: 0 !important;
+  background: {bg_default};
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}}
+</style>"#
+    );
+
+    let embed_id_json = serde_json::to_string(embed_id).unwrap_or_else(|_| "\"nova-embed\"".to_string());
+    let bridge_script = format!(
+        r#"<script id="nova-agent-embed-bridge">
+(function() {{
+  var EMBED_ID = {embed_id_json};
+  var lastHeight = 0;
+  var rafId = 0;
+
+  function measureContentHeight() {{
+    var body = document.body;
+    if (!body) return 0;
+    var bodyRect = body.getBoundingClientRect();
+    var h = Math.max(bodyRect.height, body.offsetHeight);
+    var kids = body.children;
+    for (var i = 0; i < kids.length; i++) {{
+      var el = kids[i];
+      if (el.id === "nova-agent-embed-bridge") continue;
+      var r = el.getBoundingClientRect();
+      var span = r.bottom - bodyRect.top;
+      if (span > h) h = span;
+    }}
+    return Math.ceil(h);
+  }}
+
+  function postSize() {{
+    rafId = 0;
+    var h = measureContentHeight();
+    if (h > 0 && Math.abs(h - lastHeight) >= 1) {{
+      lastHeight = h;
+      try {{
+        window.parent.postMessage({{ type: "nova-agent-embed-resize", embedId: EMBED_ID, height: h }}, "*");
+      }} catch (_e) {{}}
+    }}
+  }}
+
+  function scheduleMeasure() {{
+    if (!rafId) {{
+      rafId = window.requestAnimationFrame(postSize);
+    }}
+  }}
+
+  if (typeof ResizeObserver !== "undefined") {{
+    var ro = new ResizeObserver(scheduleMeasure);
+    if (document.body) ro.observe(document.body);
+    window.addEventListener("DOMContentLoaded", function() {{
+      if (document.body) ro.observe(document.body);
+      scheduleMeasure();
+    }});
+  }}
+
+  if (typeof MutationObserver !== "undefined") {{
+    var startMo = function() {{
+      if (!document.body) return;
+      var mo = new MutationObserver(scheduleMeasure);
+      mo.observe(document.body, {{ childList: true, subtree: true, attributes: true }});
+    }};
+    if (document.body) startMo();
+    else window.addEventListener("DOMContentLoaded", startMo);
+  }}
+
+  window.addEventListener("load", scheduleMeasure);
+  window.addEventListener("resize", scheduleMeasure);
+  document.addEventListener("click", function() {{
+    scheduleMeasure();
+    setTimeout(scheduleMeasure, 50);
+  }}, true);
+  document.addEventListener("input", scheduleMeasure, true);
+  document.addEventListener("change", scheduleMeasure, true);
+
+  [30, 100, 260, 600, 1200].forEach(function(ms) {{
+    setTimeout(scheduleMeasure, ms);
+  }});
+  scheduleMeasure();
+}})();
+</script>"#
+    );
+
+    let with_style = if let Some(head_pos) = find_ascii_ci(raw_html, "<head") {
+        if let Some(rel_gt) = raw_html[head_pos..].find('>') {
+            let insert_at = head_pos + rel_gt + 1;
+            format!("{}\n{}{}", &raw_html[..insert_at], theme_style, &raw_html[insert_at..])
+        } else {
+            format!("{theme_style}\n{raw_html}")
+        }
+    } else {
+        format!("{theme_style}\n{raw_html}")
+    };
+
+    if let Some(body_close) = rfind_ascii_ci(&with_style, "</body") {
+        format!(
+            "{}{}\n{}",
+            &with_style[..body_close],
+            bridge_script,
+            &with_style[body_close..]
+        )
+    } else {
+        format!("{with_style}\n{bridge_script}")
+    }
 }
 
 fn extract_artifact_metadata(
@@ -2174,6 +2416,7 @@ impl AppCore {
                 pending_tool_diffs: HashMap::new(),
                 bg_pids: HashMap::new(),
                 warm_workers: HashMap::new(),
+                embed_tickets: HashMap::new(),
                 approval_rules: persisted.approval_rules,
                 threads,
                 personas,
@@ -3929,6 +4172,116 @@ impl AppCore {
         Ok(content)
     }
 
+    /// Mints (or reuses) a short-lived capability ticket for rendering a validated `.html` artifact
+    /// inside an isolated `sandbox="allow-scripts"` iframe without exposing NOVA's IPC token.
+    pub fn create_embed_ticket(
+        &self,
+        conversation_id: Option<&str>,
+        file_path: &str,
+        embed_id: &str,
+        inline: bool,
+    ) -> Result<String, String> {
+        let clean_path = normalize_embed_file_path(file_path);
+        if clean_path.is_empty() {
+            return Err("Embed file path is empty".to_string());
+        }
+        let ext = Path::new(&clean_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "html" && ext != "htm" {
+            return Err("Only .html / .htm artifacts can be rendered in an embed frame".to_string());
+        }
+
+        // Validate authorization, existence, and 512 KB cap immediately
+        let _ = self.read_session_artifact(conversation_id, &clean_path)?;
+
+        let clean_cid = conversation_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let safe_embed_id: String = embed_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | ':'))
+            .take(80)
+            .collect();
+        let final_embed_id = if safe_embed_id.is_empty() {
+            "nova-embed".to_string()
+        } else {
+            safe_embed_id
+        };
+
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(1800);
+        let min_reuse = std::time::Duration::from_secs(120);
+
+        let mut g = self.inner.lock().unwrap();
+        g.embed_tickets.retain(|_, v| v.expires_at > now);
+
+        let norm_req = normalize_path_key(&clean_path);
+        if let Some((existing_tok, entry)) = g.embed_tickets.iter_mut().find(|(_, v)| {
+            normalize_path_key(&v.file_path) == norm_req
+                && v.conversation_id == clean_cid
+                && v.embed_id == final_embed_id
+                && v.inline == inline
+                && v.expires_at.saturating_duration_since(now) > min_reuse
+        }) {
+            entry.expires_at = now + ttl;
+            return Ok(existing_tok.clone());
+        }
+
+        if g.embed_tickets.len() >= 128 {
+            if let Some(oldest_key) = g
+                .embed_tickets
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                g.embed_tickets.remove(&oldest_key);
+            }
+        }
+
+        let ticket = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        g.embed_tickets.insert(
+            ticket.clone(),
+            EmbedTicketEntry {
+                file_path: clean_path,
+                conversation_id: clean_cid,
+                embed_id: final_embed_id,
+                inline,
+                expires_at: now + ttl,
+            },
+        );
+        Ok(ticket)
+    }
+
+    /// Resolves an embed capability ticket and returns the HTML document augmented with Antigravity
+    /// semantic theme CSS variables and an auto-sizing `postMessage` bridge.
+    pub fn render_embed_ticket(&self, ticket: &str) -> Result<String, String> {
+        let trimmed = ticket.trim();
+        if trimmed.len() < 32 || trimmed.len() > 128 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid embed ticket".to_string());
+        }
+
+        let entry = {
+            let mut g = self.inner.lock().unwrap();
+            let now = std::time::Instant::now();
+            g.embed_tickets.retain(|_, v| v.expires_at > now);
+            g.embed_tickets
+                .get(trimmed)
+                .cloned()
+                .ok_or_else(|| "Embed ticket expired or not found".to_string())?
+        };
+
+        let raw_html = self.read_session_artifact(entry.conversation_id.as_deref(), &entry.file_path)?;
+        Ok(inject_nova_embed_runtime(&raw_html, &entry.embed_id, entry.inline))
+    }
+
     /// Finalizes active turn, step states, and session status after a stream result or process exit.
     fn finalize_session_turn(
         sess: &mut AgentSession,
@@ -5567,5 +5920,35 @@ mod tests {
         assert!(art.request_feedback);
         assert!(art.user_facing);
         assert_eq!(art.summary, "Implementation plan for ask_question support");
+    }
+
+    #[test]
+    fn embed_runtime_normalizes_file_uris_and_injects_theme_and_resize_bridge() {
+        use super::{inject_nova_embed_runtime, normalize_embed_file_path};
+
+        assert_eq!(
+            normalize_embed_file_path(
+                "file:///C:/Users/ongch/.gemini/antigravity-cli/brain/123/my%20widget.html#top"
+            ),
+            "C:/Users/ongch/.gemini/antigravity-cli/brain/123/my widget.html"
+        );
+        assert_eq!(
+            normalize_embed_file_path("file:///home/dev/.gemini/antigravity/brain/1/demo.html"),
+            "/home/dev/.gemini/antigravity/brain/1/demo.html"
+        );
+
+        let raw = "<!DOCTYPE html><html><head><title>Demo</title></head><body class=\"bg-transparent\"><div>Hello</div></body></html>";
+        let out = inject_nova_embed_runtime(raw, "nova-emb-42", true);
+        assert!(out.contains("id=\"nova-agent-embed-vars\""));
+        assert!(out.contains("--card:"));
+        assert!(out.contains("--foreground:"));
+        assert!(out.contains("nova-agent-embed-resize"));
+        assert!(out.contains("\"nova-emb-42\""));
+        let style_idx = out.find("nova-agent-embed-vars").unwrap();
+        let title_idx = out.find("<title>Demo</title>").unwrap();
+        let script_idx = out.find("nova-agent-embed-bridge").unwrap();
+        let body_end_idx = out.rfind("</body>").unwrap();
+        assert!(style_idx < title_idx, "theme defaults must precede widget head tags");
+        assert!(script_idx < body_end_idx, "resize bridge must precede </body>");
     }
 }
