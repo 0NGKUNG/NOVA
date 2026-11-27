@@ -265,9 +265,10 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     h: -1,
   });
 
+  const cliSessions = useMemo(() => sessions.filter(isNovaCliSession), [sessions]);
   const activeAgentCount = useMemo(
-    () => sessions.filter((s) => s.status === "active" || s.status === "waiting_approval").length,
-    [sessions]
+    () => cliSessions.filter((s) => s.status === "active" || s.status === "waiting_approval").length,
+    [cliSessions]
   );
 
   const orbState: OrbState =
@@ -291,7 +292,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       };
     }
     if (activeAgentCount > 0) {
-      const live = sessions.find(
+      const live = cliSessions.find(
         (s) => s.status === "active" || s.status === "waiting_approval"
       );
       let label = `${activeAgentCount} ${t(lang, "activeAgents")}`;
@@ -306,7 +307,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       return { cls: "closed-active-text", text: label };
     }
     return { cls: "closed-idle-text", text: t(lang, "idleReady") };
-  }, [activeAgentCount, lang, pendingApprovals.length, pendingQuestions.length, sessions]);
+  }, [activeAgentCount, cliSessions, lang, pendingApprovals.length, pendingQuestions.length]);
 
   const [displayedClosedStatus, setDisplayedClosedStatus] = useState(liveClosedStatus);
   const [pillAwaitingExpand, setPillAwaitingExpand] = useState(false);
@@ -1470,7 +1471,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
   const allProjectPaths = [
     ...(snapshot.recentWorkspaces ?? []).map((workspace) => workspace.path),
-    ...sessions.filter(isNovaCliSession).map((session) => session.workspacePath),
+    ...cliSessions.map((session) => session.workspacePath),
     ...recentProjectPaths,
     ...addedWorkspacePaths,
   ].reduce<string[]>((unique, path) => {
@@ -1481,14 +1482,22 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   const activeWorkspacePath = (selectedWorkspacePath && projectPaths.some((path) => path.toLowerCase() === selectedWorkspacePath.toLowerCase())
     ? selectedWorkspacePath
     : projectPaths[0]) ?? "";
-  const workspaceSessions = sessions.filter((session) =>
+  const workspaceSessions = cliSessions.filter((session) =>
     session.workspacePath.toLowerCase() === activeWorkspacePath.toLowerCase() &&
-    !hiddenChatIds.includes(session.conversationId) &&
-    isNovaCliSession(session)
+    !hiddenChatIds.includes(session.conversationId)
   );
   const selectedSession = isNewChatDraft
     ? null
-    : workspaceSessions.find((session) => session.conversationId === selectedSessionId) || workspaceSessions[0] || null;
+    : selectedSessionId
+      ? workspaceSessions.find((session) => session.conversationId === selectedSessionId) || null
+      : workspaceSessions[0] || null;
+
+  useEffect(() => {
+    if (activeWorkspacePath && !isNewChatDraft && selectedSessionId && !selectedSession) {
+      setSelectedSessionId(null);
+      setIsNewChatDraft(true);
+    }
+  }, [activeWorkspacePath, isNewChatDraft, selectedSessionId, selectedSession?.conversationId]);
 
   useLayoutEffect(() => {
     if (!projectMenuOpen) {
@@ -2030,9 +2039,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
                 >
                   <Layers size={13} />
                   <span>{t(lang, "missionControl")}</span>
-                  {(totalUrgentCount > 0 || sessions.length > 0) && (
+                  {(totalUrgentCount > 0 || cliSessions.length > 0) && (
                     <span className={`pill-counter ${totalUrgentCount > 0 ? "urgent" : ""}`}>
-                      {totalUrgentCount > 0 ? `!${totalUrgentCount}` : sessions.length}
+                      {totalUrgentCount > 0 ? `!${totalUrgentCount}` : cliSessions.length}
                     </span>
                   )}
                 </button>

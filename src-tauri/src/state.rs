@@ -1264,6 +1264,10 @@ fn parse_ide_permission_hint(raw: &str) -> Option<String> {
     }
 }
 
+fn hook_completion_sound(cli_hook_event: bool) -> Option<&'static str> {
+    cli_hook_event.then_some("ready")
+}
+
 fn extract_latest_thinking_paragraph(raw: &str) -> Option<String> {
     let paragraphs: Vec<&str> = raw
         .split("\n\n")
@@ -3667,7 +3671,7 @@ impl AppCore {
                     });
                 }
                 self.persist();
-                self.broadcast_snapshot(Some("ready"));
+                self.broadcast_snapshot(hook_completion_sound(cli_hook_event));
             } else {
                 self.persist();
                 self.broadcast_snapshot(None);
@@ -5655,7 +5659,8 @@ impl AppCore {
 mod tests {
     use super::{
         apply_insights_to_session, clean_user_prompt, dedup_and_merge_focus_groups,
-        dedup_session_diffs, is_cli_hook_event, is_nova_cli_session_origin, AgentSession,
+        dedup_session_diffs, hook_completion_sound, is_cli_hook_event,
+        is_nova_cli_session_origin, AgentSession,
         FileDiffPreview, FocusGroup, SessionStep, SessionTurn, TranscriptInsights,
     };
     use crate::models::{NormalizedHookEnvelope, ProcessAncestor};
@@ -5713,6 +5718,12 @@ mod tests {
             ..base
         };
         assert!(is_cli_hook_event(&cli_process, None));
+    }
+
+    #[test]
+    fn app_completion_does_not_play_cli_ready_sound() {
+        assert_eq!(hook_completion_sound(false), None);
+        assert_eq!(hook_completion_sound(true), Some("ready"));
     }
 
     #[test]

@@ -3,14 +3,14 @@ export type Lang = "en" | "th";
 const STRINGS: Record<string, { en: string; th: string }> = {
   missionControl: { en: "Workspace", th: "พื้นที่ทำงาน" },
   missionDescription: {
-    en: "Monitor parallel Antigravity workspaces, subagent swarms, live file diffs, and smart approvals.",
-    th: "ติดตาม Workspace ของ Antigravity, งานจาก Subagent, การเปลี่ยนแปลงไฟล์ และคำขออนุมัติได้ในที่เดียว",
+    en: "Run AGY CLI coding sessions and handle Antigravity app approvals here.",
+    th: "รันเซสชันเขียนโค้ดผ่าน AGY CLI และจัดการคำขออนุมัติจากแอป Antigravity ที่นี่",
   },
   readyWhenYouAre: { en: "READY WHEN YOU ARE", th: "พร้อมเมื่อคุณเริ่ม" },
   nothingRunning: { en: "Nothing running yet", th: "ยังไม่มีเซสชันที่กำลังทำงาน" },
   connectAntigravityHint: {
-    en: "Connect Antigravity to see live workspaces, approvals, and file changes here.",
-    th: "เชื่อมต่อ Antigravity เพื่อดู Workspace ที่กำลังทำงาน คำขออนุมัติ และการเปลี่ยนแปลงไฟล์ที่นี่",
+    en: "Install Antigravity hooks to receive app approval requests here; app conversations stay in Antigravity.",
+    th: "ติดตั้ง Antigravity hooks เพื่อรับคำขออนุมัติจากแอปที่นี่ ส่วนบทสนทนาในแอปจะอยู่ใน Antigravity",
   },
   setupAntigravity: { en: "Set up Antigravity", th: "ตั้งค่า Antigravity" },
   quickChat: { en: "Chat", th: "แชต" },
@@ -50,8 +50,8 @@ const STRINGS: Record<string, { en: string; th: string }> = {
   jumpWindow: { en: "Focus Window", th: "สลับไปหน้าต่างงาน" },
   launchSession: { en: "Launch Agent Session", th: "เปิดเซสชันเอเจนต์ใหม่" },
   noActiveSessions: {
-    en: "No active sessions right now — start a task in Antigravity or launch a workspace session below.",
-    th: "ยังไม่มีเซสชันที่กำลังทำงาน — เริ่มงานใน Antigravity หรือเปิดเซสชันใหม่ด้านล่าง",
+    en: "No NOVA CLI sessions right now — launch a workspace session below. App approval requests will appear here.",
+    th: "ตอนนี้ไม่มีเซสชัน CLI ใน NOVA — เปิดเซสชัน Workspace ด้านล่าง คำขออนุมัติจากแอปจะแสดงที่นี่",
   },
 };
 
