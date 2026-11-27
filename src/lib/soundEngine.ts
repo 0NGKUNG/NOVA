@@ -380,7 +380,10 @@ function fireBuffer(ac: AudioContext, cue: SoundCue) {
   const buf = bufferCache.get(cue) ?? buildCueBuffer(ac, cue);
   const src = ac.createBufferSource();
   src.buffer = buf;
-  src.connect(ac.destination);
+  const outputGain = ac.createGain();
+  outputGain.gain.value = 1.25; // A gentle ~2 dB lift across short UI cues.
+  src.connect(outputGain);
+  outputGain.connect(ac.destination);
   src.start();
 }
 

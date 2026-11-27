@@ -83,8 +83,8 @@ function renderNovaMascotPng(size) {
   // Coucou spherical eye constants from NovaOrb.tsx
   const EYE_SP = 0.34;
   const EYE_P = 0.06;
-  const eyeW = Math.max(size <= 24 ? 1.45 : 0, orbSize * 0.078);
-  const eyeH = Math.max(size <= 24 ? 3.05 : 0, orbSize * 0.168);
+  const eyeW = Math.max(size <= 24 ? 1.8 : 0, orbSize * 0.094);
+  const eyeH = Math.max(size <= 24 ? 3.8 : 0, orbSize * 0.21);
   const pillR = Math.min(eyeW * 0.5, eyeH * 0.5);
   const pillHalfW = eyeW * 0.5 - pillR;
   const pillHalfH = eyeH * 0.5 - pillR;
